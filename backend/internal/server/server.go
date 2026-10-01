@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -18,11 +19,17 @@ type ContainerLister interface {
 	ListContainers(ctx context.Context) ([]docker.Container, error)
 }
 
-// New returns the dashboard's HTTP handler.
-func New(containers ContainerLister) http.Handler {
+// New returns the dashboard's HTTP handler. If static is non-nil, its files
+// (the built frontend) are served for every path the API doesn't claim.
+func New(containers ContainerLister, static fs.FS) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /api/containers", handleListContainers(containers))
+	if static != nil {
+		// "GET /" matches everything, but ServeMux always prefers the most
+		// specific pattern, so the API routes above still win.
+		mux.Handle("GET /", http.FileServerFS(static))
+	}
 	return mux
 }
 

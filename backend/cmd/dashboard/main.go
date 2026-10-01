@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -33,9 +34,15 @@ func run() error {
 		return err
 	}
 
+	// The built frontend. Unset in development, where Vite serves it instead.
+	var static fs.FS
+	if dir := os.Getenv("STATIC_DIR"); dir != "" {
+		static = os.DirFS(dir)
+	}
+
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: server.New(dockerClient),
+		Handler: server.New(dockerClient, static),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,

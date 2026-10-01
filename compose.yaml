@@ -1,0 +1,45 @@
+name: dashboard
+
+services:
+  dashboard:
+    build: .
+    restart: unless-stopped
+    ports:
+      # 127.0.0.1 only. Docker writes its own iptables rules and bypasses UFW,
+      # so a bare "8080:8080" would be reachable from the whole LAN. Remote
+      # access goes through `tailscale serve` instead.
+      - "127.0.0.1:${DASHBOARD_PORT:-8080}:8080"
+    environment:
+      DOCKER_HOST: tcp://docker-proxy:2375
+    depends_on:
+      - docker-proxy
+    networks:
+      - default # for the published port (and Discord webhooks, later)
+      - docker-api # to reach the socket proxy
+    # Hardening: the app writes nothing to disk and needs no Linux capabilities.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: unless-stopped
+    environment:
+      # Allow GET/HEAD on /containers only (plus the proxy's harmless defaults:
+      # /_ping, /version, /events). Everything else answers 403.
+      CONTAINERS: 1
+      # 0 is the default; set explicitly because it's the setting that matters.
+      POST: 0
+    volumes:
+      # :ro does NOT make the API read-only: anything that can connect to the
+      # socket can still send write requests. The protection is POST=0 above,
+      # plus this service having no published port and only being on the
+      # internal docker-api network.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-api
+
+networks:
+  docker-api:
+    # No route to the outside world; only services attached to it can talk.
+    internal: true

@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
 )
@@ -37,7 +39,7 @@ func TestHealthz(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/healthz", nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeLister{}).ServeHTTP(rec, req)
+			New(&fakeLister{}, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -91,7 +93,7 @@ func TestListContainers(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/containers", nil)
 			rec := httptest.NewRecorder()
 
-			New(tt.lister).ServeHTTP(rec, req)
+			New(tt.lister, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -101,6 +103,46 @@ func TestListContainers(t *testing.T) {
 			}
 			if got := strings.TrimSpace(rec.Body.String()); got != tt.wantBody {
 				t.Errorf("body =\n  %s\nwant\n  %s", got, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestStaticFiles(t *testing.T) {
+	static := fstest.MapFS{
+		"index.html":      {Data: []byte("<h1>dashboard</h1>")},
+		"assets/index.js": {Data: []byte("console.log('hi')")},
+	}
+
+	tests := []struct {
+		name       string
+		static     fs.FS
+		path       string
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "root serves index.html", static: static, path: "/", wantStatus: http.StatusOK, wantBody: "<h1>dashboard</h1>"},
+		{name: "assets are served", static: static, path: "/assets/index.js", wantStatus: http.StatusOK, wantBody: "console.log('hi')"},
+		{name: "missing file is 404", static: static, path: "/nope.js", wantStatus: http.StatusNotFound},
+		{name: "API still wins over static files", static: static, path: "/api/containers", wantStatus: http.StatusOK, wantBody: "[]"},
+		{name: "no static files configured", static: nil, path: "/", wantStatus: http.StatusNotFound},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			rec := httptest.NewRecorder()
+
+			New(&fakeLister{}, tt.static).ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			if tt.wantBody == "" {
+				return
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != tt.wantBody {
+				t.Errorf("body = %q, want %q", got, tt.wantBody)
 			}
 		})
 	}
