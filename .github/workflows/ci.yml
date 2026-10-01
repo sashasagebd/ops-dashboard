@@ -18,7 +18,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
+          # go.mod, not go.sum: go.sum doesn't exist until the first
+          # dependency is added, and setup-go fails if this file is missing.
+          cache-dependency-path: backend/go.mod
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
