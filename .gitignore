@@ -1,0 +1,47 @@
+# ── Secrets / environment ──────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Go (backend) ───────────────────────────────────────
+# Compiled binaries
+/backend/bin/
+/backend/dashboard
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Test output / coverage
+*.test
+*.out
+coverage.html
+# Go workspace file (local only)
+go.work
+go.work.sum
+
+# ── Node / React / Vite (frontend) ─────────────────────
+node_modules/
+/frontend/dist/
+/frontend/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── Docker / runtime data ──────────────────────────────
+docker-compose.override.yml
+/data/
+
+# ── Logs ───────────────────────────────────────────────
+*.log
+logs/
+
+# ── Editors / OS ───────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
