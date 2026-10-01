@@ -27,9 +27,15 @@ func run() error {
 	// 127.0.0.1 happens in the Compose port mapping, on the host side.
 	addr := envOr("LISTEN_ADDR", ":8080")
 
+	// The default matches the proxy's service name in compose.yaml.
+	dockerClient, err := docker.NewClient(envOr("DOCKER_HOST", "tcp://docker-proxy:2375"))
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: server.New(notImplementedLister{}),
+		Handler: server.New(dockerClient),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,
@@ -58,14 +64,6 @@ func run() error {
 		return err
 	}
 	return nil
-}
-
-// notImplementedLister stands in until the real Docker client lands in
-// milestone step 1.3. Until then /api/containers returns 502.
-type notImplementedLister struct{}
-
-func (notImplementedLister) ListContainers(context.Context) ([]docker.Container, error) {
-	return nil, errors.New("docker client not implemented yet")
 }
 
 func envOr(key, fallback string) string {
