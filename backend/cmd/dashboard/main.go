@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/server"
 )
 
@@ -28,7 +29,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: server.New(),
+		Handler: server.New(notImplementedLister{}),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,
@@ -57,6 +58,14 @@ func run() error {
 		return err
 	}
 	return nil
+}
+
+// notImplementedLister stands in until the real Docker client lands in
+// milestone step 1.3. Until then /api/containers returns 502.
+type notImplementedLister struct{}
+
+func (notImplementedLister) ListContainers(context.Context) ([]docker.Container, error) {
+	return nil, errors.New("docker client not implemented yet")
 }
 
 func envOr(key, fallback string) string {
