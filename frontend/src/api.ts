@@ -14,10 +14,22 @@ export type Container = {
   memoryLimitBytes: number | null // host memory if no limit is set
 }
 
+// HostStats matches hostResponse in the same Go file. Disk fields mean what
+// df's columns do: df's "Use%" is used / (used + available), not used / total.
+export type HostStats = {
+  cpuPercent: number | null // 0–100, all cores together; null until two samples
+  memoryBytes: number // used, i.e. total minus available
+  memoryTotalBytes: number
+  diskUsedBytes: number
+  diskAvailableBytes: number
+  diskTotalBytes: number
+}
+
 // ContainersResponse matches containersResponse in the same Go file.
 export type ContainersResponse = {
   updatedAt: string // RFC 3339; when the server last polled Docker successfully
   stale: boolean // the latest poll failed, so the data is from updatedAt
+  host: HostStats | null // null if the host couldn't be read that poll
   containers: Container[]
 }
 

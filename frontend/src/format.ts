@@ -36,12 +36,19 @@ export function formatCPU(pct: number | null): string {
 
 const MiB = 1024 * 1024
 const GiB = 1024 * MiB
+const TiB = 1024 * GiB
 
-// formatBytes uses binary units (MiB, GiB) like `docker stats`: whole MiB
-// below 1 GiB, one decimal place above. null shows as "—".
+// formatBytes uses binary units (MiB, GiB, TiB) like `docker stats`: whole
+// MiB below 1 GiB, one decimal place above. null shows as "—".
 export function formatBytes(bytes: number | null): string {
   if (bytes === null) return '—'
   if (bytes < MiB) return '<1 MiB'
   if (bytes < GiB) return `${Math.round(bytes / MiB)} MiB`
-  return `${(bytes / GiB).toFixed(1)} GiB`
+  if (bytes < TiB) return `${(bytes / GiB).toFixed(1)} GiB`
+  return `${(bytes / TiB).toFixed(1)} TiB`
+}
+
+// usagePercent is part / whole as 0–100, or 0 if whole is 0.
+export function usagePercent(part: number, whole: number): number {
+  return whole > 0 ? (part / whole) * 100 : 0
 }

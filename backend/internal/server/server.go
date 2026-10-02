@@ -45,7 +45,34 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 type containersResponse struct {
 	UpdatedAt  time.Time           `json:"updatedAt"`
 	Stale      bool                `json:"stale"` // the latest poll failed; data is from UpdatedAt
+	Host       *hostResponse       `json:"host"`  // null if the host couldn't be read that poll
 	Containers []containerResponse `json:"containers"`
+}
+
+// hostResponse is the whole server's resource usage. Disk fields have df's
+// meanings: root's reserved blocks are in neither used nor available, so
+// df's "Use%" is used / (used + available), not used / total.
+type hostResponse struct {
+	CPUPercent         *float64 `json:"cpuPercent"` // 0–100; null until two samples
+	MemoryBytes        uint64   `json:"memoryBytes"`
+	MemoryTotalBytes   uint64   `json:"memoryTotalBytes"`
+	DiskUsedBytes      uint64   `json:"diskUsedBytes"`
+	DiskAvailableBytes uint64   `json:"diskAvailableBytes"`
+	DiskTotalBytes     uint64   `json:"diskTotalBytes"`
+}
+
+func newHostResponse(h *monitor.HostStatus) *hostResponse {
+	if h == nil {
+		return nil
+	}
+	return &hostResponse{
+		CPUPercent:         ptrIf(h.CPUPercent, h.HasCPU),
+		MemoryBytes:        h.Memory.Used(),
+		MemoryTotalBytes:   h.Memory.Total,
+		DiskUsedBytes:      h.Disk.Used,
+		DiskAvailableBytes: h.Disk.Available,
+		DiskTotalBytes:     h.Disk.Total,
+	}
 }
 
 // containerResponse is one container in the API.
@@ -113,6 +140,7 @@ func handleListContainers(snapshots SnapshotSource) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, containersResponse{
 			UpdatedAt:  snap.UpdatedAt,
 			Stale:      snap.Stale,
+			Host:       newHostResponse(snap.Host),
 			Containers: list,
 		})
 	}

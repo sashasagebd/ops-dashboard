@@ -1,5 +1,5 @@
-// Package monitor polls Docker in the background and keeps the latest view of
-// every container in memory, so HTTP requests never wait on Docker.
+// Package monitor polls Docker and the host in the background and keeps the
+// latest view in memory, so HTTP requests never wait on either.
 package monitor
 
 import (
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/host"
 )
 
 // Docker is the Docker access the monitor needs. It's declared here, where
@@ -18,6 +19,21 @@ import (
 type Docker interface {
 	ListContainers(ctx context.Context) ([]docker.Container, error)
 	ContainerStats(ctx context.Context, id string) (docker.Stats, error)
+}
+
+// HostReader reads the host's resource usage; in production a *host.Reader.
+type HostReader interface {
+	Read() (host.Sample, error)
+}
+
+// HostStatus is the host's latest resource usage.
+type HostStatus struct {
+	// HasCPU is false on the first poll, before there are two samples.
+	HasCPU     bool
+	CPUPercent float64 // 0–100, all cores together
+
+	Memory host.Memory
+	Disk   host.Disk
 }
 
 // ContainerStatus is one container plus its latest resource usage.
@@ -41,6 +57,10 @@ type Snapshot struct {
 	UpdatedAt  time.Time         // when that poll finished
 	Containers []ContainerStatus // sorted by name
 
+	// Host is nil if the host couldn't be read that poll. That doesn't fail
+	// the poll: container data is still worth showing without it.
+	Host *HostStatus
+
 	// Stale is true when a later poll failed, so Containers may be out of
 	// date. Showing slightly old data, clearly marked, beats an error page
 	// while Docker is briefly unreachable.
@@ -51,22 +71,24 @@ type Snapshot struct {
 // goroutine.
 type Monitor struct {
 	docker Docker
+	host   HostReader
 	now    func() time.Time // time.Now, replaceable in tests
 
-	// prev holds each running container's last stats sample, for CPU %.
-	// Only Poll touches it, and Poll isn't called concurrently, so it needs
-	// no lock.
-	prev map[string]docker.Stats
+	// prev holds each running container's last stats sample, and prevHost
+	// the host's last CPU sample, for CPU %. Only Poll touches them, and
+	// Poll isn't called concurrently, so they need no lock.
+	prev     map[string]docker.Stats
+	prevHost *host.CPUTimes
 
 	mu     sync.RWMutex
 	snap   Snapshot
 	polled bool // whether any poll has ever succeeded
 }
 
-// New returns a Monitor that reads from d. It has no data until the first
-// successful Poll.
-func New(d Docker) *Monitor {
-	return &Monitor{docker: d, now: time.Now, prev: map[string]docker.Stats{}}
+// New returns a Monitor that reads containers from d and host stats from h.
+// It has no data until the first successful Poll.
+func New(d Docker, h HostReader) *Monitor {
+	return &Monitor{docker: d, host: h, now: time.Now, prev: map[string]docker.Stats{}}
 }
 
 // Snapshot returns the latest data. ok is false if no poll has succeeded yet.
@@ -101,9 +123,13 @@ func (m *Monitor) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Poll reads every container and its stats once and publishes a new
-// Snapshot. If listing containers fails, the previous Snapshot is kept and
-// marked stale. Poll must not be called concurrently with itself.
+// Poll reads every container and its stats, and the host's stats, once and
+// publishes a new Snapshot. If listing containers fails, the previous
+// Snapshot is kept and marked stale. Poll must not be called concurrently
+// with itself.
+//
+// The host is only read once listing has succeeded, so everything in a
+// Snapshot comes from the same moment and one Stale flag covers all of it.
 func (m *Monitor) Poll(ctx context.Context) error {
 	containers, err := m.docker.ListContainers(ctx)
 	if err != nil {
@@ -134,8 +160,10 @@ func (m *Monitor) Poll(ctx context.Context) error {
 	// sample from before it.
 	m.prev = next
 
+	hostStatus := m.readHost()
+
 	m.mu.Lock()
-	m.snap = Snapshot{UpdatedAt: m.now(), Containers: statuses}
+	m.snap = Snapshot{UpdatedAt: m.now(), Containers: statuses, Host: hostStatus}
 	m.polled = true
 	m.mu.Unlock()
 	return nil
@@ -158,4 +186,24 @@ func (m *Monitor) addStats(ctx context.Context, s *ContainerStatus, next map[str
 	if prev, ok := m.prev[s.ID]; ok {
 		s.CPUPercent, s.HasCPU = docker.CPUPercent(prev, stats)
 	}
+}
+
+// readHost reads the host's stats, or returns nil (logged) if it can't.
+//
+// On failure prevHost is kept, so the next successful read still gets a CPU
+// %: it's then averaged over two intervals instead of one, which is still
+// correct.
+func (m *Monitor) readHost() *HostStatus {
+	sample, err := m.host.Read()
+	if err != nil {
+		slog.Warn("reading host stats", "err", err)
+		return nil
+	}
+
+	status := &HostStatus{Memory: sample.Memory, Disk: sample.Disk}
+	if m.prevHost != nil {
+		status.CPUPercent, status.HasCPU = host.CPUPercent(*m.prevHost, sample.CPU)
+	}
+	m.prevHost = &sample.CPU
+	return status
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/host"
 )
 
 // fakeDocker returns whatever its fields hold at the time of the call; tests
@@ -57,6 +58,20 @@ func (f *fakeDocker) set(fn func(f *fakeDocker)) {
 	fn(f)
 }
 
+// fakeHost returns its sample, or err if set. Tests change the fields between
+// polls; no lock, as only the Run test uses another goroutine and it doesn't
+// touch these.
+type fakeHost struct {
+	sample host.Sample
+	err    error
+	reads  int
+}
+
+func (h *fakeHost) Read() (host.Sample, error) {
+	h.reads++
+	return h.sample, h.err
+}
+
 var (
 	mc  = docker.Container{ID: "m1", Name: "mc", State: "running"}
 	bot = docker.Container{ID: "b1", Name: "discordbot", State: "running"}
@@ -64,7 +79,7 @@ var (
 
 // newTestMonitor returns a Monitor whose clock reads clock.
 func newTestMonitor(f *fakeDocker, clock *time.Time) *Monitor {
-	m := New(f)
+	m := New(f, &fakeHost{})
 	m.now = func() time.Time { return *clock }
 	return m
 }
@@ -82,7 +97,7 @@ func mustPoll(t *testing.T, m *Monitor) Snapshot {
 }
 
 func TestNoSnapshotBeforeFirstPoll(t *testing.T) {
-	m := New(&fakeDocker{})
+	m := New(&fakeDocker{}, &fakeHost{})
 	if _, ok := m.Snapshot(); ok {
 		t.Error("Snapshot ok before any poll, want not ok")
 	}
@@ -224,7 +239,7 @@ func TestListErrorKeepsLastSnapshotAsStale(t *testing.T) {
 }
 
 func TestListErrorBeforeAnySuccess(t *testing.T) {
-	m := New(&fakeDocker{listErr: errors.New("proxy unreachable")})
+	m := New(&fakeDocker{listErr: errors.New("proxy unreachable")}, &fakeHost{})
 	if err := m.Poll(context.Background()); err == nil {
 		t.Fatal("Poll succeeded, want error")
 	}
@@ -235,7 +250,7 @@ func TestListErrorBeforeAnySuccess(t *testing.T) {
 
 func TestRunPollsImmediatelyAndStops(t *testing.T) {
 	f := &fakeDocker{listed: make(chan struct{}, 1)}
-	m := New(f)
+	m := New(f, &fakeHost{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 
@@ -256,5 +271,77 @@ func TestRunPollsImmediatelyAndStops(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run didn't return after cancel")
+	}
+}
+
+func TestHostStats(t *testing.T) {
+	h := &fakeHost{sample: host.Sample{
+		CPU:    host.CPUTimes{Busy: 1000, Total: 10_000},
+		Memory: host.Memory{Total: 16 << 30, Available: 10 << 30},
+		Disk:   host.Disk{Total: 250 << 30, Used: 50 << 30, Available: 187 << 30},
+	}}
+	m := New(&fakeDocker{containers: []docker.Container{mc}, stats: map[string]docker.Stats{"m1": {}}}, h)
+
+	snap := mustPoll(t, m)
+
+	if snap.Host == nil {
+		t.Fatal("Host = nil, want host stats")
+	}
+	if snap.Host.Memory != h.sample.Memory || snap.Host.Disk != h.sample.Disk {
+		t.Errorf("Host = %+v, want the sample's memory and disk", snap.Host)
+	}
+	if snap.Host.HasCPU {
+		t.Error("Host HasCPU on the first poll, want false (no previous sample)")
+	}
+
+	// 400 ticks pass on the host, 100 of them busy.
+	h.sample.CPU = host.CPUTimes{Busy: 1100, Total: 10_400}
+	snap = mustPoll(t, m)
+
+	if !snap.Host.HasCPU || snap.Host.CPUPercent != 25 {
+		t.Errorf("Host CPU = %v (HasCPU %v), want 25%%", snap.Host.CPUPercent, snap.Host.HasCPU)
+	}
+}
+
+func TestHostErrorKeepsContainers(t *testing.T) {
+	h := &fakeHost{err: errors.New("no /proc/stat")}
+	m := New(&fakeDocker{containers: []docker.Container{mc}, stats: map[string]docker.Stats{"m1": {}}}, h)
+
+	snap := mustPoll(t, m)
+
+	if snap.Host != nil {
+		t.Errorf("Host = %+v, want nil after a read error", snap.Host)
+	}
+	if len(snap.Containers) != 1 || snap.Stale {
+		t.Errorf("Containers, Stale = %v, %v; want mc, not stale", snap.Containers, snap.Stale)
+	}
+}
+
+func TestHostCPUSpansAFailedRead(t *testing.T) {
+	h := &fakeHost{sample: host.Sample{CPU: host.CPUTimes{Busy: 1000, Total: 10_000}}}
+	m := New(&fakeDocker{}, h)
+	mustPoll(t, m)
+
+	h.err = errors.New("temporary")
+	mustPoll(t, m)
+
+	// The previous sample survived the failed read, so CPU is available
+	// straight away, averaged over both intervals.
+	h.err = nil
+	h.sample.CPU = host.CPUTimes{Busy: 1200, Total: 10_800}
+	snap := mustPoll(t, m)
+	if snap.Host == nil || !snap.Host.HasCPU || snap.Host.CPUPercent != 25 {
+		t.Errorf("Host = %+v, want CPU 25%% from the sample before the failure", snap.Host)
+	}
+}
+
+func TestHostNotReadWhenListFails(t *testing.T) {
+	h := &fakeHost{}
+	m := New(&fakeDocker{listErr: errors.New("proxy unreachable")}, h)
+
+	_ = m.Poll(context.Background())
+
+	if h.reads != 0 {
+		t.Errorf("host read %d times, want 0 (a failed poll publishes nothing)", h.reads)
 	}
 }

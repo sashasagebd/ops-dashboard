@@ -1,6 +1,6 @@
-import { act, render, screen } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Container, ContainersResponse } from './api'
+import type { Container, ContainersResponse, HostStats } from './api'
 import App from './App'
 
 const NOW = new Date('2026-10-01T12:00:00Z')
@@ -21,8 +21,23 @@ function container(overrides: Partial<Container> = {}): Container {
   }
 }
 
+const GiB = 1024 ** 3
+
+function hostStats(overrides: Partial<HostStats> = {}): HostStats {
+  return {
+    cpuPercent: 4.2,
+    memoryBytes: 6 * GiB,
+    memoryTotalBytes: 15 * GiB,
+    // 10 GiB reserved for root: in neither used nor available, like df.
+    diskUsedBytes: 50 * GiB,
+    diskAvailableBytes: 150 * GiB,
+    diskTotalBytes: 210 * GiB,
+    ...overrides,
+  }
+}
+
 function snapshot(containers: Container[], overrides: Partial<ContainersResponse> = {}): ContainersResponse {
-  return { updatedAt: NOW.toISOString(), stale: false, containers, ...overrides }
+  return { updatedAt: NOW.toISOString(), stale: false, host: null, containers, ...overrides }
 }
 
 // mockFetch answers successive calls with successive [status, body] pairs,
@@ -193,5 +208,72 @@ describe('App', () => {
     setHidden(false)
     await advance(0)
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  describe('server tiles', () => {
+    it('show CPU, memory and disk with usage bars', async () => {
+      mockFetch([200, snapshot([], { host: hostStats() })])
+
+      render(<App />)
+      await advance(0)
+
+      const cpu = within(screen.getByRole('region', { name: 'CPU' }))
+      expect(cpu.getByText('4.2%')).toBeInTheDocument()
+      expect(cpu.getByRole('meter')).toHaveAttribute('aria-valuenow', '4')
+
+      const memory = within(screen.getByRole('region', { name: 'Memory' }))
+      expect(memory.getByText('6.0 GiB')).toBeInTheDocument()
+      expect(memory.getByText('of 15.0 GiB')).toBeInTheDocument()
+      expect(memory.getByRole('meter')).toHaveAttribute('aria-valuenow', '40')
+
+      // Like df's Use%: 50 / (50 + 150) = 25%, not 50 / 210.
+      const disk = within(screen.getByRole('region', { name: 'Disk' }))
+      expect(disk.getByText('50.0 GiB')).toBeInTheDocument()
+      expect(disk.getByText('of 210.0 GiB')).toBeInTheDocument()
+      expect(disk.getByRole('meter')).toHaveAttribute('aria-valuenow', '25')
+    })
+
+    it('turn the bar amber from 80% and red from 90%', async () => {
+      mockFetch([
+        200,
+        snapshot([], {
+          host: hostStats({
+            memoryBytes: 12.75 * GiB, // 85%
+            diskUsedBytes: 95 * GiB,
+            diskAvailableBytes: 5 * GiB, // 95%
+          }),
+        }),
+      ])
+
+      render(<App />)
+      await advance(0)
+
+      const fill = (name: string) => within(screen.getByRole('region', { name })).getByRole('meter').firstElementChild
+      expect(fill('CPU')).toHaveClass('bar-ok')
+      expect(fill('Memory')).toHaveClass('bar-warn')
+      expect(fill('Disk')).toHaveClass('bar-high')
+    })
+
+    it('show a dash for CPU before the second sample', async () => {
+      mockFetch([200, snapshot([], { host: hostStats({ cpuPercent: null }) })])
+
+      render(<App />)
+      await advance(0)
+
+      const cpu = within(screen.getByRole('region', { name: 'CPU' }))
+      expect(cpu.getByText('—')).toBeInTheDocument()
+      expect(cpu.getByRole('meter')).not.toHaveAttribute('aria-valuenow')
+    })
+
+    it('are replaced by a note when the host could not be read', async () => {
+      mockFetch([200, snapshot([container()], { host: null })])
+
+      render(<App />)
+      await advance(0)
+
+      expect(screen.getByText('Server stats unavailable.')).toBeInTheDocument()
+      expect(screen.queryByRole('meter')).not.toBeInTheDocument()
+      expect(screen.getByText('mc')).toBeInTheDocument()
+    })
   })
 })

@@ -1,5 +1,6 @@
 import { fetchContainers, type ContainersResponse } from './api'
 import { formatBytes, formatCPU, formatDuration, uptimeText } from './format'
+import { HostSummary } from './HostSummary'
 import { usePolling, type PollState } from './usePolling'
 
 // Matches the backend's default POLL_INTERVAL; refreshing faster would only
@@ -16,13 +17,13 @@ function App() {
 
   return (
     <main>
-      <h1>Containers</h1>
-      <ContainerList state={state} />
+      <h1>Ops Dashboard</h1>
+      <Dashboard state={state} />
     </main>
   )
 }
 
-function ContainerList({ state }: { state: PollState<ContainersResponse> }) {
+function Dashboard({ state }: { state: PollState<ContainersResponse> }) {
   switch (state.status) {
     case 'loading':
       return <p>Loading…</p>
@@ -35,7 +36,11 @@ function ContainerList({ state }: { state: PollState<ContainersResponse> }) {
       const { data, checkedAt } = state
       return (
         <>
+          {/* Above both sections: it applies to all the data on the page. */}
           <StaleBanner state={state} />
+          <h2>Server</h2>
+          <HostSummary host={data.host} />
+          <h2>Containers</h2>
           {data.containers.length === 0 ? (
             <p>No containers.</p>
           ) : (

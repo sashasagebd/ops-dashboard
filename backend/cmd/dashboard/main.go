@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/host"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/monitor"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/server"
 )
@@ -58,7 +59,9 @@ func run() error {
 
 	// The monitor polls Docker in the background; requests only read its
 	// latest snapshot. It stops when ctx is cancelled at shutdown.
-	mon := monitor.New(dockerClient)
+	// The container's own /proc and / report the host's CPU, memory and root
+	// disk, so no extra mounts are needed (see internal/host).
+	mon := monitor.New(dockerClient, host.NewReader("/proc", "/"))
 	go mon.Run(ctx, pollInterval)
 
 	srv := &http.Server{

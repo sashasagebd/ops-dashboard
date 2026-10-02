@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/host"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/monitor"
 )
 
@@ -89,7 +90,7 @@ func TestListContainers(t *testing.T) {
 				},
 			}},
 			wantStatus: http.StatusOK,
-			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"containers":[` +
+			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"host":null,"containers":[` +
 				`{"id":"a1","name":"discordbot","image":"discordbot","state":"exited","status":"Exited (1) 20 minutes ago",` +
 				`"startedAt":"2026-09-29T04:30:00Z","finishedAt":"2026-10-01T11:40:00Z",` +
 				`"cpuPercent":null,"memoryBytes":null,"memoryLimitBytes":null},` +
@@ -107,15 +108,41 @@ func TestListContainers(t *testing.T) {
 				}},
 			}},
 			wantStatus: http.StatusOK,
-			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"containers":[` +
+			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"host":null,"containers":[` +
 				`{"id":"b2","name":"mc","image":"","state":"running","status":"",` +
 				`"startedAt":null,"finishedAt":null,"cpuPercent":null,"memoryBytes":100,"memoryLimitBytes":1000}]}`,
+		},
+		{
+			name: "host stats, with memory used = total - available",
+			source: &fakeSource{ok: true, snap: monitor.Snapshot{
+				UpdatedAt: updated,
+				Host: &monitor.HostStatus{
+					HasCPU: true, CPUPercent: 4.5,
+					Memory: host.Memory{Total: 16_000, Available: 10_000},
+					Disk:   host.Disk{Total: 250_000, Used: 50_000, Available: 187_500},
+				},
+			}},
+			wantStatus: http.StatusOK,
+			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"host":{"cpuPercent":4.5,` +
+				`"memoryBytes":6000,"memoryTotalBytes":16000,` +
+				`"diskUsedBytes":50000,"diskAvailableBytes":187500,"diskTotalBytes":250000},"containers":[]}`,
+		},
+		{
+			name: "host CPU is null on the first poll",
+			source: &fakeSource{ok: true, snap: monitor.Snapshot{
+				UpdatedAt: updated,
+				Host:      &monitor.HostStatus{Memory: host.Memory{Total: 1, Available: 1}},
+			}},
+			wantStatus: http.StatusOK,
+			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"host":{"cpuPercent":null,` +
+				`"memoryBytes":0,"memoryTotalBytes":1,` +
+				`"diskUsedBytes":0,"diskAvailableBytes":0,"diskTotalBytes":0},"containers":[]}`,
 		},
 		{
 			name:       "stale snapshot is still served, marked stale",
 			source:     &fakeSource{ok: true, snap: monitor.Snapshot{UpdatedAt: updated, Stale: true}},
 			wantStatus: http.StatusOK,
-			wantBody:   `{"updatedAt":"2026-10-01T12:00:05Z","stale":true,"containers":[]}`,
+			wantBody:   `{"updatedAt":"2026-10-01T12:00:05Z","stale":true,"host":null,"containers":[]}`,
 		},
 		{
 			name:       "no successful poll yet returns 502 without details",
@@ -163,7 +190,7 @@ func TestStaticFiles(t *testing.T) {
 		{name: "missing file is 404", static: static, path: "/nope.js", wantStatus: http.StatusNotFound},
 		{
 			name: "API still wins over static files", static: static, path: "/api/containers",
-			wantStatus: http.StatusOK, wantBody: `{"updatedAt":"0001-01-01T00:00:00Z","stale":false,"containers":[]}`,
+			wantStatus: http.StatusOK, wantBody: `{"updatedAt":"0001-01-01T00:00:00Z","stale":false,"host":null,"containers":[]}`,
 		},
 		{name: "no static files configured", static: nil, path: "/", wantStatus: http.StatusNotFound},
 	}
