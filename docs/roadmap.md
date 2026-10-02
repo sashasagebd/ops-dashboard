@@ -8,8 +8,8 @@ _Last updated: 2026-10-01_
 | Milestone | Status |
 |---|---|
 | M1: Thinnest end-to-end slice | ✅ Done, deployed |
-| M2: Full container status | 🚧 In progress (2.1–2.4 done) |
-| M3: Host stats | Not started |
+| M2: Full container status | ✅ Done, deployed |
+| M3: Host stats | 🚧 In progress |
 | M4: Discord alerts | Not started |
 | M5: Portfolio polish | Not started |
 
@@ -30,7 +30,7 @@ them, both running via Docker Compose on the server and reachable through
 Verified on the server: the Tailscale URL shows the real containers, and the
 dashboard port is not reachable from another LAN device.
 
-## M2: Full container status 🚧
+## M2: Full container status ✅
 
 **Goal:** every container (including stopped), with up/down status, uptime,
 CPU % and RAM, refreshing automatically.
@@ -40,8 +40,8 @@ CPU % and RAM, refreshing automatically.
 | 2.1 | List all containers (`all=true`) and inspect each for `startedAt` / `finishedAt`. Additive API fields (`null` when Docker has no time); page has an Uptime column ("up 3h 12m" / "down 20m", Docker's status text on hover). | ✅ `3ef9fd0`, deployed |
 | 2.2 | `ContainerStats` (one-shot stats sample, RAM minus inactive file cache) and pure `CPUPercent(prev, cur)` in the Docker client. Not wired up yet, so no behaviour change. | ✅ `92b3b30` (CPU switched to percent of host in 2.3's commit) |
 | 2.3 | `internal/monitor` poller (`POLL_INTERVAL`, default 5s, min 1s) holding the latest snapshot in memory, including stats for running containers (CPU from the previous poll's sample). API is now `{updatedAt, stale, containers: [...]}` with `cpuPercent`, `memoryBytes`, `memoryLimitBytes` (null when not available); frontend fetch updated. | ✅ `bf339c3`, deployed; server API shows CPU/RAM for all running containers, so the proxy allows stats |
-| 2.4 | `usePolling` hook (5s, next fetch scheduled after each response, paused while the tab is hidden, keeps data when a refresh fails); CPU/Memory columns; stale banner (server can't reach Docker / browser can't reach server / data older than 30s); `API_TARGET` for `npm run dev` against the real server. | ✅ Done, not yet committed; `API_TARGET` verified against the server from the PC |
-| 2.5 | Redeploy; record the poller decision in `decisions/stack.md`. | |
+| 2.4 | `usePolling` hook (5s, next fetch scheduled after each response, paused while the tab is hidden, keeps data when a refresh fails); CPU/Memory columns; stale banner (server can't reach Docker / browser can't reach server / data older than 30s); `API_TARGET` for `npm run dev` against the real server. | ✅ `d232e42`, deployed; `API_TARGET` verified against the server from the PC |
+| 2.5 | Redeploy; record the poller, CPU/memory, staleness and polling-hook decisions in `decisions/stack.md`. | ✅ Deployed; live page verified on the server |
 
 Decisions (approved 2026-10-01):
 - **CPU % from two polls.** Use the stats endpoint's `one-shot` mode (instant,
@@ -58,10 +58,32 @@ Decisions (approved 2026-10-01):
 `docker ps -a` on the server shows no leftover containers, so "all containers"
 needs no filtering.
 
-## M3: Host stats
+## M3: Host stats 🚧
 
-CPU, memory and disk for the host, from the host's `/proc` and `/` mounted
-read-only into the container, behind its own interface so it can be faked.
+**Goal:** CPU, memory and disk for the whole server, above the container
+table, refreshing with it.
+
+| Step | What | Status |
+|---|---|---|
+| 3.1 | `internal/host` package: parse `/proc/stat` (CPU, from two samples like containers) and `/proc/meminfo` (used = `MemTotal` − `MemAvailable`); disk usage via `statfs`. Parsers tested against real fixture text; `statfs` is Linux-only, so it sits behind a build tag with a stub for Windows dev. | ✅ Done, not yet committed |
+| 3.2 | Monitor reads host stats on each poll; API gains a `host` object (additive: `{updatedAt, stale, host, containers}`). | |
+| 3.3 | Frontend: three summary tiles (CPU %, memory used / total, disk used / total) with a usage bar. | |
+| 3.4 | Deploy; check the numbers against `top`, `free -h` and `df -h /` on the server; record decisions. | |
+
+Decisions (approved 2026-10-01):
+- **No extra mounts.** The original idea was mounting the host's `/proc` and
+  `/` read-only. But `/proc/stat` and `/proc/meminfo` inside a container
+  already report the whole host (they aren't namespaced), and `statfs` on the
+  container's `/` reports the filesystem Docker stores everything on, which is
+  the host's root disk. Mounting the host's `/` would expose every
+  world-readable host file to the dashboard for no gain.
+- **Memory "used" = total − available**, like `free`'s "available" column, so
+  reclaimable cache doesn't count, consistent with container memory.
+- **One snapshot, one request:** host stats ride along in `/api/containers`
+  instead of a second endpoint, so the page's numbers are always from the same
+  moment and there's one poll loop, one stale flag.
+- **Disk is the root filesystem only.** Fine while everything lives on one
+  disk; a `DISK_PATHS` list can come later if a second disk is added.
 
 ## M4: Discord alerts
 
@@ -82,6 +104,7 @@ None right now.
 
 Resolved:
 - **M2 plan** approved 2026-10-01.
+- **M3 plan** approved 2026-10-01.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
   `Dockerfile` and `compose.yaml`). It wasn't started; it was brought up with
   `docker compose up -d` on 2026-10-01 and the dashboard shows it with no code

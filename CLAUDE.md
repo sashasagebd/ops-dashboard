@@ -26,6 +26,7 @@ over Tailscale.
   - `internal/server/`: HTTP routes; reads snapshots through its `SnapshotSource` interface, never Docker directly
   - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %
   - `internal/docker/`: Docker Engine API client (plain `net/http`, no SDK)
+  - `internal/host/`: host CPU (`/proc/stat`), memory (`/proc/meminfo`) and disk (`statfs`, Linux-only via build tag; stub elsewhere so Windows dev still builds)
 - `frontend/`: Vite + React + TypeScript, Oxlint, Vitest + Testing Library
 - `Dockerfile`, `compose.yaml`: one image (Go serves the built frontend from `STATIC_DIR`) plus the socket proxy
 
