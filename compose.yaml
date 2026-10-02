@@ -15,7 +15,7 @@ services:
     depends_on:
       - docker-proxy
     networks:
-      - default # for the published port (and Discord webhooks, later)
+      - default # for the published port
       - docker-api # to reach the socket proxy
     # Hardening: the app writes nothing to disk and needs no Linux capabilities.
     read_only: true

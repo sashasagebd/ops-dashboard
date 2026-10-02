@@ -9,9 +9,9 @@ _Last updated: 2026-10-01_
 |---|---|
 | M1: Thinnest end-to-end slice | ✅ Done, deployed |
 | M2: Full container status | ✅ Done, deployed |
-| M3: Host stats | 🚧 In progress |
-| M4: Discord alerts | Not started |
-| M5: Portfolio polish | Not started |
+| M3: Host stats | ✅ Done, deployed |
+| M4: Discord alerts | ⏸️ Deferred (not in v1; plan kept below) |
+| M5: Portfolio polish | 🚧 In progress (5.1–5.2 done) |
 
 ## M1: Thinnest end-to-end slice ✅
 
@@ -58,7 +58,7 @@ Decisions (approved 2026-10-01):
 `docker ps -a` on the server shows no leftover containers, so "all containers"
 needs no filtering.
 
-## M3: Host stats 🚧
+## M3: Host stats ✅
 
 **Goal:** CPU, memory and disk for the whole server, above the container
 table, refreshing with it.
@@ -66,9 +66,9 @@ table, refreshing with it.
 | Step | What | Status |
 |---|---|---|
 | 3.1 | `internal/host` package: parse `/proc/stat` (CPU, from two samples like containers) and `/proc/meminfo` (used = `MemTotal` − `MemAvailable`); disk usage via `statfs`. Parsers tested against real fixture text; `statfs` is Linux-only, so it sits behind a build tag with a stub for Windows dev. | ✅ `7d88367`; CI (Ubuntu) passed, including the real disk read |
-| 3.2 | Monitor reads host stats on each poll; API gains a `host` object (additive: `{updatedAt, stale, host, containers}`). `host` is `null` if the read fails; containers are unaffected. | ✅ Done, not yet committed |
-| 3.3 | Frontend: three summary tiles (CPU %, memory used / total, disk used / total) with a usage bar. Page is now "Ops Dashboard" with Server and Containers sections; bars amber at 80%, red at 90%; "Server stats unavailable." when `host` is null. | ✅ Done, not yet committed |
-| 3.4 | Deploy; check the numbers against `top`, `free -h` and `df -h /` on the server; record decisions. | |
+| 3.2 | Monitor reads host stats on each poll; API gains a `host` object (additive: `{updatedAt, stale, host, containers}`). `host` is `null` if the read fails; containers are unaffected. | ✅ `965afce`, deployed |
+| 3.3 | Frontend: three summary tiles (CPU %, memory used / total, disk used / total) with a usage bar. Page is now "Ops Dashboard" with Server and Containers sections; bars amber at 80%, red at 90%; "Server stats unavailable." when `host` is null. | ✅ `965afce` (with 3.2), deployed |
+| 3.4 | Deploy; check the numbers against `top`, `free -h` and `df -h /` on the server; record decisions. | ✅ Deployed, tiles working on the server; decisions recorded |
 
 Decisions (approved 2026-10-01):
 - **No extra mounts.** The original idea was mounting the host's `/proc` and
@@ -85,18 +85,74 @@ Decisions (approved 2026-10-01):
 - **Disk is the root filesystem only.** Fine while everything lives on one
   disk; a `DISK_PATHS` list can come later if a second disk is added.
 
-## M4: Discord alerts
+## M4: Discord alerts ⏸️ Deferred
 
-Detect up↔down transitions from the poller's snapshots and post to
-`DISCORD_WEBHOOK_URL`. No alerts on startup (first poll is a baseline); a
-change only counts after N consecutive polls, so a quick restart doesn't
-alert twice. Known limitation: if the whole host is down, nothing alerts.
+Deferred on 2026-10-01: not needed right now, so it's out of v1 (see
+[spec.md](spec.md)). The plan below was drafted but never approved; review it
+again before starting. The number is kept so the milestone history stays
+readable, and M5 comes next.
 
-## M5: Portfolio polish
+**Goal:** a Discord message when a container goes down or comes back up,
+without false alarms from redeploys or brief blips.
 
-README with architecture diagram and screenshots, decision records, a Docker
-`HEALTHCHECK` (the distroless image has no curl, so the binary needs a
-`-healthcheck` mode), and a CI job that builds the Docker image.
+| Step | What |
+|---|---|
+| 4.1 | `internal/alert` detector: a pure function of successive snapshots → events (down / up / removed). Baseline on first poll, debounce, keyed by container name. Docker client also reads health (`State.Health.Status`) from the inspect it already does. Tests only, no sending. |
+| 4.2 | `internal/discord` webhook client: one embed per event (red down, green up), 10s timeout, honours Discord's 429 `retry_after`, never logs the URL. Tested with `httptest`. |
+| 4.3 | Wiring: detector runs after each successful poll; a sender goroutine with a small queue so a slow Discord never delays polling. Config `DISCORD_WEBHOOK_URL` (unset = alerts off, logged once) and `ALERT_AFTER_POLLS` (default 3). A "dashboard started" message on boot. Docs: `.env.example`, README, compose. |
+| 4.4 | Deploy; `docker stop` the bot → down alert, start it → up alert; record decisions. |
+
+Draft decisions (not approved):
+- **"Down" = not running, or running but unhealthy.** Containers with a
+  healthcheck (Minecraft has one) can be up but hung; that's the failure most
+  worth knowing about. Containers without a healthcheck only go by state.
+- **Debounce: a change counts after 3 polls in a row (~15s).** A redeploy's
+  container recreate, or a single failed poll, doesn't alert. A Minecraft
+  restart that takes a minute *does* alert down then up, which is correct.
+- **Keyed by name, not ID.** `docker compose up --build` replaces the
+  container (new ID, same name); by ID that would look like one container
+  removed and another added.
+- **First poll is a baseline; new containers join silently.** Starting the
+  dashboard, or adding a service, doesn't send a burst of alerts.
+- **A container that disappears alerts once as "removed"**, so a crashed
+  `--rm` container isn't silent. A deliberate removal costs one message.
+- **No alerts while Docker is unreachable.** Failed polls don't feed the
+  detector, so a proxy blip can't mark everything down. The banner already
+  covers it on the page.
+- **"Dashboard started" message on boot.** Partly covers the known limitation
+  (nothing alerts while the whole host is down): after a reboot or power cut,
+  this message tells you it happened.
+- **Alerts are best-effort.** Up to 3 attempts with backoff, then logged and
+  dropped. No persistence: a restart forgets pending alerts, which is fine for
+  a home server.
+
+## M5: Portfolio polish 🚧
+
+**Goal:** someone landing on the GitHub repo understands what it is, how it's
+built and why, in a couple of minutes, and the deploy is a bit more robust.
+
+| Step | What | Status |
+|---|---|---|
+| 5.1 | `dashboard -healthcheck`: GETs its own `/healthz` and exits 0/1. Dockerfile `HEALTHCHECK` uses it (distroless has no curl or shell). The dashboard's own row then shows "(healthy)". | ✅ Done, not yet committed |
+| 5.2 | CI job that builds the Docker image (no push), so a broken Dockerfile fails the PR instead of the deploy. Also starts the image and runs the healthcheck inside it, since the dev PC has no Docker. | ✅ Done, not yet committed |
+| 5.3 | Demo mode (`DEMO=1`): fake Docker and host readers with realistic, gently changing data, so the UI runs with no Docker at all. For screenshots without real hostnames, and for anyone cloning the repo. | |
+| 5.4 | README rewrite: screenshot, architecture diagram, security model, key decisions (linking `decisions/stack.md`), how it was built with AI, run/deploy. | |
+| 5.5 | Deploy, check the healthcheck on the server, tag `v1.0.0`. | |
+
+Decisions (approved 2026-10-01):
+- **Healthcheck in the binary itself**, not a separate tool: the image stays
+  distroless with nothing extra in it. Checks the process only (`/healthz`),
+  not Docker, for the reason in `handleHealthz`.
+- **Diagram in Mermaid**: GitHub renders it natively, and it lives as text in
+  the repo, so it's diffable and stays in sync with the code.
+- **Demo mode reuses the interfaces** (`monitor.Docker`, `monitor.HostReader`)
+  with fakes, so it's a few small files and no changes to the real code
+  paths. It also shows the interface design paying off.
+- **A "How this was built" README section**: the workflow (spec → milestone
+  plan → small reviewed steps, `CLAUDE.md`, tests as guardrails, decisions
+  written down), since showing AI used well is part of the project's point.
+- **No image publishing** (e.g. to GHCR) for now: the server builds from
+  source, so a registry would add moving parts for no gain.
 
 ## Open questions
 
@@ -105,6 +161,7 @@ None right now.
 Resolved:
 - **M2 plan** approved 2026-10-01.
 - **M3 plan** approved 2026-10-01.
+- **M5 plan** approved 2026-10-01.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
   `Dockerfile` and `compose.yaml`). It wasn't started; it was brought up with
   `docker compose up -d` on 2026-10-01 and the dashboard shows it with no code

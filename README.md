@@ -1,7 +1,7 @@
 # Ops Dashboard
 
 A self-hosted monitoring dashboard for my home server: which containers are
-running, how the host is doing, and a Discord alert when a service goes down.
+running, what they're using, and how the host is doing.
 
 See [docs/spec.md](docs/spec.md) for scope and [docs/decisions/](docs/decisions/)
 for the reasoning behind the main design choices.

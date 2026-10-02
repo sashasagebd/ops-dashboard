@@ -42,7 +42,7 @@ npm run lint && npm test && npm run build
 npm run dev                       # :5173, forwards /api to :8080 (or $API_TARGET, e.g. the server's ts.net URL for real data)
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly these checks; keep them green.
+CI (`.github/workflows/ci.yml`) runs exactly these checks, plus a job that builds the Docker image and runs `/dashboard -healthcheck` inside it (the only place the image is tested, since the dev PC has no Docker); keep them green.
 
 ## Constraints (do not break)
 

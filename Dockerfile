@@ -27,4 +27,9 @@ COPY --from=backend /out/dashboard /dashboard
 COPY --from=frontend /src/dist /static
 ENV STATIC_DIR=/static
 EXPOSE 8080
+# The image has no curl or shell, so the binary checks itself (exec form, no
+# shell needed). Docker marks the container unhealthy after 3 failed checks;
+# start-period gives it time to start listening before failures count.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/dashboard", "-healthcheck"]
 ENTRYPOINT ["/dashboard"]

@@ -14,7 +14,7 @@ Talking to the Docker API:
 Serving the frontend: 
     One container. A multi-stage Dockerfile builds the frontend, then the Go binary, and Go serves both the API and the static files from one origin. That means one port to bind to 127.0.0.1, no CORS, and one target for tailscale serve. The static files are read from a folder set by an env var, not go:embed, so the backend CI job can run go build without the frontend having been built first.
 Getting container data to the page: 
-    A background poller asks Docker every POLL_INTERVAL (default 5s) and keeps the latest snapshot in memory; API requests only read that snapshot. The alternative, calling Docker on every page request, would make each request wait on several Docker calls per container, multiply load with every open tab, and leave nowhere to keep the previous sample that CPU % needs. The Discord alerts (M4) also need something watching continuously, even with no browser open, and they reuse the same poller. 
+    A background poller asks Docker every POLL_INTERVAL (default 5s) and keeps the latest snapshot in memory; API requests only read that snapshot. The alternative, calling Docker on every page request, would make each request wait on several Docker calls per container, multiply load with every open tab, and leave nowhere to keep the previous sample that CPU % needs. It also leaves room for alerts later (deferred for now): they'd need something watching continuously, even with no browser open, and could reuse the same poller. 
     Tests call Poll() directly instead of waiting on a timer, so they're fast and never flaky.
 
 Measuring CPU: 
@@ -27,3 +27,12 @@ When Docker is unreachable:
 
 Refreshing the page: 
     A small custom React hook (usePolling) instead of a library like TanStack Query. There's one endpoint, so the library's caching and deduplication wouldn't earn the dependency. The hook schedules the next fetch after each response (so requests never overlap), pauses while the tab is hidden, and keeps the old data when a refresh fails.
+
+Reading host stats: 
+    No extra volume mounts. The first plan was to mount the host's /proc and / read-only into the container. But /proc/stat and /proc/meminfo aren't namespaced, so a container already sees the whole host's CPU and memory, and statfs on the container's own / reports the filesystem Docker keeps everything on, which is the host's root disk. Mounting the host's / would have let the dashboard read every world-readable file on the server for nothing. 
+    Memory "used" is MemTotal minus MemAvailable (the kernel's own estimate of what can be freed), the same way current versions of free work, and consistent with container memory leaving out cache. 
+    Disk % is used / (used + available), like df's Use%. ext4 reserves about 5% of the disk for root, which counts as neither, so used / total would read low and never reach 100% on a full disk. 
+    statfs is Linux-only, so it sits behind a build tag with a stub; the package still builds and its parser tests still run on a Windows dev machine, and CI on Ubuntu covers the real thing.
+
+Host and containers in one response: 
+    Host stats ride along in /api/containers instead of a second endpoint. Everything on the page then comes from the same poll, there's one stale flag, and one request per refresh. If the host read fails, "host" is null and the containers still update.

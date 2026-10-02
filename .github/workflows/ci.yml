@@ -60,3 +60,33 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Plain `docker build` (BuildKit is the default) rather than a
+      # build action: nothing is pushed, so there's nothing to configure.
+      - name: Build
+        run: docker build -t ops-dashboard:ci .
+
+      - name: Check the HEALTHCHECK is set
+        run: |
+          test "$(docker inspect -f '{{json .Config.Healthcheck.Test}}' ops-dashboard:ci)" = '["CMD","/dashboard","-healthcheck"]'
+
+      # Start the image and run the same command Docker's HEALTHCHECK runs.
+      # There's no socket proxy here, so polling Docker fails (and logs
+      # errors), but /healthz doesn't depend on Docker, so it should pass.
+      - name: Smoke test
+        run: |
+          docker run -d --name dashboard ops-dashboard:ci
+          for i in $(seq 1 10); do
+            if docker exec dashboard /dashboard -healthcheck; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs dashboard
+          exit 1

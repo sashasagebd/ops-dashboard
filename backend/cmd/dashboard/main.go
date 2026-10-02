@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -20,17 +21,28 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	checkHealth := flag.Bool("healthcheck", false, "check that a running dashboard is serving, then exit (for Docker's HEALTHCHECK)")
+	flag.Parse()
+
+	// Listens on all interfaces inside the container. Restricting access to
+	// 127.0.0.1 happens in the Compose port mapping, on the host side.
+	addr := envOr("LISTEN_ADDR", ":8080")
+
+	if *checkHealth {
+		if err := healthcheck(addr); err != nil {
+			fmt.Fprintln(os.Stderr, "unhealthy:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if err := run(addr); err != nil {
 		slog.Error("dashboard exited", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	// Listens on all interfaces inside the container. Restricting access to
-	// 127.0.0.1 happens in the Compose port mapping, on the host side.
-	addr := envOr("LISTEN_ADDR", ":8080")
-
+func run(addr string) error {
 	// The default matches the proxy's service name in compose.yaml.
 	dockerClient, err := docker.NewClient(envOr("DOCKER_HOST", "tcp://docker-proxy:2375"))
 	if err != nil {
