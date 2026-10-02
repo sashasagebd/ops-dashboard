@@ -22,7 +22,7 @@ over Tailscale.
 ## Layout
 
 - `backend/`: Go module `github.com/sashasagebd/ops-dashboard/backend`
-  - `cmd/dashboard/`: entrypoint, config from env vars
+  - `cmd/dashboard/`: entrypoint, config from env vars; `-healthcheck` flag for the Dockerfile's `HEALTHCHECK` (GETs its own `/healthz`, exits 0/1)
   - `internal/server/`: HTTP routes; reads snapshots through its `SnapshotSource` interface, never Docker directly
   - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %
   - `internal/docker/`: Docker Engine API client (plain `net/http`, no SDK)
@@ -30,11 +30,18 @@ over Tailscale.
 - `frontend/`: Vite + React + TypeScript, Oxlint, Vitest + Testing Library
 - `Dockerfile`, `compose.yaml`: one image (Go serves the built frontend from `STATIC_DIR`) plus the socket proxy
 
+## API
+
+- `GET /healthz`: `{"status":"ok"}` whenever the process is serving; deliberately doesn't check Docker.
+- `GET /api/containers`: `{updatedAt, stale, host, containers}` from the monitor's latest snapshot; 502 only if no poll has ever succeeded. `host` is null if it couldn't be read. Per container: `id, name, image, state, health, status, startedAt, finishedAt, cpuPercent, memoryBytes, memoryLimitBytes`. Values that don't apply are `null`, never 0. CPU is percent of the whole host (0–100), for containers and host alike.
+- Types: `containersResponse` in `backend/internal/server/server.go`, mirrored in `frontend/src/api.ts`; keep them in sync.
+
 ## Commands
 
 ```sh
 # Backend (from backend/)
 gofmt -l . && go vet ./... && go test -race ./... && go build ./...
+GOOS=linux go vet ./...           # dev PC is Windows; this type-checks Linux-only code (disk_linux.go)
 go run ./cmd/dashboard            # :8080; /api/containers is 502 without a proxy
 
 # Frontend (from frontend/)
@@ -43,6 +50,8 @@ npm run dev                       # :5173, forwards /api to :8080 (or $API_TARGE
 ```
 
 CI (`.github/workflows/ci.yml`) runs exactly these checks, plus a job that builds the Docker image and runs `/dashboard -healthcheck` inside it (the only place the image is tested, since the dev PC has no Docker); keep them green.
+
+Deploying is done by the owner on the server (`homelab`), which only pulls: `cd ~/apps/dashboard && git pull && docker compose up -d --build`. The server's only local file is its git-ignored `.env`. After a change that needs checking on the real server, end the step with exact commands for the owner to run and what output to expect.
 
 ## Constraints (do not break)
 

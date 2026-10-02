@@ -88,9 +88,9 @@ docker compose up -d --build
 Check it's up, from the server:
 
 ```sh
-docker compose ps
+docker compose ps                              # dashboard shows "(healthy)" ~30s after start
 curl -s http://127.0.0.1:8080/healthz          # {"status":"ok"}
-curl -s http://127.0.0.1:8080/api/containers   # JSON list of all containers, including stopped ones
+curl -s http://127.0.0.1:8080/api/containers   # JSON: host stats plus every container, including stopped ones
 ```
 
 Expose it to your tailnet over HTTPS (needs MagicDNS and HTTPS certificates

@@ -36,3 +36,12 @@ Reading host stats:
 
 Host and containers in one response: 
     Host stats ride along in /api/containers instead of a second endpoint. Everything on the page then comes from the same poll, there's one stale flag, and one request per refresh. If the host read fails, "host" is null and the containers still update.
+
+Docker healthcheck: 
+    The binary checks itself (`/dashboard -healthcheck` GETs its own /healthz and exits 0 or 1), because the distroless image has no curl, wget or shell, and adding them would undo the point of distroless. It only asks "is the server responding?", not "can it reach Docker?": a dashboard that's serving its stale-data page is working as designed, and shouldn't be marked unhealthy because the proxy blipped. Health is information only; nothing restarts unhealthy containers.
+
+Testing the image in CI: 
+    A CI job builds the image, checks the HEALTHCHECK is set, starts it and runs the healthcheck inside it. The dev PC has no Docker, so before this the image was only ever tested by deploying it. Plain `docker build`, not a build action, since nothing is pushed.
+
+Showing container health: 
+    A badge next to the state (green healthy, amber starting, red unhealthy), not a tooltip: a tooltip is easy to miss and doesn't exist on a phone, and "running but unhealthy" (e.g. a hung Minecraft server) is exactly what a monitoring page must not hide. Containers without a healthcheck get no badge, so you can tell which ones are really tested. Docker keeps the last health result after a container stops, so the API sends null for stopped containers rather than a stale "healthy".

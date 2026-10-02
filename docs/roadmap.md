@@ -13,6 +13,15 @@ _Last updated: 2026-10-01_
 | M4: Discord alerts | ⏸️ Deferred (not in v1; plan kept below) |
 | M5: Portfolio polish | 🚧 In progress (5.1–5.3 done) |
 
+**Where we left off (2026-10-01):** 5.1–5.3 are committed but not deployed.
+Next:
+1. Check the new **Docker image** job in GitHub Actions is green (it's the
+   only test of the image itself).
+2. Deploy (`cd ~/apps/dashboard && git pull && docker compose up -d --build`),
+   then check `docker ps` shows the dashboard `(healthy)` after ~30s and the
+   page shows `healthy` badges on `mc` and the dashboard.
+3. Start 5.4 (demo mode). The M5 plan is already approved.
+
 ## M1: Thinnest end-to-end slice ✅
 
 One Go endpoint returning running containers as JSON, one React page showing
@@ -97,7 +106,7 @@ without false alarms from redeploys or brief blips.
 
 | Step | What |
 |---|---|
-| 4.1 | `internal/alert` detector: a pure function of successive snapshots → events (down / up / removed). Baseline on first poll, debounce, keyed by container name. Docker client also reads health (`State.Health.Status`) from the inspect it already does. Tests only, no sending. |
+| 4.1 | `internal/alert` detector: a pure function of successive snapshots → events (down / up / removed). Baseline on first poll, debounce, keyed by container name. Health is already read (5.3), so "unhealthy" can count as down. Tests only, no sending. |
 | 4.2 | `internal/discord` webhook client: one embed per event (red down, green up), 10s timeout, honours Discord's 429 `retry_after`, never logs the URL. Tested with `httptest`. |
 | 4.3 | Wiring: detector runs after each successful poll; a sender goroutine with a small queue so a slow Discord never delays polling. Config `DISCORD_WEBHOOK_URL` (unset = alerts off, logged once) and `ALERT_AFTER_POLLS` (default 3). A "dashboard started" message on boot. Docs: `.env.example`, README, compose. |
 | 4.4 | Deploy; `docker stop` the bot → down alert, start it → up alert; record decisions. |
@@ -133,9 +142,9 @@ built and why, in a couple of minutes, and the deploy is a bit more robust.
 
 | Step | What | Status |
 |---|---|---|
-| 5.1 | `dashboard -healthcheck`: GETs its own `/healthz` and exits 0/1. Dockerfile `HEALTHCHECK` uses it (distroless has no curl or shell). The dashboard's own row then gets a `healthy` badge (5.3). | ✅ Done, not yet committed |
-| 5.2 | CI job that builds the Docker image (no push), so a broken Dockerfile fails the PR instead of the deploy. Also starts the image and runs the healthcheck inside it, since the dev PC has no Docker. | ✅ Done, not yet committed |
-| 5.3 | Health badges: Docker client reads `State.Health.Status` from the inspect it already does; API `health` (null if no healthcheck or not running, since Docker keeps a stale value after stop); green `healthy` / amber `starting` / red `unhealthy` badge next to the state. Replaces relying on the Uptime tooltip, which is easy to miss and invisible on phones. | ✅ Done, not yet committed |
+| 5.1 | `dashboard -healthcheck`: GETs its own `/healthz` and exits 0/1. Dockerfile `HEALTHCHECK` uses it (distroless has no curl or shell). The dashboard's own row then gets a `healthy` badge (5.3). | ✅ `5ca4416`; not yet deployed |
+| 5.2 | CI job that builds the Docker image (no push), so a broken Dockerfile fails the PR instead of the deploy. Also starts the image and runs the healthcheck inside it, since the dev PC has no Docker. | ✅ `5ca4416`; first CI run of the Docker job not yet confirmed green |
+| 5.3 | Health badges: Docker client reads `State.Health.Status` from the inspect it already does; API `health` (null if no healthcheck or not running, since Docker keeps a stale value after stop); green `healthy` / amber `starting` / red `unhealthy` badge next to the state. Replaces relying on the Uptime tooltip, which is easy to miss and invisible on phones. | ✅ `3f5bd6d`; not yet deployed |
 | 5.4 | Demo mode (`DEMO=1`): fake Docker and host readers with realistic, gently changing data, so the UI runs with no Docker at all. For screenshots without real hostnames, and for anyone cloning the repo. | |
 | 5.5 | README rewrite: screenshot, architecture diagram, security model, key decisions (linking `decisions/stack.md`), how it was built with AI, run/deploy. | |
 | 5.6 | Deploy, check the healthcheck on the server, tag `v1.0.0`. | |
@@ -179,5 +188,9 @@ Resolved:
 - **Minecraft is published on `0.0.0.0:25565`**, so it's reachable from the LAN
   (and the internet, if the router forwards it) regardless of UFW. Fine if
   intended; not a dashboard issue.
+- **Unhealthy doesn't restart anything.** Plain Docker only records health;
+  `restart: unless-stopped` acts when a container exits, not when it's
+  unhealthy. The badge is information, not recovery. (Autoheal-style tools
+  exist if that's ever wanted, but they need write access to Docker.)
 - **Local `-race` on Windows** needs gcc; WinLibs is installed via winget and
   on the user PATH (a fully restarted VS Code picks it up).
