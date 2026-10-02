@@ -29,8 +29,7 @@ const statsCgroupV2 = `{
   "networks": {"eth0": {"rx_bytes": 1000, "tx_bytes": 2000}}
 }`
 
-// statsCgroupV1 is the older layout: per-CPU usage, "total_inactive_file",
-// and (on old engines) no online_cpus.
+// statsCgroupV1 is the older layout, with "total_inactive_file".
 const statsCgroupV1 = `{
   "read": "2026-10-01T12:00:00Z",
   "cpu_stats": {
@@ -57,19 +56,17 @@ func TestContainerStats(t *testing.T) {
 				Read:           time.Date(2026, 10, 1, 12, 0, 0, 500_000_000, time.UTC),
 				CPUUsage:       52_000_000_000,
 				SystemCPUUsage: 9_100_000_000_000,
-				OnlineCPUs:     4,
 				MemoryUsed:     2147483648 - 536870912,
 				MemoryLimit:    16596942848,
 			},
 		},
 		{
-			name: "cgroup v1 counts CPUs from percpu_usage",
+			name: "cgroup v1",
 			body: statsCgroupV1,
 			want: Stats{
 				Read:           time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
 				CPUUsage:       1000,
 				SystemCPUUsage: 50000,
-				OnlineCPUs:     4,
 				MemoryUsed:     700, // total_inactive_file wins on cgroup v1
 				MemoryLimit:    8000,
 			},
@@ -139,8 +136,10 @@ func TestMemoryUsed(t *testing.T) {
 }
 
 func TestCPUPercent(t *testing.T) {
-	// prev is a sample on a 4-core host; each case varies cur.
-	prev := Stats{CPUUsage: 10_000, SystemCPUUsage: 1_000_000, OnlineCPUs: 4}
+	// prev is a sample on a 4-core host; each case varies cur. Between the
+	// samples the host's 4 cores together pass 400 units of CPU time (100
+	// each).
+	prev := Stats{CPUUsage: 10_000, SystemCPUUsage: 1_000_000}
 
 	tests := []struct {
 		name   string
@@ -149,32 +148,30 @@ func TestCPUPercent(t *testing.T) {
 		wantOK bool
 	}{
 		{
-			// The host used 400 units of CPU time across 4 cores (100 each);
-			// the container used 100, i.e. one full core.
-			name:   "one full core",
-			cur:    Stats{CPUUsage: 10_100, SystemCPUUsage: 1_000_400, OnlineCPUs: 4},
+			name:   "one full core of four is 25% of the host",
+			cur:    Stats{CPUUsage: 10_100, SystemCPUUsage: 1_000_400},
+			want:   25,
+			wantOK: true,
+		},
+		{
+			name:   "all four cores is 100%",
+			cur:    Stats{CPUUsage: 10_400, SystemCPUUsage: 1_000_400},
 			want:   100,
 			wantOK: true,
 		},
 		{
-			name:   "all four cores",
-			cur:    Stats{CPUUsage: 10_400, SystemCPUUsage: 1_000_400, OnlineCPUs: 4},
-			want:   400,
-			wantOK: true,
-		},
-		{
 			name:   "idle",
-			cur:    Stats{CPUUsage: 10_000, SystemCPUUsage: 1_000_400, OnlineCPUs: 4},
+			cur:    Stats{CPUUsage: 10_000, SystemCPUUsage: 1_000_400},
 			want:   0,
 			wantOK: true,
 		},
 		{
 			name: "container restarted, so its counter went backwards",
-			cur:  Stats{CPUUsage: 50, SystemCPUUsage: 1_000_400, OnlineCPUs: 4},
+			cur:  Stats{CPUUsage: 50, SystemCPUUsage: 1_000_400},
 		},
 		{
 			name: "no host time passed",
-			cur:  Stats{CPUUsage: 10_100, SystemCPUUsage: 1_000_000, OnlineCPUs: 4},
+			cur:  Stats{CPUUsage: 10_100, SystemCPUUsage: 1_000_000},
 		},
 		{
 			name: "stopped container (all zero)",

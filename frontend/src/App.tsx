@@ -21,7 +21,7 @@ function App() {
     // first request from updating state after it's been thrown away.
     const controller = new AbortController()
     fetchContainers(controller.signal)
-      .then((containers) => setState({ status: 'ok', containers, loadedAt: Date.now() }))
+      .then((res) => setState({ status: 'ok', containers: res.containers, loadedAt: Date.now() }))
       .catch((err: unknown) => {
         if (controller.signal.aborted) return
         setState({ status: 'error', message: err instanceof Error ? err.message : String(err) })

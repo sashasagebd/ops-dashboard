@@ -1,8 +1,6 @@
 package server
 
 import (
-	"context"
-	"errors"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -12,16 +10,17 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/monitor"
 )
 
-// fakeLister is a ContainerLister that returns canned results.
-type fakeLister struct {
-	containers []docker.Container
-	err        error
+// fakeSource is a SnapshotSource that returns a canned snapshot.
+type fakeSource struct {
+	snap monitor.Snapshot
+	ok   bool
 }
 
-func (f *fakeLister) ListContainers(context.Context) ([]docker.Container, error) {
-	return f.containers, f.err
+func (f *fakeSource) Snapshot() (monitor.Snapshot, bool) {
+	return f.snap, f.ok
 }
 
 func TestHealthz(t *testing.T) {
@@ -40,7 +39,7 @@ func TestHealthz(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/healthz", nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeLister{}, nil).ServeHTTP(rec, req)
+			New(&fakeSource{}, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -59,50 +58,68 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestListContainers(t *testing.T) {
+	updated := time.Date(2026, 10, 1, 12, 0, 5, 0, time.UTC)
+
 	tests := []struct {
 		name       string
-		lister     *fakeLister
+		source     *fakeSource
 		wantStatus int
 		wantBody   string
 	}{
 		{
-			name: "returns containers sorted by name",
-			lister: &fakeLister{containers: []docker.Container{
-				{ID: "b2", Name: "minecraft", Image: "itzg/minecraft-server", State: "running", Status: "Up 3 hours"},
-				{ID: "a1", Name: "discord-bot", Image: "discord-bot:latest", State: "running", Status: "Up 2 days"},
+			name: "running container with stats, stopped one without",
+			source: &fakeSource{ok: true, snap: monitor.Snapshot{
+				UpdatedAt: updated,
+				Containers: []monitor.ContainerStatus{
+					{
+						Container: docker.Container{
+							ID: "a1", Name: "discordbot", Image: "discordbot", State: "exited", Status: "Exited (1) 20 minutes ago",
+							StartedAt:  time.Date(2026, 9, 29, 4, 30, 0, 0, time.UTC),
+							FinishedAt: time.Date(2026, 10, 1, 11, 40, 0, 0, time.UTC),
+						},
+					},
+					{
+						Container: docker.Container{
+							ID: "b2", Name: "mc", Image: "itzg/minecraft-server", State: "running", Status: "Up 3 hours",
+							StartedAt: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC),
+						},
+						HasStats: true, MemoryUsed: 2147483648, MemoryLimit: 16596942848,
+						HasCPU: true, CPUPercent: 12.5,
+					},
+				},
 			}},
 			wantStatus: http.StatusOK,
-			wantBody: `[{"id":"a1","name":"discord-bot","image":"discord-bot:latest","state":"running","status":"Up 2 days","startedAt":null,"finishedAt":null},` +
-				`{"id":"b2","name":"minecraft","image":"itzg/minecraft-server","state":"running","status":"Up 3 hours","startedAt":null,"finishedAt":null}]`,
+			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"containers":[` +
+				`{"id":"a1","name":"discordbot","image":"discordbot","state":"exited","status":"Exited (1) 20 minutes ago",` +
+				`"startedAt":"2026-09-29T04:30:00Z","finishedAt":"2026-10-01T11:40:00Z",` +
+				`"cpuPercent":null,"memoryBytes":null,"memoryLimitBytes":null},` +
+				`{"id":"b2","name":"mc","image":"itzg/minecraft-server","state":"running","status":"Up 3 hours",` +
+				`"startedAt":"2026-10-01T09:00:00Z","finishedAt":null,` +
+				`"cpuPercent":12.5,"memoryBytes":2147483648,"memoryLimitBytes":16596942848}]}`,
 		},
 		{
-			name: "times are RFC 3339, and zero times are null",
-			lister: &fakeLister{containers: []docker.Container{
-				{
-					ID: "a1", Name: "discord-bot", Image: "discord-bot:latest", State: "exited", Status: "Exited (1) 20 minutes ago",
-					StartedAt:  time.Date(2026, 9, 29, 4, 30, 0, 0, time.UTC),
-					FinishedAt: time.Date(2026, 10, 1, 11, 40, 0, 0, time.UTC),
-				},
-				{
-					ID: "b2", Name: "minecraft", Image: "itzg/minecraft-server", State: "running", Status: "Up 3 hours",
-					StartedAt: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC),
-				},
+			name: "memory without CPU on the first poll",
+			source: &fakeSource{ok: true, snap: monitor.Snapshot{
+				UpdatedAt: updated,
+				Containers: []monitor.ContainerStatus{{
+					Container: docker.Container{ID: "b2", Name: "mc", State: "running"},
+					HasStats:  true, MemoryUsed: 100, MemoryLimit: 1000,
+				}},
 			}},
 			wantStatus: http.StatusOK,
-			wantBody: `[{"id":"a1","name":"discord-bot","image":"discord-bot:latest","state":"exited","status":"Exited (1) 20 minutes ago",` +
-				`"startedAt":"2026-09-29T04:30:00Z","finishedAt":"2026-10-01T11:40:00Z"},` +
-				`{"id":"b2","name":"minecraft","image":"itzg/minecraft-server","state":"running","status":"Up 3 hours",` +
-				`"startedAt":"2026-10-01T09:00:00Z","finishedAt":null}]`,
+			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"containers":[` +
+				`{"id":"b2","name":"mc","image":"","state":"running","status":"",` +
+				`"startedAt":null,"finishedAt":null,"cpuPercent":null,"memoryBytes":100,"memoryLimitBytes":1000}]}`,
 		},
 		{
-			name:       "no containers encodes as empty array",
-			lister:     &fakeLister{},
+			name:       "stale snapshot is still served, marked stale",
+			source:     &fakeSource{ok: true, snap: monitor.Snapshot{UpdatedAt: updated, Stale: true}},
 			wantStatus: http.StatusOK,
-			wantBody:   `[]`,
+			wantBody:   `{"updatedAt":"2026-10-01T12:00:05Z","stale":true,"containers":[]}`,
 		},
 		{
-			name:       "Docker error returns 502 without leaking details",
-			lister:     &fakeLister{err: errors.New("dial tcp docker-proxy:2375: connection refused")},
+			name:       "no successful poll yet returns 502 without details",
+			source:     &fakeSource{},
 			wantStatus: http.StatusBadGateway,
 			wantBody:   `{"error":"could not list containers"}`,
 		},
@@ -113,7 +130,7 @@ func TestListContainers(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/containers", nil)
 			rec := httptest.NewRecorder()
 
-			New(tt.lister, nil).ServeHTTP(rec, req)
+			New(tt.source, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -144,7 +161,10 @@ func TestStaticFiles(t *testing.T) {
 		{name: "root serves index.html", static: static, path: "/", wantStatus: http.StatusOK, wantBody: "<h1>dashboard</h1>"},
 		{name: "assets are served", static: static, path: "/assets/index.js", wantStatus: http.StatusOK, wantBody: "console.log('hi')"},
 		{name: "missing file is 404", static: static, path: "/nope.js", wantStatus: http.StatusNotFound},
-		{name: "API still wins over static files", static: static, path: "/api/containers", wantStatus: http.StatusOK, wantBody: "[]"},
+		{
+			name: "API still wins over static files", static: static, path: "/api/containers",
+			wantStatus: http.StatusOK, wantBody: `{"updatedAt":"0001-01-01T00:00:00Z","stale":false,"containers":[]}`,
+		},
 		{name: "no static files configured", static: nil, path: "/", wantStatus: http.StatusNotFound},
 	}
 
@@ -153,7 +173,7 @@ func TestStaticFiles(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeLister{}, tt.static).ServeHTTP(rec, req)
+			New(&fakeSource{ok: true}, tt.static).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)

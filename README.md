@@ -55,6 +55,7 @@ cd frontend && npm run lint && npm test && npm run build
 |---|---|---|
 | `LISTEN_ADDR` | `:8080` | backend: address to listen on |
 | `DOCKER_HOST` | `tcp://docker-proxy:2375` | backend: socket proxy address (`tcp://` only) |
+| `POLL_INTERVAL` | `5s` | backend: how often to poll Docker (Go duration, minimum `1s`) |
 | `STATIC_DIR` | unset | backend: built frontend to serve (set to `/static` in the image) |
 | `DASHBOARD_PORT` | `8080` | compose: host port, always bound to `127.0.0.1` |
 

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/monitor"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/server"
 )
 
@@ -34,23 +36,38 @@ func run() error {
 		return err
 	}
 
+	pollInterval, err := time.ParseDuration(envOr("POLL_INTERVAL", "5s"))
+	if err != nil {
+		return fmt.Errorf("POLL_INTERVAL: %w", err)
+	}
+	// Each poll makes a few requests per container; much faster than this
+	// would just load Docker for numbers nobody can read that quickly.
+	if pollInterval < time.Second {
+		return fmt.Errorf("POLL_INTERVAL %s: must be at least 1s", pollInterval)
+	}
+
 	// The built frontend. Unset in development, where Vite serves it instead.
 	var static fs.FS
 	if dir := os.Getenv("STATIC_DIR"); dir != "" {
 		static = os.DirFS(dir)
 	}
 
+	// docker stop sends SIGTERM; Ctrl+C sends SIGINT.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// The monitor polls Docker in the background; requests only read its
+	// latest snapshot. It stops when ctx is cancelled at shutdown.
+	mon := monitor.New(dockerClient)
+	go mon.Run(ctx, pollInterval)
+
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: server.New(dockerClient, static),
+		Handler: server.New(mon, static),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
-	// docker stop sends SIGTERM; Ctrl+C sends SIGINT.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {

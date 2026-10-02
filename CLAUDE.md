@@ -23,7 +23,8 @@ over Tailscale.
 
 - `backend/`: Go module `github.com/sashasagebd/ops-dashboard/backend`
   - `cmd/dashboard/`: entrypoint, config from env vars
-  - `internal/server/`: HTTP routes; declares the interfaces it consumes (e.g. `ContainerLister`)
+  - `internal/server/`: HTTP routes; reads snapshots through its `SnapshotSource` interface, never Docker directly
+  - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %
   - `internal/docker/`: Docker Engine API client (plain `net/http`, no SDK)
 - `frontend/`: Vite + React + TypeScript, Oxlint, Vitest + Testing Library
 - `Dockerfile`, `compose.yaml`: one image (Go serves the built frontend from `STATIC_DIR`) plus the socket proxy

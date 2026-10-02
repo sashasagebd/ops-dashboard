@@ -2,30 +2,28 @@
 package server
 
 import (
-	"context"
 	"encoding/json"
 	"io/fs"
 	"log/slog"
 	"net/http"
-	"slices"
-	"strings"
 	"time"
 
-	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/monitor"
 )
 
-// ContainerLister is the slice of Docker access the server needs. It's
-// declared here, where it's used, so tests can pass a fake.
-type ContainerLister interface {
-	ListContainers(ctx context.Context) ([]docker.Container, error)
+// SnapshotSource provides the latest container data. It's declared here,
+// where it's used, so tests can pass a fake; in production it's a
+// *monitor.Monitor.
+type SnapshotSource interface {
+	Snapshot() (snap monitor.Snapshot, ok bool)
 }
 
 // New returns the dashboard's HTTP handler. If static is non-nil, its files
 // (the built frontend) are served for every path the API doesn't claim.
-func New(containers ContainerLister, static fs.FS) http.Handler {
+func New(snapshots SnapshotSource, static fs.FS) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /api/containers", handleListContainers(containers))
+	mux.HandleFunc("GET /api/containers", handleListContainers(snapshots))
 	if static != nil {
 		// "GET /" matches everything, but ServeMux always prefers the most
 		// specific pattern, so the API routes above still win.
@@ -41,20 +39,32 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// containerResponse is the JSON shape of one container in the API. It's kept
-// separate from docker.Container so the API contract doesn't change by
-// accident when the internal type does.
+// containersResponse is the JSON body of GET /api/containers. The API types
+// are kept separate from the monitor's so the API contract doesn't change by
+// accident when an internal type does.
+type containersResponse struct {
+	UpdatedAt  time.Time           `json:"updatedAt"`
+	Stale      bool                `json:"stale"` // the latest poll failed; data is from UpdatedAt
+	Containers []containerResponse `json:"containers"`
+}
+
+// containerResponse is one container in the API.
 //
 // Times are sent as timestamps rather than a computed uptime, so the browser
 // can work out "up 3h 12m" against its own clock however old the response is.
+// Values that don't apply are null rather than 0, so "no data" can't be
+// mistaken for "idle".
 type containerResponse struct {
-	ID         string     `json:"id"`
-	Name       string     `json:"name"`
-	Image      string     `json:"image"`
-	State      string     `json:"state"`
-	Status     string     `json:"status"`
-	StartedAt  *time.Time `json:"startedAt"`  // null if never started
-	FinishedAt *time.Time `json:"finishedAt"` // null if never stopped
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	Image            string     `json:"image"`
+	State            string     `json:"state"`
+	Status           string     `json:"status"`
+	StartedAt        *time.Time `json:"startedAt"`        // null if never started
+	FinishedAt       *time.Time `json:"finishedAt"`       // null if never stopped
+	CPUPercent       *float64   `json:"cpuPercent"`       // share of the whole host, 0–100; null until two samples
+	MemoryBytes      *uint64    `json:"memoryBytes"`      // null if not running or unreadable
+	MemoryLimitBytes *uint64    `json:"memoryLimitBytes"` // host memory if no limit is set
 }
 
 // timeOrNil maps Docker's "no time" (the zero time) to nil, which encodes as
@@ -66,37 +76,45 @@ func timeOrNil(t time.Time) *time.Time {
 	return &t
 }
 
-func handleListContainers(containers ContainerLister) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		list, err := containers.ListContainers(r.Context())
-		if err != nil {
-			// The details go to the log, not the client: Docker errors can
-			// include internal hostnames and paths.
-			slog.Error("listing containers", "err", err)
+// ptrIf returns &v if ok, else nil (null in JSON).
+func ptrIf[T any](v T, ok bool) *T {
+	if !ok {
+		return nil
+	}
+	return &v
+}
+
+func handleListContainers(snapshots SnapshotSource) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		snap, ok := snapshots.Snapshot()
+		if !ok {
+			// No poll has succeeded yet. The monitor logs each failure, so
+			// there's nothing to add to the log here.
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "could not list containers"})
 			return
 		}
 
-		// Docker returns newest-first; sort by name so the page doesn't
-		// reshuffle when a container restarts.
-		slices.SortFunc(list, func(a, b docker.Container) int {
-			return strings.Compare(a.Name, b.Name)
-		})
-
 		// make, not a nil slice: an empty result must encode as [], not null.
-		resp := make([]containerResponse, 0, len(list))
-		for _, c := range list {
-			resp = append(resp, containerResponse{
-				ID:         c.ID,
-				Name:       c.Name,
-				Image:      c.Image,
-				State:      c.State,
-				Status:     c.Status,
-				StartedAt:  timeOrNil(c.StartedAt),
-				FinishedAt: timeOrNil(c.FinishedAt),
+		list := make([]containerResponse, 0, len(snap.Containers))
+		for _, c := range snap.Containers {
+			list = append(list, containerResponse{
+				ID:               c.ID,
+				Name:             c.Name,
+				Image:            c.Image,
+				State:            c.State,
+				Status:           c.Status,
+				StartedAt:        timeOrNil(c.StartedAt),
+				FinishedAt:       timeOrNil(c.FinishedAt),
+				CPUPercent:       ptrIf(c.CPUPercent, c.HasCPU),
+				MemoryBytes:      ptrIf(c.MemoryUsed, c.HasStats),
+				MemoryLimitBytes: ptrIf(c.MemoryLimit, c.HasStats),
 			})
 		}
-		writeJSON(w, http.StatusOK, resp)
+		writeJSON(w, http.StatusOK, containersResponse{
+			UpdatedAt:  snap.UpdatedAt,
+			Stale:      snap.Stale,
+			Containers: list,
+		})
 	}
 }
 

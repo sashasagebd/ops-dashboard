@@ -9,9 +9,19 @@ export type Container = {
   status: string // human-readable, e.g. "Up 3 hours"
   startedAt: string | null // RFC 3339; null if never started
   finishedAt: string | null // RFC 3339; null if never stopped
+  cpuPercent: number | null // share of the whole host, 0–100; null until two samples
+  memoryBytes: number | null // null if not running
+  memoryLimitBytes: number | null // host memory if no limit is set
 }
 
-export async function fetchContainers(signal?: AbortSignal): Promise<Container[]> {
+// ContainersResponse matches containersResponse in the same Go file.
+export type ContainersResponse = {
+  updatedAt: string // RFC 3339; when the server last polled Docker successfully
+  stale: boolean // the latest poll failed, so the data is from updatedAt
+  containers: Container[]
+}
+
+export async function fetchContainers(signal?: AbortSignal): Promise<ContainersResponse> {
   const res = await fetch('/api/containers', { signal })
   if (!res.ok) {
     // The API sends {"error": "..."} on failure; fall back to the status line
@@ -19,7 +29,7 @@ export async function fetchContainers(signal?: AbortSignal): Promise<Container[]
     const body: unknown = await res.json().catch(() => null)
     throw new Error(errorMessage(body) ?? `Request failed: ${res.status} ${res.statusText}`)
   }
-  return (await res.json()) as Container[]
+  return (await res.json()) as ContainersResponse
 }
 
 function errorMessage(body: unknown): string | undefined {

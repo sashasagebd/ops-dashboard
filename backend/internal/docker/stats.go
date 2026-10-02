@@ -15,8 +15,7 @@ type Stats struct {
 	Read time.Time // when Docker took the sample
 
 	CPUUsage       uint64 // CPU time used by the container so far, in ns
-	SystemCPUUsage uint64 // CPU time used by the whole host so far, in ns
-	OnlineCPUs     uint32
+	SystemCPUUsage uint64 // CPU time of the whole host so far, all cores summed, in ns
 
 	MemoryUsed  uint64 // bytes, excluding file cache the kernel can reclaim
 	MemoryLimit uint64 // bytes; the host's total memory if no limit is set
@@ -27,11 +26,9 @@ type apiStats struct {
 	Read     time.Time `json:"read"`
 	CPUStats struct {
 		CPUUsage struct {
-			TotalUsage  uint64   `json:"total_usage"`
-			PercpuUsage []uint64 `json:"percpu_usage"` // cgroup v1 only
+			TotalUsage uint64 `json:"total_usage"`
 		} `json:"cpu_usage"`
 		SystemCPUUsage uint64 `json:"system_cpu_usage"`
-		OnlineCPUs     uint32 `json:"online_cpus"`
 	} `json:"cpu_stats"`
 	MemoryStats struct {
 		Usage uint64            `json:"usage"`
@@ -54,16 +51,10 @@ func (c *Client) ContainerStats(ctx context.Context, id string) (Stats, error) {
 		return Stats{}, fmt.Errorf("container %s stats: %w", id, err)
 	}
 
-	online := raw.CPUStats.OnlineCPUs
-	if online == 0 {
-		// Older engines on cgroup v1 may omit online_cpus.
-		online = uint32(len(raw.CPUStats.CPUUsage.PercpuUsage))
-	}
 	return Stats{
 		Read:           raw.Read,
 		CPUUsage:       raw.CPUStats.CPUUsage.TotalUsage,
 		SystemCPUUsage: raw.CPUStats.SystemCPUUsage,
-		OnlineCPUs:     online,
 		MemoryUsed:     memoryUsed(raw.MemoryStats.Usage, raw.MemoryStats.Stats),
 		MemoryLimit:    raw.MemoryStats.Limit,
 	}, nil
@@ -84,20 +75,21 @@ func memoryUsed(usage uint64, stats map[string]uint64) uint64 {
 	return usage
 }
 
-// CPUPercent returns the container's CPU use between two samples, like
-// `docker stats`: 100% is one full core, so a 4-core host can show up to
-// 400%.
+// CPUPercent returns the container's CPU use between two samples as a share
+// of the whole host: 100% means every core is busy, so it's on the same
+// scale as host CPU. (`docker stats` instead counts 100% per core, which
+// would be this times the number of cores.)
 //
-// ok is false when there's no meaningful answer: the samples are out of
-// order, a counter went backwards (the container restarted between them), or
-// no host time passed.
+// ok is false when there's no meaningful answer: a counter went backwards
+// (the container restarted between the samples), or no host time passed.
 func CPUPercent(prev, cur Stats) (pct float64, ok bool) {
-	if cur.CPUUsage < prev.CPUUsage || cur.SystemCPUUsage <= prev.SystemCPUUsage || cur.OnlineCPUs == 0 {
+	if cur.CPUUsage < prev.CPUUsage || cur.SystemCPUUsage <= prev.SystemCPUUsage {
 		return 0, false
 	}
 	// The counters are uint64; the checks above make sure neither
-	// subtraction wraps around.
+	// subtraction wraps around. SystemCPUUsage sums every core, so the ratio
+	// is already a share of the whole host.
 	cpuDelta := float64(cur.CPUUsage - prev.CPUUsage)
 	systemDelta := float64(cur.SystemCPUUsage - prev.SystemCPUUsage)
-	return cpuDelta / systemDelta * float64(cur.OnlineCPUs) * 100, true
+	return cpuDelta / systemDelta * 100, true
 }

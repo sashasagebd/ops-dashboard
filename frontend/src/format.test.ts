@@ -34,6 +34,9 @@ describe('uptimeText', () => {
     status: 'Up 3 hours',
     startedAt: null,
     finishedAt: null,
+    cpuPercent: null,
+    memoryBytes: null,
+    memoryLimitBytes: null,
   }
 
   it('counts a running container from when it started', () => {

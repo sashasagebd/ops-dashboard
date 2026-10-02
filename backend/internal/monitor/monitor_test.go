@@ -1,0 +1,260 @@
+package monitor
+
+import (
+	"context"
+	"errors"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+)
+
+// fakeDocker returns whatever its fields hold at the time of the call; tests
+// change them between polls. It's locked so the Run test can use it from
+// another goroutine.
+type fakeDocker struct {
+	mu         sync.Mutex
+	containers []docker.Container
+	listErr    error
+	stats      map[string]docker.Stats // by ID; missing means an error
+	statsCalls []string                // IDs, in call order
+	listed     chan struct{}           // if non-nil, signalled on each list
+}
+
+func (f *fakeDocker) ListContainers(context.Context) ([]docker.Container, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listed != nil {
+		select {
+		case f.listed <- struct{}{}:
+		default:
+		}
+	}
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	// A copy, as the real client returns a fresh slice each time; Poll sorts
+	// it.
+	return append([]docker.Container(nil), f.containers...), nil
+}
+
+func (f *fakeDocker) ContainerStats(_ context.Context, id string) (docker.Stats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statsCalls = append(f.statsCalls, id)
+	s, ok := f.stats[id]
+	if !ok {
+		return docker.Stats{}, errors.New("no stats for " + id)
+	}
+	return s, nil
+}
+
+func (f *fakeDocker) set(fn func(f *fakeDocker)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn(f)
+}
+
+var (
+	mc  = docker.Container{ID: "m1", Name: "mc", State: "running"}
+	bot = docker.Container{ID: "b1", Name: "discordbot", State: "running"}
+)
+
+// newTestMonitor returns a Monitor whose clock reads clock.
+func newTestMonitor(f *fakeDocker, clock *time.Time) *Monitor {
+	m := New(f)
+	m.now = func() time.Time { return *clock }
+	return m
+}
+
+func mustPoll(t *testing.T, m *Monitor) Snapshot {
+	t.Helper()
+	if err := m.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	snap, ok := m.Snapshot()
+	if !ok {
+		t.Fatal("Snapshot not ok after a successful poll")
+	}
+	return snap
+}
+
+func TestNoSnapshotBeforeFirstPoll(t *testing.T) {
+	m := New(&fakeDocker{})
+	if _, ok := m.Snapshot(); ok {
+		t.Error("Snapshot ok before any poll, want not ok")
+	}
+}
+
+func TestFirstPoll(t *testing.T) {
+	stopped := docker.Container{ID: "s1", Name: "old", State: "exited"}
+	f := &fakeDocker{
+		containers: []docker.Container{mc, stopped, bot},
+		stats: map[string]docker.Stats{
+			"m1": {CPUUsage: 100, SystemCPUUsage: 1000, MemoryUsed: 2 << 30, MemoryLimit: 16 << 30},
+			"b1": {CPUUsage: 10, SystemCPUUsage: 1000, MemoryUsed: 80 << 20, MemoryLimit: 16 << 30},
+		},
+	}
+	clock := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	m := newTestMonitor(f, &clock)
+
+	snap := mustPoll(t, m)
+
+	if !snap.UpdatedAt.Equal(clock) || snap.Stale {
+		t.Errorf("UpdatedAt, Stale = %v, %v; want %v, false", snap.UpdatedAt, snap.Stale, clock)
+	}
+	var names []string
+	for _, c := range snap.Containers {
+		names = append(names, c.Name)
+	}
+	if want := []string{"discordbot", "mc", "old"}; !slices.Equal(names, want) {
+		t.Fatalf("names = %v, want %v (sorted)", names, want)
+	}
+
+	got := snap.Containers[1] // mc
+	if !got.HasStats || got.MemoryUsed != 2<<30 || got.MemoryLimit != 16<<30 {
+		t.Errorf("mc stats = %+v, want memory 2 GiB of 16 GiB", got)
+	}
+	if got.HasCPU {
+		t.Error("mc HasCPU on the first poll, want false (no previous sample)")
+	}
+	if old := snap.Containers[2]; old.HasStats {
+		t.Error("stopped container HasStats, want false")
+	}
+	if want := []string{"b1", "m1"}; !slices.Equal(f.statsCalls, want) {
+		t.Errorf("stats requested for %v, want only running containers %v", f.statsCalls, want)
+	}
+}
+
+func TestCPUFromPreviousPoll(t *testing.T) {
+	f := &fakeDocker{
+		containers: []docker.Container{mc},
+		stats:      map[string]docker.Stats{"m1": {CPUUsage: 100, SystemCPUUsage: 1000}},
+	}
+	clock := time.Now()
+	m := newTestMonitor(f, &clock)
+	mustPoll(t, m)
+
+	// Between polls the host passes 400 units of CPU time and mc uses 100.
+	f.set(func(f *fakeDocker) {
+		f.stats["m1"] = docker.Stats{CPUUsage: 200, SystemCPUUsage: 1400}
+	})
+	snap := mustPoll(t, m)
+
+	got := snap.Containers[0]
+	if !got.HasCPU || got.CPUPercent != 25 {
+		t.Errorf("CPU = %v (HasCPU %v), want 25%%", got.CPUPercent, got.HasCPU)
+	}
+}
+
+func TestNoCPUAfterRestart(t *testing.T) {
+	f := &fakeDocker{
+		containers: []docker.Container{mc},
+		stats:      map[string]docker.Stats{"m1": {CPUUsage: 100, SystemCPUUsage: 1000}},
+	}
+	clock := time.Now()
+	m := newTestMonitor(f, &clock)
+	mustPoll(t, m)
+
+	// mc stops for a poll, then comes back. Its new counters happen to be
+	// higher than the old sample, which would give a wrong CPU % if that
+	// sample were still around.
+	f.set(func(f *fakeDocker) { f.containers = []docker.Container{{ID: "m1", Name: "mc", State: "exited"}} })
+	mustPoll(t, m)
+	f.set(func(f *fakeDocker) {
+		f.containers = []docker.Container{mc}
+		f.stats["m1"] = docker.Stats{CPUUsage: 900, SystemCPUUsage: 1400}
+	})
+	snap := mustPoll(t, m)
+
+	if snap.Containers[0].HasCPU {
+		t.Error("HasCPU on the first poll after a restart, want false")
+	}
+}
+
+func TestStatsErrorAffectsOnlyThatContainer(t *testing.T) {
+	f := &fakeDocker{
+		containers: []docker.Container{mc, bot},
+		stats:      map[string]docker.Stats{"m1": {MemoryUsed: 1}}, // none for bot
+	}
+	clock := time.Now()
+	m := newTestMonitor(f, &clock)
+
+	snap := mustPoll(t, m)
+
+	if snap.Containers[0].HasStats { // discordbot
+		t.Error("discordbot HasStats despite a stats error, want false")
+	}
+	if !snap.Containers[1].HasStats { // mc
+		t.Error("mc HasStats = false, want true")
+	}
+}
+
+func TestListErrorKeepsLastSnapshotAsStale(t *testing.T) {
+	f := &fakeDocker{
+		containers: []docker.Container{mc},
+		stats:      map[string]docker.Stats{"m1": {}},
+	}
+	first := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	clock := first
+	m := newTestMonitor(f, &clock)
+	mustPoll(t, m)
+
+	clock = first.Add(5 * time.Second)
+	f.set(func(f *fakeDocker) { f.listErr = errors.New("proxy unreachable") })
+	if err := m.Poll(context.Background()); err == nil {
+		t.Fatal("Poll succeeded, want error")
+	}
+
+	snap, ok := m.Snapshot()
+	if !ok || !snap.Stale {
+		t.Fatalf("ok, Stale = %v, %v; want true, true", ok, snap.Stale)
+	}
+	if !snap.UpdatedAt.Equal(first) || len(snap.Containers) != 1 {
+		t.Errorf("snapshot = %+v, want the first poll's data (UpdatedAt %v)", snap, first)
+	}
+
+	// Docker comes back: fresh data, no longer stale.
+	f.set(func(f *fakeDocker) { f.listErr = nil })
+	if snap := mustPoll(t, m); snap.Stale || !snap.UpdatedAt.Equal(clock) {
+		t.Errorf("after recovery Stale, UpdatedAt = %v, %v; want false, %v", snap.Stale, snap.UpdatedAt, clock)
+	}
+}
+
+func TestListErrorBeforeAnySuccess(t *testing.T) {
+	m := New(&fakeDocker{listErr: errors.New("proxy unreachable")})
+	if err := m.Poll(context.Background()); err == nil {
+		t.Fatal("Poll succeeded, want error")
+	}
+	if _, ok := m.Snapshot(); ok {
+		t.Error("Snapshot ok with no successful poll, want not ok")
+	}
+}
+
+func TestRunPollsImmediatelyAndStops(t *testing.T) {
+	f := &fakeDocker{listed: make(chan struct{}, 1)}
+	m := New(f)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	// An hour's interval: the only poll this test can see is the immediate
+	// one.
+	go func() {
+		m.Run(ctx, time.Hour)
+		close(done)
+	}()
+
+	select {
+	case <-f.listed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run didn't poll immediately")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run didn't return after cancel")
+	}
+}
