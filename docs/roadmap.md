@@ -8,7 +8,7 @@ _Last updated: 2026-10-01_
 | Milestone | Status |
 |---|---|
 | M1: Thinnest end-to-end slice | ✅ Done, deployed |
-| M2: Full container status | 🚧 In progress (2.1 done) |
+| M2: Full container status | 🚧 In progress (2.1–2.2 done) |
 | M3: Host stats | Not started |
 | M4: Discord alerts | Not started |
 | M5: Portfolio polish | Not started |
@@ -37,9 +37,9 @@ CPU % and RAM, refreshing automatically.
 
 | Step | What | Status |
 |---|---|---|
-| 2.1 | List all containers (`all=true`) and inspect each for `startedAt` / `finishedAt`. Additive API fields (`null` when Docker has no time); page has an Uptime column ("up 3h 12m" / "down 20m", Docker's status text on hover). | ✅ Done, not yet committed or deployed |
-| 2.2 | CPU/RAM in the Docker client via the stats endpoint. | |
-| 2.3 | Background poller (`POLL_INTERVAL`, default 5s) holding the latest snapshot in memory. API becomes `{updatedAt, containers: [...]}`; frontend fetch updated in the same step. | |
+| 2.1 | List all containers (`all=true`) and inspect each for `startedAt` / `finishedAt`. Additive API fields (`null` when Docker has no time); page has an Uptime column ("up 3h 12m" / "down 20m", Docker's status text on hover). | ✅ `3ef9fd0` (not yet deployed) |
+| 2.2 | `ContainerStats` (one-shot stats sample, RAM minus inactive file cache) and pure `CPUPercent(prev, cur)` in the Docker client. Not wired up yet, so no behaviour change. | ✅ Done, not yet committed |
+| 2.3 | Background poller (`POLL_INTERVAL`, default 5s) holding the latest snapshot in memory, including stats for running containers (CPU from the previous poll's sample). API becomes `{updatedAt, containers: [...]}` with CPU/RAM fields; frontend fetch updated in the same step. | |
 | 2.4 | Frontend: CPU/RAM columns, auto-refresh (uptimes then tick too), pause when tab hidden, stale-data banner. Add a way to develop the UI with real data (see ideas below). | |
 | 2.5 | Redeploy; record the poller decision in `decisions/stack.md`. | |
 
@@ -47,6 +47,8 @@ Decisions (approved 2026-10-01):
 - **CPU % from two polls.** Use the stats endpoint's `one-shot` mode (instant,
   single sample) and compute CPU % from the previous poll's sample, instead of
   Docker's default ~1s wait per container. CPU shows "—" for the first poll.
+  Scale is per core like `docker stats` (100% = one core; 400% max on 4
+  cores).
 - **RAM like `docker stats`:** usage minus reclaimable file cache.
 - **Stale over broken:** if Docker stops answering, keep serving the last
   snapshot marked stale; 502 only if there has never been a successful poll.
