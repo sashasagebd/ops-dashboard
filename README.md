@@ -42,6 +42,19 @@ npm install
 npm run dev
 ```
 
+To work on the UI with real data instead, skip the Go server and point the
+frontend at the deployed dashboard (your PC must be on the tailnet). The API is
+read-only, so this can't change anything on the server.
+
+```sh
+cd frontend
+API_TARGET=https://<server-name>.<tailnet>.ts.net npm run dev    # bash, incl. Git Bash
+# PowerShell: $env:API_TARGET="https://<server-name>.<tailnet>.ts.net"; npm run dev
+```
+
+Use the same URL you open the dashboard at (`tailscale serve status` on the
+server prints it).
+
 Checks (the same ones CI runs):
 
 ```sh
@@ -58,6 +71,7 @@ cd frontend && npm run lint && npm test && npm run build
 | `POLL_INTERVAL` | `5s` | backend: how often to poll Docker (Go duration, minimum `1s`) |
 | `STATIC_DIR` | unset | backend: built frontend to serve (set to `/static` in the image) |
 | `DASHBOARD_PORT` | `8080` | compose: host port, always bound to `127.0.0.1` |
+| `API_TARGET` | `http://localhost:8080` | frontend dev server only: where `npm run dev` forwards `/api` |
 
 ## Deploying to the server
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Container } from './api'
-import { formatDuration, uptimeText } from './format'
+import { formatBytes, formatCPU, formatDuration, uptimeText } from './format'
 
 const SECOND = 1000
 const MINUTE = 60 * SECOND
@@ -52,5 +52,32 @@ describe('uptimeText', () => {
   it('shows a dash when Docker has no time', () => {
     expect(uptimeText({ ...base, state: 'created' }, now)).toBe('—')
     expect(uptimeText({ ...base, startedAt: 'not a date' }, now)).toBe('—')
+  })
+})
+
+describe('formatCPU', () => {
+  it.each([
+    [null, '—'],
+    [0, '0.0%'],
+    [0.006, '<0.1%'],
+    [0.356, '0.4%'],
+    [12.34, '12.3%'],
+    [100, '100.0%'],
+  ])('%s is %s', (pct, want) => {
+    expect(formatCPU(pct)).toBe(want)
+  })
+})
+
+describe('formatBytes', () => {
+  // The non-trivial values are real readings from the server.
+  it.each([
+    [null, '—'],
+    [500_000, '<1 MiB'],
+    [6_348_800, '6 MiB'],
+    [38_662_144, '37 MiB'],
+    [1024 * 1024 * 1024, '1.0 GiB'],
+    [5_418_610_688, '5.0 GiB'],
+  ])('%s is %s', (bytes, want) => {
+    expect(formatBytes(bytes)).toBe(want)
   })
 })

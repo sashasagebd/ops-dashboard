@@ -38,7 +38,7 @@ go run ./cmd/dashboard            # :8080; /api/containers is 502 without a prox
 
 # Frontend (from frontend/)
 npm run lint && npm test && npm run build
-npm run dev                       # :5173, forwards /api to :8080
+npm run dev                       # :5173, forwards /api to :8080 (or $API_TARGET, e.g. the server's ts.net URL for real data)
 ```
 
 CI (`.github/workflows/ci.yml`) runs exactly these checks; keep them green.

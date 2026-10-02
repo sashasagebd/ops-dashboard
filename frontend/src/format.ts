@@ -24,3 +24,24 @@ export function uptimeText(c: Container, now: number): string {
   if (Number.isNaN(ms)) return '—'
   return `${up ? 'up' : 'down'} ${formatDuration(ms)}`
 }
+
+// formatCPU shows one decimal place. Tiny non-zero values show as "<0.1%"
+// rather than "0.0%", so a container that's barely busy doesn't look idle.
+// null (stopped, or no second sample yet) shows as "—".
+export function formatCPU(pct: number | null): string {
+  if (pct === null) return '—'
+  if (pct > 0 && pct < 0.1) return '<0.1%'
+  return `${pct.toFixed(1)}%`
+}
+
+const MiB = 1024 * 1024
+const GiB = 1024 * MiB
+
+// formatBytes uses binary units (MiB, GiB) like `docker stats`: whole MiB
+// below 1 GiB, one decimal place above. null shows as "—".
+export function formatBytes(bytes: number | null): string {
+  if (bytes === null) return '—'
+  if (bytes < MiB) return '<1 MiB'
+  if (bytes < GiB) return `${Math.round(bytes / MiB)} MiB`
+  return `${(bytes / GiB).toFixed(1)} GiB`
+}

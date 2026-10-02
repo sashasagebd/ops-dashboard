@@ -7,6 +7,8 @@
   --up-bg: #dafbe1;
   --down: #b42318;
   --down-bg: #fee4e2;
+  --warn: #7a4b00;
+  --warn-bg: #fff4d6;
 
   --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
@@ -27,6 +29,8 @@
     --up-bg: #0f2e19;
     --down: #ff8a80;
     --down-bg: #3a1411;
+    --warn: #ffd27a;
+    --warn-bg: #3a2a08;
   }
 }
 
@@ -61,6 +65,24 @@ th {
   color: var(--muted);
   font-weight: 500;
   font-size: 0.875rem;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+/* Numbers line up by digit when they're right-aligned and fixed-width. */
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.banner {
+  margin: 0 0 16px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  color: var(--warn);
+  background: var(--warn-bg);
 }
 
 .mono {

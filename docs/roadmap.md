@@ -8,7 +8,7 @@ _Last updated: 2026-10-01_
 | Milestone | Status |
 |---|---|
 | M1: Thinnest end-to-end slice | ✅ Done, deployed |
-| M2: Full container status | 🚧 In progress (2.1–2.3 done) |
+| M2: Full container status | 🚧 In progress (2.1–2.4 done) |
 | M3: Host stats | Not started |
 | M4: Discord alerts | Not started |
 | M5: Portfolio polish | Not started |
@@ -37,10 +37,10 @@ CPU % and RAM, refreshing automatically.
 
 | Step | What | Status |
 |---|---|---|
-| 2.1 | List all containers (`all=true`) and inspect each for `startedAt` / `finishedAt`. Additive API fields (`null` when Docker has no time); page has an Uptime column ("up 3h 12m" / "down 20m", Docker's status text on hover). | ✅ `3ef9fd0` (not yet deployed) |
+| 2.1 | List all containers (`all=true`) and inspect each for `startedAt` / `finishedAt`. Additive API fields (`null` when Docker has no time); page has an Uptime column ("up 3h 12m" / "down 20m", Docker's status text on hover). | ✅ `3ef9fd0`, deployed |
 | 2.2 | `ContainerStats` (one-shot stats sample, RAM minus inactive file cache) and pure `CPUPercent(prev, cur)` in the Docker client. Not wired up yet, so no behaviour change. | ✅ `92b3b30` (CPU switched to percent of host in 2.3's commit) |
-| 2.3 | `internal/monitor` poller (`POLL_INTERVAL`, default 5s, min 1s) holding the latest snapshot in memory, including stats for running containers (CPU from the previous poll's sample). API is now `{updatedAt, stale, containers: [...]}` with `cpuPercent`, `memoryBytes`, `memoryLimitBytes` (null when not available); frontend fetch updated. | ✅ Done, not yet committed |
-| 2.4 | Frontend: CPU/RAM columns, auto-refresh (uptimes then tick too), pause when tab hidden, stale-data banner. Add a way to develop the UI with real data (see ideas below). | |
+| 2.3 | `internal/monitor` poller (`POLL_INTERVAL`, default 5s, min 1s) holding the latest snapshot in memory, including stats for running containers (CPU from the previous poll's sample). API is now `{updatedAt, stale, containers: [...]}` with `cpuPercent`, `memoryBytes`, `memoryLimitBytes` (null when not available); frontend fetch updated. | ✅ `bf339c3`, deployed; server API shows CPU/RAM for all running containers, so the proxy allows stats |
+| 2.4 | `usePolling` hook (5s, next fetch scheduled after each response, paused while the tab is hidden, keeps data when a refresh fails); CPU/Memory columns; stale banner (server can't reach Docker / browser can't reach server / data older than 30s); `API_TARGET` for `npm run dev` against the real server. | ✅ Done, not yet committed; `API_TARGET` verified against the server from the PC |
 | 2.5 | Redeploy; record the poller decision in `decisions/stack.md`. | |
 
 Decisions (approved 2026-10-01):
@@ -78,9 +78,10 @@ README with architecture diagram and screenshots, decision records, a Docker
 
 ## Open questions
 
-- **M2 plan** needs approval before 2.1 starts.
+None right now.
 
 Resolved:
+- **M2 plan** approved 2026-10-01.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
   `Dockerfile` and `compose.yaml`). It wasn't started; it was brought up with
   `docker compose up -d` on 2026-10-01 and the dashboard shows it with no code
@@ -91,9 +92,9 @@ Resolved:
 ## Ideas / notes
 
 - **Local dev has no Docker data.** Local `go run` can't reach a socket proxy,
-  so the page shows "could not list containers". Options: point Vite's `/api`
-  forwarding at the server's Tailscale URL (read-only, tailnet-only), or a
-  sample-data mode in the backend.
+  so the page shows "could not list containers". Solved in 2.4 with
+  `API_TARGET` (Vite forwards `/api` to the server's Tailscale URL); see the
+  README. A sample-data mode would still help for demos/screenshots (M5).
 - **Minecraft is published on `0.0.0.0:25565`**, so it's reachable from the LAN
   (and the internet, if the router forwards it) regardless of UFW. Fine if
   intended; not a dashboard issue.
