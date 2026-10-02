@@ -55,10 +55,15 @@ type apiContainer struct {
 // apiInspect is the subset of `GET /containers/{id}/json` we use. Docker
 // reports times it doesn't have as "0001-01-01T00:00:00Z", which decodes to
 // the zero time.Time.
+//
+// State.Health is only present for containers with a healthcheck.
 type apiInspect struct {
 	State struct {
 		StartedAt  time.Time `json:"StartedAt"`
 		FinishedAt time.Time `json:"FinishedAt"`
+		Health     *struct {
+			Status string `json:"Status"`
+		} `json:"Health"`
 	} `json:"State"`
 }
 
@@ -87,12 +92,17 @@ func (c *Client) ListContainers(ctx context.Context) ([]Container, error) {
 			return nil, fmt.Errorf("inspecting container %s: %w", rc.ID, err)
 		}
 
+		var health string
+		if h := inspect.State.Health; h != nil {
+			health = h.Status
+		}
 		containers = append(containers, Container{
 			ID:         rc.ID,
 			Name:       containerName(rc),
 			Image:      rc.Image,
 			State:      rc.State,
 			Status:     rc.Status,
+			Health:     health,
 			StartedAt:  inspect.State.StartedAt,
 			FinishedAt: inspect.State.FinishedAt,
 		})

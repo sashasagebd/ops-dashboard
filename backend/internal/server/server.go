@@ -86,6 +86,7 @@ type containerResponse struct {
 	Name             string     `json:"name"`
 	Image            string     `json:"image"`
 	State            string     `json:"state"`
+	Health           *string    `json:"health"` // "starting", "healthy" or "unhealthy"; null if no healthcheck or not running
 	Status           string     `json:"status"`
 	StartedAt        *time.Time `json:"startedAt"`        // null if never started
 	FinishedAt       *time.Time `json:"finishedAt"`       // null if never stopped
@@ -125,10 +126,13 @@ func handleListContainers(snapshots SnapshotSource) http.HandlerFunc {
 		list := make([]containerResponse, 0, len(snap.Containers))
 		for _, c := range snap.Containers {
 			list = append(list, containerResponse{
-				ID:               c.ID,
-				Name:             c.Name,
-				Image:            c.Image,
-				State:            c.State,
+				ID:    c.ID,
+				Name:  c.Name,
+				Image: c.Image,
+				State: c.State,
+				// Docker keeps the last health result after a container
+				// stops; it's stale then, so it isn't sent.
+				Health:           ptrIf(c.Health, c.Health != "" && c.State == "running"),
 				Status:           c.Status,
 				StartedAt:        timeOrNil(c.StartedAt),
 				FinishedAt:       timeOrNil(c.FinishedAt),

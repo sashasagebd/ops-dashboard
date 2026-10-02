@@ -11,7 +11,7 @@ _Last updated: 2026-10-01_
 | M2: Full container status | ✅ Done, deployed |
 | M3: Host stats | ✅ Done, deployed |
 | M4: Discord alerts | ⏸️ Deferred (not in v1; plan kept below) |
-| M5: Portfolio polish | 🚧 In progress (5.1–5.2 done) |
+| M5: Portfolio polish | 🚧 In progress (5.1–5.3 done) |
 
 ## M1: Thinnest end-to-end slice ✅
 
@@ -133,11 +133,12 @@ built and why, in a couple of minutes, and the deploy is a bit more robust.
 
 | Step | What | Status |
 |---|---|---|
-| 5.1 | `dashboard -healthcheck`: GETs its own `/healthz` and exits 0/1. Dockerfile `HEALTHCHECK` uses it (distroless has no curl or shell). The dashboard's own row then shows "(healthy)". | ✅ Done, not yet committed |
+| 5.1 | `dashboard -healthcheck`: GETs its own `/healthz` and exits 0/1. Dockerfile `HEALTHCHECK` uses it (distroless has no curl or shell). The dashboard's own row then gets a `healthy` badge (5.3). | ✅ Done, not yet committed |
 | 5.2 | CI job that builds the Docker image (no push), so a broken Dockerfile fails the PR instead of the deploy. Also starts the image and runs the healthcheck inside it, since the dev PC has no Docker. | ✅ Done, not yet committed |
-| 5.3 | Demo mode (`DEMO=1`): fake Docker and host readers with realistic, gently changing data, so the UI runs with no Docker at all. For screenshots without real hostnames, and for anyone cloning the repo. | |
-| 5.4 | README rewrite: screenshot, architecture diagram, security model, key decisions (linking `decisions/stack.md`), how it was built with AI, run/deploy. | |
-| 5.5 | Deploy, check the healthcheck on the server, tag `v1.0.0`. | |
+| 5.3 | Health badges: Docker client reads `State.Health.Status` from the inspect it already does; API `health` (null if no healthcheck or not running, since Docker keeps a stale value after stop); green `healthy` / amber `starting` / red `unhealthy` badge next to the state. Replaces relying on the Uptime tooltip, which is easy to miss and invisible on phones. | ✅ Done, not yet committed |
+| 5.4 | Demo mode (`DEMO=1`): fake Docker and host readers with realistic, gently changing data, so the UI runs with no Docker at all. For screenshots without real hostnames, and for anyone cloning the repo. | |
+| 5.5 | README rewrite: screenshot, architecture diagram, security model, key decisions (linking `decisions/stack.md`), how it was built with AI, run/deploy. | |
+| 5.6 | Deploy, check the healthcheck on the server, tag `v1.0.0`. | |
 
 Decisions (approved 2026-10-01):
 - **Healthcheck in the binary itself**, not a separate tool: the image stays

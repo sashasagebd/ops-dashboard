@@ -12,6 +12,11 @@ const REFRESH_MS = 5000
 // Several missed polls, so one slow poll doesn't flash a warning.
 const STALE_AFTER_MS = 30_000
 
+// Badge colour per health status. "running" alone only means the process is
+// alive; the health badge says whether the app inside is actually working,
+// so "unhealthy" is red even though the container is up.
+const HEALTH_BADGE = { healthy: 'up', starting: 'warn', unhealthy: 'down' } as const
+
 function App() {
   const state = usePolling(fetchContainers, REFRESH_MS)
 
@@ -68,7 +73,12 @@ function Dashboard({ state }: { state: PollState<ContainersResponse> }) {
                       <td>{c.name}</td>
                       <td className="mono">{c.image}</td>
                       <td>
-                        <span className={`badge badge-${c.state === 'running' ? 'up' : 'down'}`}>{c.state}</span>
+                        <span className="badges">
+                          <span className={`badge badge-${c.state === 'running' ? 'up' : 'down'}`}>{c.state}</span>
+                          {c.health !== null && (
+                            <span className={`badge badge-${HEALTH_BADGE[c.health]}`}>{c.health}</span>
+                          )}
+                        </span>
                       </td>
                       {/* Docker's own status text stays available on hover: it
                           includes health ("(healthy)") and exit codes. */}

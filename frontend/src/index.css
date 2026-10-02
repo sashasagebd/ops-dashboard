@@ -182,3 +182,15 @@ th {
   color: var(--down);
   background: var(--down-bg);
 }
+
+.badge-warn {
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+
+/* State and health badges side by side, wrapping on narrow screens. */
+.badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}

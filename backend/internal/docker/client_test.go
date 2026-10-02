@@ -83,7 +83,7 @@ const listResponse = `[
 
 // inspectResponses are trimmed `GET /containers/{id}/json` responses, keyed by
 // ID. Docker writes times it doesn't have as the zero time, like minecraft's
-// FinishedAt here.
+// FinishedAt here. Only minecraft has a healthcheck, so only it has Health.
 var inspectResponses = map[string]string{
 	"8dfafdbc3a40": `{
 	  "Id": "8dfafdbc3a40",
@@ -91,7 +91,8 @@ var inspectResponses = map[string]string{
 	    "Status": "running",
 	    "Running": true,
 	    "StartedAt": "2026-10-01T09:00:00.123456789Z",
-	    "FinishedAt": "0001-01-01T00:00:00Z"
+	    "FinishedAt": "0001-01-01T00:00:00Z",
+	    "Health": {"Status": "healthy", "FailingStreak": 0, "Log": []}
 	  }
 	}`,
 	"9cd87474be90": `{
@@ -151,7 +152,7 @@ func TestListContainers(t *testing.T) {
 	want := []Container{
 		{
 			ID: "8dfafdbc3a40", Name: "minecraft", Image: "itzg/minecraft-server",
-			State: "running", Status: "Up 3 hours (healthy)",
+			State: "running", Status: "Up 3 hours (healthy)", Health: "healthy",
 			StartedAt: time.Date(2026, 10, 1, 9, 0, 0, 123456789, time.UTC),
 		},
 		{
@@ -173,7 +174,7 @@ func TestListContainers(t *testing.T) {
 
 func containersEqual(a, b Container) bool {
 	return a.ID == b.ID && a.Name == b.Name && a.Image == b.Image &&
-		a.State == b.State && a.Status == b.Status &&
+		a.State == b.State && a.Status == b.Status && a.Health == b.Health &&
 		a.StartedAt.Equal(b.StartedAt) && a.FinishedAt.Equal(b.FinishedAt)
 }
 

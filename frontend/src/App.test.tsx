@@ -11,6 +11,7 @@ function container(overrides: Partial<Container> = {}): Container {
     name: 'mc',
     image: 'itzg/minecraft-server',
     state: 'running',
+    health: null,
     status: 'Up 2 days (healthy)',
     startedAt: '2026-09-29T08:00:00Z',
     finishedAt: null,
@@ -119,6 +120,29 @@ describe('App', () => {
     expect(screen.getAllByText('—')).toHaveLength(2) // discordbot's CPU and memory
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith('/api/containers', expect.anything())
+  })
+
+  it('shows a health badge next to the state for containers with a healthcheck', async () => {
+    mockFetch([
+      200,
+      snapshot([
+        container({ id: 'a', name: 'a', health: 'healthy' }),
+        container({ id: 'b', name: 'b', health: 'starting' }),
+        container({ id: 'c', name: 'c', health: 'unhealthy' }),
+        container({ id: 'd', name: 'd', health: null }),
+      ]),
+    ])
+
+    render(<App />)
+    await advance(0)
+
+    expect(screen.getByText('healthy')).toHaveClass('badge-up')
+    expect(screen.getByText('starting')).toHaveClass('badge-warn')
+    // Red even though the container is running: the app inside isn't working.
+    expect(screen.getByText('unhealthy')).toHaveClass('badge-down')
+    // d has no healthcheck: just its state badge.
+    expect(screen.getAllByText('running')).toHaveLength(4)
+    expect(screen.getAllByText(/^(healthy|starting|unhealthy)$/)).toHaveLength(3)
   })
 
   it('shows a message when there are no containers', async () => {

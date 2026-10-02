@@ -68,13 +68,16 @@ func TestListContainers(t *testing.T) {
 		wantBody   string
 	}{
 		{
-			name: "running container with stats, stopped one without",
+			// discordbot's "unhealthy" is left over from before it stopped,
+			// so it isn't sent; mc's is current.
+			name: "running container with stats and health, stopped one without",
 			source: &fakeSource{ok: true, snap: monitor.Snapshot{
 				UpdatedAt: updated,
 				Containers: []monitor.ContainerStatus{
 					{
 						Container: docker.Container{
 							ID: "a1", Name: "discordbot", Image: "discordbot", State: "exited", Status: "Exited (1) 20 minutes ago",
+							Health:     "unhealthy",
 							StartedAt:  time.Date(2026, 9, 29, 4, 30, 0, 0, time.UTC),
 							FinishedAt: time.Date(2026, 10, 1, 11, 40, 0, 0, time.UTC),
 						},
@@ -82,6 +85,7 @@ func TestListContainers(t *testing.T) {
 					{
 						Container: docker.Container{
 							ID: "b2", Name: "mc", Image: "itzg/minecraft-server", State: "running", Status: "Up 3 hours",
+							Health:    "healthy",
 							StartedAt: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC),
 						},
 						HasStats: true, MemoryUsed: 2147483648, MemoryLimit: 16596942848,
@@ -91,10 +95,10 @@ func TestListContainers(t *testing.T) {
 			}},
 			wantStatus: http.StatusOK,
 			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"host":null,"containers":[` +
-				`{"id":"a1","name":"discordbot","image":"discordbot","state":"exited","status":"Exited (1) 20 minutes ago",` +
+				`{"id":"a1","name":"discordbot","image":"discordbot","state":"exited","health":null,"status":"Exited (1) 20 minutes ago",` +
 				`"startedAt":"2026-09-29T04:30:00Z","finishedAt":"2026-10-01T11:40:00Z",` +
 				`"cpuPercent":null,"memoryBytes":null,"memoryLimitBytes":null},` +
-				`{"id":"b2","name":"mc","image":"itzg/minecraft-server","state":"running","status":"Up 3 hours",` +
+				`{"id":"b2","name":"mc","image":"itzg/minecraft-server","state":"running","health":"healthy","status":"Up 3 hours",` +
 				`"startedAt":"2026-10-01T09:00:00Z","finishedAt":null,` +
 				`"cpuPercent":12.5,"memoryBytes":2147483648,"memoryLimitBytes":16596942848}]}`,
 		},
@@ -109,7 +113,7 @@ func TestListContainers(t *testing.T) {
 			}},
 			wantStatus: http.StatusOK,
 			wantBody: `{"updatedAt":"2026-10-01T12:00:05Z","stale":false,"host":null,"containers":[` +
-				`{"id":"b2","name":"mc","image":"","state":"running","status":"",` +
+				`{"id":"b2","name":"mc","image":"","state":"running","health":null,"status":"",` +
 				`"startedAt":null,"finishedAt":null,"cpuPercent":null,"memoryBytes":100,"memoryLimitBytes":1000}]}`,
 		},
 		{

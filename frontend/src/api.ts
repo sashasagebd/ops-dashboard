@@ -6,6 +6,8 @@ export type Container = {
   name: string
   image: string
   state: string // machine-readable, e.g. "running", "exited"
+  // From the container's healthcheck; null if it has none or isn't running.
+  health: 'starting' | 'healthy' | 'unhealthy' | null
   status: string // human-readable, e.g. "Up 3 hours"
   startedAt: string | null // RFC 3339; null if never started
   finishedAt: string | null // RFC 3339; null if never stopped

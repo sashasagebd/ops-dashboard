@@ -31,6 +31,7 @@ describe('uptimeText', () => {
     name: 'mc',
     image: 'itzg/minecraft-server',
     state: 'running',
+    health: null,
     status: 'Up 3 hours',
     startedAt: null,
     finishedAt: null,
