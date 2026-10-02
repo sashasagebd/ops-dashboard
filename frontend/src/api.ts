@@ -7,6 +7,8 @@ export type Container = {
   image: string
   state: string // machine-readable, e.g. "running", "exited"
   status: string // human-readable, e.g. "Up 3 hours"
+  startedAt: string | null // RFC 3339; null if never started
+  finishedAt: string | null // RFC 3339; null if never stopped
 }
 
 export async function fetchContainers(signal?: AbortSignal): Promise<Container[]> {

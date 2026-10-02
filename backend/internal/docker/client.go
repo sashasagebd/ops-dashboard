@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,21 +52,49 @@ type apiContainer struct {
 	Status string   `json:"Status"`
 }
 
-// ListContainers returns the running containers.
+// apiInspect is the subset of `GET /containers/{id}/json` we use. Docker
+// reports times it doesn't have as "0001-01-01T00:00:00Z", which decodes to
+// the zero time.Time.
+type apiInspect struct {
+	State struct {
+		StartedAt  time.Time `json:"StartedAt"`
+		FinishedAt time.Time `json:"FinishedAt"`
+	} `json:"State"`
+}
+
+// ListContainers returns all containers, including stopped ones.
+//
+// The list endpoint has no exact start/stop times (only text like "Up 3
+// hours"), so each container is also inspected. That's one extra request per
+// container, which is fine for a home server's handful; they run one after
+// another to keep this simple.
 func (c *Client) ListContainers(ctx context.Context) ([]Container, error) {
 	var raw []apiContainer
-	if err := c.get(ctx, "/containers/json", &raw); err != nil {
+	if err := c.get(ctx, "/containers/json?all=true", &raw); err != nil {
 		return nil, fmt.Errorf("listing containers: %w", err)
 	}
 
 	containers := make([]Container, 0, len(raw))
 	for _, rc := range raw {
+		var inspect apiInspect
+		err := c.get(ctx, "/containers/"+url.PathEscape(rc.ID)+"/json", &inspect)
+		if errors.Is(err, errNotFound) {
+			// Removed between the list and the inspect; it's gone, so leave
+			// it out rather than failing the whole list.
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspecting container %s: %w", rc.ID, err)
+		}
+
 		containers = append(containers, Container{
-			ID:     rc.ID,
-			Name:   containerName(rc),
-			Image:  rc.Image,
-			State:  rc.State,
-			Status: rc.Status,
+			ID:         rc.ID,
+			Name:       containerName(rc),
+			Image:      rc.Image,
+			State:      rc.State,
+			Status:     rc.Status,
+			StartedAt:  inspect.State.StartedAt,
+			FinishedAt: inspect.State.FinishedAt,
 		})
 	}
 	return containers, nil
@@ -79,6 +108,9 @@ func containerName(rc apiContainer) string {
 	return strings.TrimPrefix(rc.Names[0], "/")
 }
 
+// errNotFound is returned (wrapped) by get when Docker answers 404.
+var errNotFound = errors.New("not found")
+
 // get sends a GET request to path and decodes the JSON response into v.
 func (c *Client) get(ctx context.Context, path string, v any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
@@ -91,6 +123,9 @@ func (c *Client) get(ctx context.Context, path string, v any) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("GET %s: %w", path, errNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
 		// Docker errors look like {"message": "..."}. The proxy answers 403
 		// for endpoints it doesn't allow, which is worth seeing in the log.

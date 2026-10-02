@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
 )
@@ -71,8 +72,27 @@ func TestListContainers(t *testing.T) {
 				{ID: "a1", Name: "discord-bot", Image: "discord-bot:latest", State: "running", Status: "Up 2 days"},
 			}},
 			wantStatus: http.StatusOK,
-			wantBody: `[{"id":"a1","name":"discord-bot","image":"discord-bot:latest","state":"running","status":"Up 2 days"},` +
-				`{"id":"b2","name":"minecraft","image":"itzg/minecraft-server","state":"running","status":"Up 3 hours"}]`,
+			wantBody: `[{"id":"a1","name":"discord-bot","image":"discord-bot:latest","state":"running","status":"Up 2 days","startedAt":null,"finishedAt":null},` +
+				`{"id":"b2","name":"minecraft","image":"itzg/minecraft-server","state":"running","status":"Up 3 hours","startedAt":null,"finishedAt":null}]`,
+		},
+		{
+			name: "times are RFC 3339, and zero times are null",
+			lister: &fakeLister{containers: []docker.Container{
+				{
+					ID: "a1", Name: "discord-bot", Image: "discord-bot:latest", State: "exited", Status: "Exited (1) 20 minutes ago",
+					StartedAt:  time.Date(2026, 9, 29, 4, 30, 0, 0, time.UTC),
+					FinishedAt: time.Date(2026, 10, 1, 11, 40, 0, 0, time.UTC),
+				},
+				{
+					ID: "b2", Name: "minecraft", Image: "itzg/minecraft-server", State: "running", Status: "Up 3 hours",
+					StartedAt: time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC),
+				},
+			}},
+			wantStatus: http.StatusOK,
+			wantBody: `[{"id":"a1","name":"discord-bot","image":"discord-bot:latest","state":"exited","status":"Exited (1) 20 minutes ago",` +
+				`"startedAt":"2026-09-29T04:30:00Z","finishedAt":"2026-10-01T11:40:00Z"},` +
+				`{"id":"b2","name":"minecraft","image":"itzg/minecraft-server","state":"running","status":"Up 3 hours",` +
+				`"startedAt":"2026-10-01T09:00:00Z","finishedAt":null}]`,
 		},
 		{
 			name:       "no containers encodes as empty array",

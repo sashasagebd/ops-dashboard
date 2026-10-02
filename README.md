@@ -75,7 +75,7 @@ Check it's up, from the server:
 ```sh
 docker compose ps
 curl -s http://127.0.0.1:8080/healthz          # {"status":"ok"}
-curl -s http://127.0.0.1:8080/api/containers   # JSON list of running containers
+curl -s http://127.0.0.1:8080/api/containers   # JSON list of all containers, including stopped ones
 ```
 
 Expose it to your tailnet over HTTPS (needs MagicDNS and HTTPS certificates

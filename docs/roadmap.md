@@ -8,7 +8,7 @@ _Last updated: 2026-10-01_
 | Milestone | Status |
 |---|---|
 | M1: Thinnest end-to-end slice | ✅ Done, deployed |
-| M2: Full container status | 📝 Planned, awaiting approval |
+| M2: Full container status | 🚧 In progress (2.1 done) |
 | M3: Host stats | Not started |
 | M4: Discord alerts | Not started |
 | M5: Portfolio polish | Not started |
@@ -30,20 +30,20 @@ them, both running via Docker Compose on the server and reachable through
 Verified on the server: the Tailscale URL shows the real containers, and the
 dashboard port is not reachable from another LAN device.
 
-## M2: Full container status 📝
+## M2: Full container status 🚧
 
 **Goal:** every container (including stopped), with up/down status, uptime,
 CPU % and RAM, refreshing automatically.
 
-| Step | What |
-|---|---|
-| 2.1 | List all containers (`all=true`) and inspect each for `startedAt` / `finishedAt`. Additive API fields; page shows "up 3h 12m" / "down for 20m". |
-| 2.2 | CPU/RAM in the Docker client via the stats endpoint. |
-| 2.3 | Background poller (`POLL_INTERVAL`, default 5s) holding the latest snapshot in memory. API becomes `{updatedAt, containers: [...]}`; frontend fetch updated in the same step. |
-| 2.4 | Frontend: uptime/CPU/RAM columns, auto-refresh, pause when tab hidden, stale-data banner. Add a way to develop the UI with real data (see ideas below). |
-| 2.5 | Redeploy; record the poller decision in `decisions/stack.md`. |
+| Step | What | Status |
+|---|---|---|
+| 2.1 | List all containers (`all=true`) and inspect each for `startedAt` / `finishedAt`. Additive API fields (`null` when Docker has no time); page has an Uptime column ("up 3h 12m" / "down 20m", Docker's status text on hover). | ✅ Done, not yet committed or deployed |
+| 2.2 | CPU/RAM in the Docker client via the stats endpoint. | |
+| 2.3 | Background poller (`POLL_INTERVAL`, default 5s) holding the latest snapshot in memory. API becomes `{updatedAt, containers: [...]}`; frontend fetch updated in the same step. | |
+| 2.4 | Frontend: CPU/RAM columns, auto-refresh (uptimes then tick too), pause when tab hidden, stale-data banner. Add a way to develop the UI with real data (see ideas below). | |
+| 2.5 | Redeploy; record the poller decision in `decisions/stack.md`. | |
 
-Proposed decisions:
+Decisions (approved 2026-10-01):
 - **CPU % from two polls.** Use the stats endpoint's `one-shot` mode (instant,
   single sample) and compute CPU % from the previous poll's sample, instead of
   Docker's default ~1s wait per container. CPU shows "—" for the first poll.
@@ -76,12 +76,15 @@ README with architecture diagram and screenshots, decision records, a Docker
 
 ## Open questions
 
-- **Stardew Valley server and Discord bot aren't Docker containers** (not in
-  `docker ps -a`). Are they not set up yet, running outside Docker, or
-  candidates to containerize? v1 only monitors containers, so this decides
-  whether they need a separate check (e.g. systemd), probably as a milestone
-  after M4.
 - **M2 plan** needs approval before 2.1 starts.
+
+Resolved:
+- **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
+  `Dockerfile` and `compose.yaml`). It wasn't started; it was brought up with
+  `docker compose up -d` on 2026-10-01 and the dashboard shows it with no code
+  changes. No non-Docker checks needed.
+- **Stardew Valley server** isn't set up yet (answered 2026-10-01). If it's run
+  in Docker when set up, the dashboard picks it up with no code changes.
 
 ## Ideas / notes
 

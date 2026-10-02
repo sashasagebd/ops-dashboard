@@ -1,12 +1,16 @@
 import { useEffect, useState } from 'react'
 import { fetchContainers, type Container } from './api'
+import { uptimeText } from './format'
 
 // One union instead of separate loading/error/data flags, so impossible
 // combinations (e.g. loading *and* an error) can't be represented.
 type LoadState =
   | { status: 'loading' }
   | { status: 'error'; message: string }
-  | { status: 'ok'; containers: Container[] }
+  // loadedAt is the "now" uptimes are measured against. It's captured when
+  // the data arrives rather than read during render, which keeps rendering
+  // pure and every row consistent with the others.
+  | { status: 'ok'; containers: Container[]; loadedAt: number }
 
 function App() {
   const [state, setState] = useState<LoadState>({ status: 'loading' })
@@ -17,7 +21,7 @@ function App() {
     // first request from updating state after it's been thrown away.
     const controller = new AbortController()
     fetchContainers(controller.signal)
-      .then((containers) => setState({ status: 'ok', containers }))
+      .then((containers) => setState({ status: 'ok', containers, loadedAt: Date.now() }))
       .catch((err: unknown) => {
         if (controller.signal.aborted) return
         setState({ status: 'error', message: err instanceof Error ? err.message : String(err) })
@@ -41,7 +45,7 @@ function ContainerList({ state }: { state: LoadState }) {
       return <p role="alert">Couldn't load containers: {state.message}</p>
     case 'ok':
       if (state.containers.length === 0) {
-        return <p>No running containers.</p>
+        return <p>No containers.</p>
       }
       return (
         <table>
@@ -50,7 +54,7 @@ function ContainerList({ state }: { state: LoadState }) {
               <th scope="col">Name</th>
               <th scope="col">Image</th>
               <th scope="col">State</th>
-              <th scope="col">Status</th>
+              <th scope="col">Uptime</th>
             </tr>
           </thead>
           <tbody>
@@ -61,7 +65,9 @@ function ContainerList({ state }: { state: LoadState }) {
                 <td>
                   <span className={`badge badge-${c.state === 'running' ? 'up' : 'down'}`}>{c.state}</span>
                 </td>
-                <td>{c.status}</td>
+                {/* Docker's own status text stays available on hover: it
+                    includes health ("(healthy)") and exit codes. */}
+                <td title={c.status}>{uptimeText(c, state.loadedAt)}</td>
               </tr>
             ))}
           </tbody>

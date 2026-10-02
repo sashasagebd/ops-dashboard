@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestClient starts a fake Docker API that answers every request with
@@ -56,8 +57,8 @@ func TestNewClient(t *testing.T) {
 	}
 }
 
-// listResponse is trimmed from a real `GET /containers/json` response; Docker
-// sends many more fields, which the client must ignore.
+// listResponse is trimmed from a real `GET /containers/json?all=true`
+// response; Docker sends many more fields, which the client must ignore.
 const listResponse = `[
   {
     "Id": "8dfafdbc3a40",
@@ -75,19 +76,72 @@ const listResponse = `[
     "Id": "9cd87474be90",
     "Names": [],
     "Image": "discord-bot:latest",
-    "State": "running",
-    "Status": "Up 2 days"
+    "State": "exited",
+    "Status": "Exited (1) 20 minutes ago"
   }
 ]`
 
-func TestListContainers(t *testing.T) {
-	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/containers/json" {
-			t.Errorf("request = %s %s, want GET /containers/json", r.Method, r.URL.Path)
+// inspectResponses are trimmed `GET /containers/{id}/json` responses, keyed by
+// ID. Docker writes times it doesn't have as the zero time, like minecraft's
+// FinishedAt here.
+var inspectResponses = map[string]string{
+	"8dfafdbc3a40": `{
+	  "Id": "8dfafdbc3a40",
+	  "State": {
+	    "Status": "running",
+	    "Running": true,
+	    "StartedAt": "2026-10-01T09:00:00.123456789Z",
+	    "FinishedAt": "0001-01-01T00:00:00Z"
+	  }
+	}`,
+	"9cd87474be90": `{
+	  "Id": "9cd87474be90",
+	  "State": {
+	    "Status": "exited",
+	    "ExitCode": 1,
+	    "StartedAt": "2026-09-29T04:30:00Z",
+	    "FinishedAt": "2026-10-01T11:40:00Z"
+	  }
+	}`,
+}
+
+// fakeDockerAPI serves listResponse for the list endpoint and inspect
+// (by container ID) for the inspect endpoint. A missing ID gets a 404, like
+// Docker for a container that no longer exists.
+func fakeDockerAPI(t *testing.T, inspect map[string]string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(listResponse))
-	})
+
+		if r.URL.Path == "/containers/json" {
+			if got := r.URL.Query().Get("all"); got != "true" {
+				t.Errorf("list query all = %q, want true (stopped containers too)", got)
+			}
+			_, _ = w.Write([]byte(listResponse))
+			return
+		}
+
+		id, ok := strings.CutPrefix(r.URL.Path, "/containers/")
+		id, ok2 := strings.CutSuffix(id, "/json")
+		if !ok || !ok2 {
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		body, found := inspect[id]
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"No such container: ` + id + `"}`))
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}
+}
+
+func TestListContainers(t *testing.T) {
+	c := newTestClient(t, fakeDockerAPI(t, inspectResponses))
 
 	got, err := c.ListContainers(context.Background())
 	if err != nil {
@@ -95,11 +149,62 @@ func TestListContainers(t *testing.T) {
 	}
 
 	want := []Container{
-		{ID: "8dfafdbc3a40", Name: "minecraft", Image: "itzg/minecraft-server", State: "running", Status: "Up 3 hours (healthy)"},
-		{ID: "9cd87474be90", Name: "9cd87474be90", Image: "discord-bot:latest", State: "running", Status: "Up 2 days"},
+		{
+			ID: "8dfafdbc3a40", Name: "minecraft", Image: "itzg/minecraft-server",
+			State: "running", Status: "Up 3 hours (healthy)",
+			StartedAt: time.Date(2026, 10, 1, 9, 0, 0, 123456789, time.UTC),
+		},
+		{
+			ID: "9cd87474be90", Name: "9cd87474be90", Image: "discord-bot:latest",
+			State: "exited", Status: "Exited (1) 20 minutes ago",
+			StartedAt:  time.Date(2026, 9, 29, 4, 30, 0, 0, time.UTC),
+			FinishedAt: time.Date(2026, 10, 1, 11, 40, 0, 0, time.UTC),
+		},
 	}
-	if !slices.Equal(got, want) {
+	// Compare times with Equal, not ==: == also compares the location and
+	// monotonic clock reading, so the same instant can compare unequal.
+	if !slices.EqualFunc(got, want, containersEqual) {
 		t.Errorf("ListContainers =\n  %+v\nwant\n  %+v", got, want)
+	}
+	if !got[0].FinishedAt.IsZero() {
+		t.Errorf("minecraft FinishedAt = %v, want zero time (Docker's 0001-01-01)", got[0].FinishedAt)
+	}
+}
+
+func containersEqual(a, b Container) bool {
+	return a.ID == b.ID && a.Name == b.Name && a.Image == b.Image &&
+		a.State == b.State && a.Status == b.Status &&
+		a.StartedAt.Equal(b.StartedAt) && a.FinishedAt.Equal(b.FinishedAt)
+}
+
+func TestListContainersSkipsRemovedContainer(t *testing.T) {
+	// The discord-bot container is in the list but gone by the time it's
+	// inspected (404).
+	inspect := map[string]string{"8dfafdbc3a40": inspectResponses["8dfafdbc3a40"]}
+	c := newTestClient(t, fakeDockerAPI(t, inspect))
+
+	got, err := c.ListContainers(context.Background())
+	if err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "minecraft" {
+		t.Errorf("ListContainers = %+v, want only minecraft", got)
+	}
+}
+
+func TestListContainersInspectError(t *testing.T) {
+	inspect := map[string]string{
+		"8dfafdbc3a40": inspectResponses["8dfafdbc3a40"],
+		"9cd87474be90": `{not json`,
+	}
+	c := newTestClient(t, fakeDockerAPI(t, inspect))
+
+	_, err := c.ListContainers(context.Background())
+	if err == nil {
+		t.Fatal("ListContainers succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "inspecting container 9cd87474be90") {
+		t.Errorf("error = %q, want it to name the container", err)
 	}
 }
 
