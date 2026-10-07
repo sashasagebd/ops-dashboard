@@ -1,6 +1,6 @@
-import { act, render, screen, within } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Container, ContainersResponse, HostStats } from './api'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
+import type { Container, ContainersResponse, HistoryResponse, HostStats } from './api'
 import App from './App'
 
 const NOW = new Date('2026-10-01T12:00:00Z')
@@ -41,24 +41,48 @@ function snapshot(containers: Container[], overrides: Partial<ContainersResponse
   return { updatedAt: NOW.toISOString(), stale: false, host: null, containers, ...overrides }
 }
 
-// mockFetch answers successive calls with successive [status, body] pairs,
-// repeating the last one. A body can be a function, called per request (e.g.
-// to stamp the current fake time). It returns just the parts of a Response
-// that fetchContainers uses, so the body resolves immediately under fake
-// timers.
+// history returns a /api/history body: by default nothing recorded yet.
+function history(overrides: Partial<HistoryResponse> = {}): HistoryResponse {
+  return {
+    start: '2026-10-01T11:01:00Z',
+    stepSeconds: 60,
+    host: { cpuPercent: [], cpuPercentMax: [], memoryBytes: [], diskUsedBytes: [] },
+    containers: {},
+    ...overrides,
+  }
+}
+
+// What /api/history answers, and the mock that records its calls. Set
+// historyReply before render; it's reset before each test.
+let historyReply: [number, unknown]
+let historyMock: Mock<(url: string) => Promise<Response>>
+
+// respond builds just the parts of a Response that the fetchers use, so the
+// body resolves immediately under fake timers.
+function respond(status: number, json: unknown): Promise<Response> {
+  return Promise.resolve({
+    ok: status < 400,
+    status,
+    statusText: '',
+    json: () => Promise.resolve(json),
+  } as Response)
+}
+
+// mockFetch answers successive /api/containers calls with successive
+// [status, body] pairs, repeating the last one. A body can be a function,
+// called per request (e.g. to stamp the current fake time). /api/history
+// calls go to historyMock instead, so they don't use up the sequence. It
+// returns the /api/containers mock.
 function mockFetch(...responses: [number, unknown][]) {
   let call = 0
-  const fetchMock = vi.fn(() => {
+  const fetchMock = vi.fn((_url: string, _init?: RequestInit) => {
     const [status, body] = responses[Math.min(call++, responses.length - 1)]
-    const json: unknown = typeof body === 'function' ? (body as () => unknown)() : body
-    return Promise.resolve({
-      ok: status < 400,
-      status,
-      statusText: '',
-      json: () => Promise.resolve(json),
-    } as Response)
+    return respond(status, typeof body === 'function' ? (body as () => unknown)() : body)
   })
-  vi.stubGlobal('fetch', fetchMock)
+  historyMock = vi.fn((_url: string) => respond(...historyReply))
+  vi.stubGlobal('fetch', (url: string, init?: RequestInit) =>
+    url.startsWith('/api/history') ? historyMock(url) : fetchMock(url, init),
+  )
   return fetchMock
 }
 
@@ -77,6 +101,7 @@ beforeEach(() => {
   // Only timers and Date are faked; promises still resolve normally.
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
   vi.setSystemTime(NOW)
+  historyReply = [200, history()]
 })
 
 afterEach(() => {
@@ -298,6 +323,89 @@ describe('App', () => {
       expect(screen.getByText('Server stats unavailable.')).toBeInTheDocument()
       expect(screen.queryByRole('meter')).not.toBeInTheDocument()
       expect(screen.getByText('mc')).toBeInTheDocument()
+    })
+  })
+
+  describe('trend lines', () => {
+    const MiB = 1024 ** 2
+
+    it('are drawn for each container and server tile', async () => {
+      historyReply = [
+        200,
+        history({
+          host: {
+            cpuPercent: [4, 6],
+            cpuPercentMax: [10, 70],
+            memoryBytes: [6 * GiB, 7 * GiB],
+            diskUsedBytes: [50 * GiB, 50 * GiB],
+          },
+          containers: {
+            mc: { cpuPercent: [1, null], cpuPercentMax: [3, null], memoryBytes: [GiB, 2 * GiB] },
+          },
+        }),
+      ]
+      mockFetch([
+        200,
+        snapshot([container(), container({ id: 'n1', name: 'new', memoryBytes: 80 * MiB })], { host: hostStats() }),
+      ])
+
+      render(<App />)
+      await advance(0)
+
+      expect(screen.getByRole('img', { name: 'mc CPU, last hour: average 1.0%, peak 3.0%' })).toBeInTheDocument()
+      expect(screen.getByRole('img', { name: 'mc memory, last hour: average 1.5 GiB, peak 2.0 GiB' })).toBeInTheDocument()
+      // "new" has no history yet: its numbers, but no line.
+      expect(screen.queryByRole('img', { name: /^new / })).not.toBeInTheDocument()
+
+      const cpu = within(screen.getByRole('region', { name: 'CPU' }))
+      expect(cpu.getByRole('img', { name: 'Server CPU, last hour: average 5.0%, peak 70.0%' })).toBeInTheDocument()
+      const disk = within(screen.getByRole('region', { name: 'Disk' }))
+      expect(disk.getByRole('img', { name: 'Server disk, last hour: average 50.0 GiB, peak 50.0 GiB' })).toBeInTheDocument()
+      expect(historyMock).toHaveBeenCalledWith('/api/history?window=1h')
+    })
+
+    it('switch to the last 24 hours with the toggle', async () => {
+      historyReply = [200, history({ containers: { mc: { cpuPercent: [2], cpuPercentMax: [2], memoryBytes: [GiB] } } })]
+      mockFetch([200, snapshot([container()])])
+
+      render(<App />)
+      await advance(0)
+      expect(screen.getByRole('button', { name: '1h' })).toHaveAttribute('aria-pressed', 'true')
+
+      fireEvent.click(screen.getByRole('button', { name: '24h' }))
+      await advance(0)
+
+      expect(historyMock).toHaveBeenLastCalledWith('/api/history?window=24h')
+      expect(screen.getByRole('button', { name: '24h' })).toHaveAttribute('aria-pressed', 'true')
+      expect(screen.getByRole('button', { name: '1h' })).toHaveAttribute('aria-pressed', 'false')
+      expect(screen.getByRole('img', { name: /^mc CPU, last 24 hours:/ })).toBeInTheDocument()
+    })
+
+    it('refresh every minute, not with every 5-second update', async () => {
+      const fetchMock = mockFetch([200, snapshot([container()])])
+
+      render(<App />)
+      await advance(0)
+      await advance(55_000)
+      expect(fetchMock).toHaveBeenCalledTimes(12)
+      expect(historyMock).toHaveBeenCalledTimes(1)
+
+      await advance(5_000)
+      expect(historyMock).toHaveBeenCalledTimes(2)
+    })
+
+    it("are left out, without an error, when history can't load", async () => {
+      historyReply = [500, { error: 'boom' }]
+      mockFetch([200, snapshot([container()], { host: hostStats() })])
+
+      render(<App />)
+      await advance(0)
+
+      expect(screen.getByText('mc')).toBeInTheDocument()
+      expect(screen.getAllByRole('meter')).toHaveLength(3)
+      expect(screen.queryByRole('img')).not.toBeInTheDocument()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
     })
   })
 })

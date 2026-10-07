@@ -3,7 +3,7 @@
 Milestones for the v1 scope in [spec.md](spec.md). Each numbered step is one
 small, reviewed commit. Design reasoning lives in [decisions/](decisions/).
 
-_Last updated: 2026-10-01_
+_Last updated: 2026-10-06_
 
 | Milestone | Status |
 |---|---|
@@ -11,16 +11,19 @@ _Last updated: 2026-10-01_
 | M2: Full container status | ✅ Done, deployed |
 | M3: Host stats | ✅ Done, deployed |
 | M4: Discord alerts | ⏸️ Deferred (not in v1; plan kept below) |
-| M5: Portfolio polish | 🚧 In progress (5.1–5.3 done) |
+| M5: Portfolio polish | 🚧 In progress (5.1–5.3 done, 5.4 dropped) |
+| M6: History sparklines | 🚧 Code done (6.1–6.4, docs for 6.5); not committed or deployed |
 
-**Where we left off (2026-10-01):** 5.1–5.3 are committed but not deployed.
-Next:
+**Where we left off (2026-10-06):** 5.1–5.3 are committed but not deployed.
+M6 was started ahead of finishing v1 (owner's call); 5.5 and 5.6 are still
+to do. Next:
 1. Check the new **Docker image** job in GitHub Actions is green (it's the
    only test of the image itself).
 2. Deploy (`cd ~/apps/dashboard && git pull && docker compose up -d --build`),
    then check `docker ps` shows the dashboard `(healthy)` after ~30s and the
    page shows `healthy` badges on `mc` and the dashboard.
-3. Start 5.4 (demo mode). The M5 plan is already approved.
+3. Review M6 (6.1–6.4), commit, push, then deploy and run the 6.5 checks
+   (they cover the 5.1–5.3 checks above too). Then back to 5.5 and 5.6.
 
 ## M1: Thinnest end-to-end slice ✅
 
@@ -145,8 +148,8 @@ built and why, in a couple of minutes, and the deploy is a bit more robust.
 | 5.1 | `dashboard -healthcheck`: GETs its own `/healthz` and exits 0/1. Dockerfile `HEALTHCHECK` uses it (distroless has no curl or shell). The dashboard's own row then gets a `healthy` badge (5.3). | ✅ `5ca4416`; not yet deployed |
 | 5.2 | CI job that builds the Docker image (no push), so a broken Dockerfile fails the PR instead of the deploy. Also starts the image and runs the healthcheck inside it, since the dev PC has no Docker. | ✅ `5ca4416`; first CI run of the Docker job not yet confirmed green |
 | 5.3 | Health badges: Docker client reads `State.Health.Status` from the inspect it already does; API `health` (null if no healthcheck or not running, since Docker keeps a stale value after stop); green `healthy` / amber `starting` / red `unhealthy` badge next to the state. Replaces relying on the Uptime tooltip, which is easy to miss and invisible on phones. | ✅ `3f5bd6d`; not yet deployed |
-| 5.4 | Demo mode (`DEMO=1`): fake Docker and host readers with realistic, gently changing data, so the UI runs with no Docker at all. For screenshots without real hostnames, and for anyone cloning the repo. | |
-| 5.5 | README rewrite: screenshot, architecture diagram, security model, key decisions (linking `decisions/stack.md`), how it was built with AI, run/deploy. | |
+| 5.4 | ~~Demo mode (`DEMO=1`): fake Docker and host readers with generated data.~~ Dropped 2026-10-06: the screenshot can come from the real server (container and image names aren't sensitive), `API_TARGET` already covers local dev, and the existing fake-based tests already show the interface design. Kept under Ideas / notes for if end-to-end tests are added. | ❌ Dropped |
+| 5.5 | README rewrite: screenshot (from the real server; crop out the URL bar, optionally `docker stop` one container briefly for a "down" row), architecture diagram, security model, key decisions (linking `decisions/stack.md`), how it was built with AI, run/deploy. | |
 | 5.6 | Deploy, check the healthcheck on the server, tag `v1.0.0`. | |
 
 Decisions (approved 2026-10-01):
@@ -155,14 +158,51 @@ Decisions (approved 2026-10-01):
   not Docker, for the reason in `handleHealthz`.
 - **Diagram in Mermaid**: GitHub renders it natively, and it lives as text in
   the repo, so it's diffable and stays in sync with the code.
-- **Demo mode reuses the interfaces** (`monitor.Docker`, `monitor.HostReader`)
-  with fakes, so it's a few small files and no changes to the real code
-  paths. It also shows the interface design paying off.
+- ~~**Demo mode reuses the interfaces**~~ (moot: 5.4 dropped 2026-10-06).
 - **A "How this was built" README section**: the workflow (spec → milestone
   plan → small reviewed steps, `CLAUDE.md`, tests as guardrails, decisions
   written down), since showing AI used well is part of the project's point.
 - **No image publishing** (e.g. to GHCR) for now: the server builds from
   source, so a registry would add moving parts for no gain.
+
+## M6: History sparklines 🚧
+
+Post-v1 scope (see [spec.md](spec.md)), but started before `v1.0.0` was
+tagged, at the owner's request. Plan approved 2026-10-06.
+
+**Goal:** a small trend line next to each container's CPU and memory, and
+under each host tile, so you can see whether "now" is normal, a spike or a
+slow climb (e.g. a memory leak, or the disk filling up).
+
+| Step | What |
+|---|---|
+| 6.1 | `internal/history`: a fixed-size ring buffer per series, fed by `Poll` after each successful poll. Raw 5s samples are folded into 1-minute buckets (CPU avg + max, memory avg; host disk used), 24h kept (1,440 buckets). Keyed by container name; a missing value (stopped, no stats, failed poll) is a gap, not 0. A container's history is dropped once it has been gone for 24h. Tests only, driven with a fake clock; no API change. **In review, not committed.** Window returns a `View` (`Start`, `Step`, series) since 6.2. |
+| 6.2 | `GET /api/history?window=1h\|24h` (default 1h; anything else 400): `{start, stepSeconds, host: {cpuPercent, cpuPercentMax, memoryBytes, diskUsedBytes}, containers: {name: {cpuPercent, cpuPercentMax, memoryBytes}}}`. Each series is a plain array, one value per step from `start`, `null` for gaps; CPU rounded to 2 decimals, bytes to whole numbers. Changed from the plan's `{t, v}` points: a timestamp per value would be most of a 24h body (~1,440 values × ~18 series). Host also gets `cpuPercentMax`. No 502 before the first poll: an empty history is a valid answer. `HistorySource` interface in `internal/server`; types mirrored in `frontend/src/api.ts` (`fetchHistory`, not used by the page yet). **In review, not committed.** |
+| 6.3 | `Sparkline` component: hand-drawn inline SVG, one `<path>` with a subpath per run of non-null values (a lone value is a dot), stretched to its box with a non-scaling stroke. Fixed y-scale (0–100 for CPU, the limit for memory). Average as the line, peaks faint behind it. `role="img"` with the average and peak in its name. Pure helpers (`sparklinePath`, `seriesStats`, `seriesMax`) in `series.ts` so the component file only exports components (fast refresh). Tests: `series.test.ts`, `Sparkline.test.tsx`. **Not committed.** |
+| 6.4 | Wired in: sparklines in the CPU and Memory cells (by container name) and the three host tiles (disk scaled to usable space, like its bar); a 1h / 24h toggle in the header (`aria-pressed` buttons); history polled every 60s with `usePolling`, separate from the 5s live poll, and paused with it while the tab is hidden. If history fails the page simply has no lines (no error, no banner). App tests: the fetch mock now answers by URL. **Not committed.** |
+| 6.5 | Decisions recorded in `decisions/stack.md`, README mentions `/api/history`, spec updated (approval). **Still to do (owner):** deploy, check the lines against `docker stats` / `top` over a few minutes. |
+
+Decisions (approved 2026-10-06):
+- **In memory first, no database.** Covers "what happened in the last hour or
+  day" with no new dependencies, volumes or migrations. The known cost: every
+  `docker compose up --build` wipes history. If that gets annoying, move it
+  behind a `HistoryStore` interface backed by SQLite on a volume
+  (`modernc.org/sqlite`, pure Go, because the static distroless build has no
+  cgo).
+- **1-minute buckets keeping avg and max CPU.** 720 raw points an hour is more
+  than a sparkline can draw; an average alone would hide a 10-second spike,
+  so the max is kept alongside it. Memory is ~1,440 buckets × a few numbers ×
+  a handful of series: well under 1 MB.
+- **Keyed by name, not ID**, as in the M4 plan: a Compose recreate gets a new
+  ID, and by ID every deploy would reset the container's history.
+- **Gaps are null**, matching the API's "null, never 0" rule: a stopped
+  container's line breaks instead of dropping to zero.
+- **Separate endpoint, slower poll.** Resending 24h of points every 5s would
+  be wasteful. This is a deliberate exception to "one snapshot, one request"
+  (M3): the trend and the live number can be a few seconds apart, which
+  doesn't matter for a trend line.
+- **No chart library.** A sparkline is ~40 lines of SVG; Recharts or similar
+  would add far more bundle than it saves.
 
 ## Open questions
 
@@ -171,7 +211,8 @@ None right now.
 Resolved:
 - **M2 plan** approved 2026-10-01.
 - **M3 plan** approved 2026-10-01.
-- **M5 plan** approved 2026-10-01.
+- **M5 plan** approved 2026-10-01; 5.4 (demo mode) dropped 2026-10-06.
+- **M6 plan** approved 2026-10-06.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
   `Dockerfile` and `compose.yaml`). It wasn't started; it was brought up with
   `docker compose up -d` on 2026-10-01 and the dashboard shows it with no code
@@ -184,7 +225,12 @@ Resolved:
 - **Local dev has no Docker data.** Local `go run` can't reach a socket proxy,
   so the page shows "could not list containers". Solved in 2.4 with
   `API_TARGET` (Vite forwards `/api` to the server's Tailscale URL); see the
-  README. A sample-data mode would still help for demos/screenshots (M5).
+  README.
+- **Demo mode (dropped from M5 as 5.4).** Worth revisiting if Playwright
+  end-to-end tests are added: they need a backend with stable fake data. It
+  would be an `internal/demo` package implementing `monitor.Docker` and
+  `monitor.HostReader` (generating cumulative CPU counters, not percentages,
+  so the real CPU % code runs), switched on by `DEMO=1` in `main.go`.
 - **Minecraft is published on `0.0.0.0:25565`**, so it's reachable from the LAN
   (and the internet, if the router forwards it) regardless of UFW. Fine if
   intended; not a dashboard issue.

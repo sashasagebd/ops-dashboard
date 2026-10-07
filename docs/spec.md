@@ -26,7 +26,9 @@ Progress and the milestone plan are in [roadmap.md](roadmap.md).
   roadmap (M4) for when it is.
 - Logs
 - Restart buttons (or any other action that changes container state)
-- History graphs
+- History graphs. Planned post-v1 as M6 (approved 2026-10-06): small
+  sparklines of CPU, memory and disk, kept in memory for 24h, so history
+  resets on redeploy. See the roadmap.
 - Auth beyond Tailscale
 
 ## Constraints

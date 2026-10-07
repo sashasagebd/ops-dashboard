@@ -26,7 +26,7 @@ When Docker is unreachable:
     Stale over broken. If a poll fails, the API keeps serving the last good snapshot with "stale": true; it only returns an error if no poll has ever succeeded. The page keeps showing data and a banner says which link is broken (server can't reach Docker, browser can't reach server, or data stopped updating) and how old the data is. A monitoring page that goes blank exactly when something's wrong is the least useful kind.
 
 Refreshing the page: 
-    A small custom React hook (usePolling) instead of a library like TanStack Query. There's one endpoint, so the library's caching and deduplication wouldn't earn the dependency. The hook schedules the next fetch after each response (so requests never overlap), pauses while the tab is hidden, and keeps the old data when a refresh fails.
+    A small custom React hook (usePolling) instead of a library like TanStack Query. There are two endpoints (live data, and history on a slower poll), so the library's caching and deduplication wouldn't earn the dependency. The hook schedules the next fetch after each response (so requests never overlap), pauses while the tab is hidden, and keeps the old data when a refresh fails.
 
 Reading host stats: 
     No extra volume mounts. The first plan was to mount the host's /proc and / read-only into the container. But /proc/stat and /proc/meminfo aren't namespaced, so a container already sees the whole host's CPU and memory, and statfs on the container's own / reports the filesystem Docker keeps everything on, which is the host's root disk. Mounting the host's / would have let the dashboard read every world-readable file on the server for nothing. 
@@ -45,3 +45,12 @@ Testing the image in CI:
 
 Showing container health: 
     A badge next to the state (green healthy, amber starting, red unhealthy), not a tooltip: a tooltip is easy to miss and doesn't exist on a phone, and "running but unhealthy" (e.g. a hung Minecraft server) is exactly what a monitoring page must not hide. Containers without a healthcheck get no badge, so you can tell which ones are really tested. Docker keeps the last health result after a container stops, so the API sends null for stopped containers rather than a stale "healthy".
+
+Trend lines (history):
+    Kept in memory, not in a database. Each series is a fixed ring of 1-minute buckets covering 24 hours, so memory use is fixed (about 0.5 MB with a handful of containers) and old data falls off on its own. The cost is that every redeploy starts the history again; if that gets annoying, the history can move behind an interface backed by SQLite (pure-Go modernc.org/sqlite, since the static distroless build has no cgo). 
+    Each bucket keeps the average and the maximum. The page draws the average as the line and the peaks faintly behind it, because an average alone hides a 10-second CPU spike, which is often exactly what you're looking for. 
+    Keyed by container name, not ID: a Compose deploy recreates the container with a new ID, and by ID its line would restart on every deploy. A container that's stopped keeps its line (with a gap); one that hasn't been seen for 24 hours is forgotten. 
+    Gaps are null, never 0, like everywhere else in the API: a stopped container's line breaks instead of diving to zero, and a minute in which Docker was unreachable is a gap rather than a run of stale values. 
+    A separate endpoint (/api/history) on a 60-second poll, an exception to "one snapshot, one request": resending a day of points every 5 seconds would be wasteful, and a trend line a few seconds behind the live number doesn't matter. Its series are plain arrays (one value per minute from a start time) rather than {time, value} pairs, because at 24 hours a timestamp on every value would be most of the response. 
+    Only two windows (1h, 24h), so the response size stays bounded and the API is easy to describe. 
+    Hand-drawn SVG instead of a chart library: a sparkline is one path per series, and a library would add far more to the bundle than it saves. Scales are fixed (0-100% for CPU, the limit for memory, usable space for disk), not fitted to the data, so an idle container is a flat line near the bottom rather than a dramatic zigzag. Each line's accessible name carries its average and peak, since a screen reader can't read the drawing.

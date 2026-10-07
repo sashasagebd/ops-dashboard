@@ -11,7 +11,15 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/history"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/host"
+)
+
+// History is kept in 1-minute buckets for 24 hours: 1,440 points per series,
+// plenty for a sparkline at either window the page offers (1h, 24h).
+const (
+	historyBucket    = time.Minute
+	historyRetention = 24 * time.Hour
 )
 
 // Docker is the Docker access the monitor needs. It's declared here, where
@@ -80,6 +88,8 @@ type Monitor struct {
 	prev     map[string]docker.Stats
 	prevHost *host.CPUTimes
 
+	history *history.History // has its own lock
+
 	mu     sync.RWMutex
 	snap   Snapshot
 	polled bool // whether any poll has ever succeeded
@@ -88,7 +98,13 @@ type Monitor struct {
 // New returns a Monitor that reads containers from d and host stats from h.
 // It has no data until the first successful Poll.
 func New(d Docker, h HostReader) *Monitor {
-	return &Monitor{docker: d, host: h, now: time.Now, prev: map[string]docker.Stats{}}
+	return &Monitor{
+		docker:  d,
+		host:    h,
+		now:     time.Now,
+		prev:    map[string]docker.Stats{},
+		history: history.New(historyBucket, historyRetention),
+	}
 }
 
 // Snapshot returns the latest data. ok is false if no poll has succeeded yet.
@@ -100,6 +116,12 @@ func (m *Monitor) Snapshot() (snap Snapshot, ok bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.snap, m.polled
+}
+
+// History returns the recorded trend data for the last window, up to now.
+// It's safe to call while polling.
+func (m *Monitor) History(window time.Duration) history.View {
+	return m.history.Window(m.now(), window)
 }
 
 // Run polls immediately and then every interval, until ctx is cancelled.
@@ -161,12 +183,43 @@ func (m *Monitor) Poll(ctx context.Context) error {
 	m.prev = next
 
 	hostStatus := m.readHost()
+	now := m.now()
 
 	m.mu.Lock()
-	m.snap = Snapshot{UpdatedAt: m.now(), Containers: statuses, Host: hostStatus}
+	m.snap = Snapshot{UpdatedAt: now, Containers: statuses, Host: hostStatus}
 	m.polled = true
 	m.mu.Unlock()
+
+	// Only successful polls are recorded, so a minute in which Docker was
+	// unreachable is a gap in the history rather than a run of stale values.
+	m.history.Record(now, historySample(hostStatus), historySamples(statuses))
 	return nil
+}
+
+func historySample(s *HostStatus) *history.HostSample {
+	if s == nil {
+		return nil
+	}
+	return &history.HostSample{
+		HasCPU:     s.HasCPU,
+		CPUPercent: s.CPUPercent,
+		MemoryUsed: s.Memory.Used(),
+		DiskUsed:   s.Disk.Used,
+	}
+}
+
+func historySamples(statuses []ContainerStatus) []history.ContainerSample {
+	samples := make([]history.ContainerSample, 0, len(statuses))
+	for _, s := range statuses {
+		samples = append(samples, history.ContainerSample{
+			Name:       s.Name,
+			HasCPU:     s.HasCPU,
+			CPUPercent: s.CPUPercent,
+			HasMemory:  s.HasStats,
+			MemoryUsed: s.MemoryUsed,
+		})
+	}
+	return samples
 }
 
 // addStats fills in s's resource usage and records the sample in next. A

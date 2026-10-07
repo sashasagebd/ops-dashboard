@@ -24,7 +24,8 @@ over Tailscale.
 - `backend/`: Go module `github.com/sashasagebd/ops-dashboard/backend`
   - `cmd/dashboard/`: entrypoint, config from env vars; `-healthcheck` flag for the Dockerfile's `HEALTHCHECK` (GETs its own `/healthz`, exits 0/1)
   - `internal/server/`: HTTP routes; reads snapshots through its `SnapshotSource` interface, never Docker directly
-  - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %
+  - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %; feeds `internal/history` after each successful poll
+  - `internal/history/`: in-memory trend data (1-minute buckets of avg/max, 24h ring per series, keyed by container name; gaps are `OK: false`, never 0). Not persisted.
   - `internal/docker/`: Docker Engine API client (plain `net/http`, no SDK)
   - `internal/host/`: host CPU (`/proc/stat`), memory (`/proc/meminfo`) and disk (`statfs`, Linux-only via build tag; stub elsewhere so Windows dev still builds)
 - `frontend/`: Vite + React + TypeScript, Oxlint, Vitest + Testing Library
@@ -34,7 +35,8 @@ over Tailscale.
 
 - `GET /healthz`: `{"status":"ok"}` whenever the process is serving; deliberately doesn't check Docker.
 - `GET /api/containers`: `{updatedAt, stale, host, containers}` from the monitor's latest snapshot; 502 only if no poll has ever succeeded. `host` is null if it couldn't be read. Per container: `id, name, image, state, health, status, startedAt, finishedAt, cpuPercent, memoryBytes, memoryLimitBytes`. Values that don't apply are `null`, never 0. CPU is percent of the whole host (0–100), for containers and host alike.
-- Types: `containersResponse` in `backend/internal/server/server.go`, mirrored in `frontend/src/api.ts`; keep them in sync.
+- `GET /api/history?window=1h|24h` (default 1h, else 400): `{start, stepSeconds, host, containers}` from the in-memory history. Each series is an array with one value per step (60s) from `start`, oldest first, `null` for gaps; all series in a response have the same length. Containers are keyed by name.
+- Types: `containersResponse` and `historyResponse` in `backend/internal/server/server.go`, mirrored in `frontend/src/api.ts`; keep them in sync.
 
 ## Commands
 

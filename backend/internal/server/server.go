@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net/http"
 	"time"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/history"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/monitor"
 )
 
@@ -18,12 +20,19 @@ type SnapshotSource interface {
 	Snapshot() (snap monitor.Snapshot, ok bool)
 }
 
+// HistorySource provides recent trend data; in production it's also a
+// *monitor.Monitor.
+type HistorySource interface {
+	History(window time.Duration) history.View
+}
+
 // New returns the dashboard's HTTP handler. If static is non-nil, its files
 // (the built frontend) are served for every path the API doesn't claim.
-func New(snapshots SnapshotSource, static fs.FS) http.Handler {
+func New(snapshots SnapshotSource, hist HistorySource, static fs.FS) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /api/containers", handleListContainers(snapshots))
+	mux.HandleFunc("GET /api/history", handleHistory(hist))
 	if static != nil {
 		// "GET /" matches everything, but ServeMux always prefers the most
 		// specific pattern, so the API routes above still win.
@@ -148,6 +157,98 @@ func handleListContainers(snapshots SnapshotSource) http.HandlerFunc {
 			Containers: list,
 		})
 	}
+}
+
+// historyWindows are the windows GET /api/history accepts, matching the
+// page's toggle. A fixed list rather than any duration keeps the response
+// size bounded and the API easy to describe.
+var historyWindows = map[string]time.Duration{
+	"1h":  time.Hour,
+	"24h": 24 * time.Hour,
+}
+
+// historyResponse is the JSON body of GET /api/history.
+//
+// Every series has the same length: one value per stepSeconds from start,
+// oldest first, the last one being the minute still in progress. Values
+// carry no timestamps of their own: at 24h a series is 1,440 values, and a
+// timestamp on each would be most of the body. A value is null when nothing
+// was recorded in that step (stopped, not yet available, or Docker
+// unreachable), so the line has a gap instead of dropping to 0.
+type historyResponse struct {
+	Start       time.Time                           `json:"start"` // start of the first step
+	StepSeconds int                                 `json:"stepSeconds"`
+	Host        hostHistoryResponse                 `json:"host"`
+	Containers  map[string]containerHistoryResponse `json:"containers"` // by name; {} if none
+}
+
+type hostHistoryResponse struct {
+	CPUPercent    []*float64 `json:"cpuPercent"`    // step average, 0–100
+	CPUPercentMax []*float64 `json:"cpuPercentMax"` // step maximum, so short spikes still show
+	MemoryBytes   []*float64 `json:"memoryBytes"`   // step average of used memory
+	DiskUsedBytes []*float64 `json:"diskUsedBytes"`
+}
+
+type containerHistoryResponse struct {
+	CPUPercent    []*float64 `json:"cpuPercent"`
+	CPUPercentMax []*float64 `json:"cpuPercentMax"`
+	MemoryBytes   []*float64 `json:"memoryBytes"`
+}
+
+func handleHistory(hist HistorySource) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		param := r.URL.Query().Get("window")
+		if param == "" {
+			param = "1h"
+		}
+		window, ok := historyWindows[param]
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "window must be 1h or 24h"})
+			return
+		}
+
+		// No 502 before the first poll, unlike /api/containers: an empty
+		// history is still a valid answer (every value null).
+		v := hist.History(window)
+		containers := make(map[string]containerHistoryResponse, len(v.Containers))
+		for name, c := range v.Containers {
+			containers[name] = containerHistoryResponse{
+				CPUPercent:    values(c.CPU, avg, 2),
+				CPUPercentMax: values(c.CPU, peak, 2),
+				MemoryBytes:   values(c.Memory, avg, 0),
+			}
+		}
+		writeJSON(w, http.StatusOK, historyResponse{
+			Start:       v.Start,
+			StepSeconds: int(v.Step / time.Second),
+			Host: hostHistoryResponse{
+				CPUPercent:    values(v.Host.CPU, avg, 2),
+				CPUPercentMax: values(v.Host.CPU, peak, 2),
+				MemoryBytes:   values(v.Host.Memory, avg, 0),
+				DiskUsedBytes: values(v.Host.Disk, avg, 0),
+			},
+			Containers: containers,
+		})
+	}
+}
+
+func avg(p history.Point) float64  { return p.Avg }
+func peak(p history.Point) float64 { return p.Max }
+
+// values picks one number from each point, rounded to decimals places, with
+// nil (null) for gaps. Rounding matters for size: an average of byte counts
+// is rarely a whole number, and its full float64 digits would roughly triple
+// the body for precision no chart can show.
+func values(points []history.Point, pick func(history.Point) float64, decimals int) []*float64 {
+	scale := math.Pow10(decimals)
+	out := make([]*float64, len(points))
+	for i, p := range points {
+		if p.OK {
+			v := math.Round(pick(p)*scale) / scale
+			out[i] = &v
+		}
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

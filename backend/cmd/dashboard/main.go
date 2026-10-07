@@ -70,7 +70,7 @@ func run(addr string) error {
 	defer stop()
 
 	// The monitor polls Docker in the background; requests only read its
-	// latest snapshot. It stops when ctx is cancelled at shutdown.
+	// latest snapshot and history. It stops when ctx is cancelled at shutdown.
 	// The container's own /proc and / report the host's CPU, memory and root
 	// disk, so no extra mounts are needed (see internal/host).
 	mon := monitor.New(dockerClient, host.NewReader("/proc", "/"))
@@ -78,7 +78,7 @@ func run(addr string) error {
 
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: server.New(mon, static),
+		Handler: server.New(mon, mon, static),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,

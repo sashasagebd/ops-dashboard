@@ -35,15 +35,55 @@ export type ContainersResponse = {
   containers: Container[]
 }
 
-export async function fetchContainers(signal?: AbortSignal): Promise<ContainersResponse> {
-  const res = await fetch('/api/containers', { signal })
+// HistoryWindow is a window GET /api/history accepts.
+export type HistoryWindow = '1h' | '24h'
+
+// Series is one value per step, oldest first; null is a gap (nothing recorded
+// in that step), never 0.
+export type Series = (number | null)[]
+
+// HostHistory matches hostHistoryResponse in the same Go file.
+export type HostHistory = {
+  cpuPercent: Series // step average, 0–100
+  cpuPercentMax: Series // step maximum, so short spikes still show
+  memoryBytes: Series // used, step average
+  diskUsedBytes: Series
+}
+
+// ContainerHistory matches containerHistoryResponse in the same Go file.
+export type ContainerHistory = {
+  cpuPercent: Series
+  cpuPercentMax: Series
+  memoryBytes: Series
+}
+
+// HistoryResponse matches historyResponse in the same Go file. Every series
+// has the same length; value i covers the step starting at
+// start + i * stepSeconds, and the last one is still filling.
+export type HistoryResponse = {
+  start: string // RFC 3339; start of the first step
+  stepSeconds: number
+  host: HostHistory
+  containers: Record<string, ContainerHistory> // by container name
+}
+
+export function fetchContainers(signal?: AbortSignal): Promise<ContainersResponse> {
+  return getJSON<ContainersResponse>('/api/containers', signal)
+}
+
+export function fetchHistory(window: HistoryWindow, signal?: AbortSignal): Promise<HistoryResponse> {
+  return getJSON<HistoryResponse>(`/api/history?window=${window}`, signal)
+}
+
+async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(url, { signal })
   if (!res.ok) {
     // The API sends {"error": "..."} on failure; fall back to the status line
     // if the body is something else (e.g. a proxy error page).
     const body: unknown = await res.json().catch(() => null)
     throw new Error(errorMessage(body) ?? `Request failed: ${res.status} ${res.statusText}`)
   }
-  return (await res.json()) as ContainersResponse
+  return (await res.json()) as T
 }
 
 function errorMessage(body: unknown): string | undefined {

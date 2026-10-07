@@ -345,3 +345,51 @@ func TestHostNotReadWhenListFails(t *testing.T) {
 		t.Errorf("host read %d times, want 0 (a failed poll publishes nothing)", h.reads)
 	}
 }
+
+func TestPollRecordsHistory(t *testing.T) {
+	f := &fakeDocker{
+		containers: []docker.Container{mc},
+		stats:      map[string]docker.Stats{"m1": {CPUUsage: 100, SystemCPUUsage: 1000, MemoryUsed: 1 << 30}},
+	}
+	h := &fakeHost{sample: host.Sample{
+		CPU:    host.CPUTimes{Busy: 1000, Total: 10_000},
+		Memory: host.Memory{Total: 16 << 30, Available: 12 << 30},
+		Disk:   host.Disk{Used: 50 << 30},
+	}}
+	clock := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	m := New(f, h)
+	m.now = func() time.Time { return clock }
+
+	// Minute 0: first poll, so no CPU % yet.
+	mustPoll(t, m)
+	// Minute 1: mc is recreated by a deploy (new ID, same name); the host
+	// passes 400 ticks, 100 busy.
+	clock = clock.Add(time.Minute)
+	f.set(func(f *fakeDocker) {
+		f.containers = []docker.Container{{ID: "m2", Name: "mc", State: "running"}}
+		f.stats = map[string]docker.Stats{"m2": {CPUUsage: 5, SystemCPUUsage: 2000, MemoryUsed: 1 << 30}}
+	})
+	h.sample.CPU = host.CPUTimes{Busy: 1100, Total: 10_400}
+	mustPoll(t, m)
+	// Minute 2: Docker unreachable for the whole minute.
+	clock = clock.Add(time.Minute)
+	f.set(func(f *fakeDocker) { f.listErr = errors.New("proxy unreachable") })
+	_ = m.Poll(context.Background())
+
+	v := m.History(3 * time.Minute)
+	hostHist, containers := v.Host, v.Containers
+
+	if got := hostHist.CPU; !got[1].OK || got[1].Avg != 25 || got[0].OK || got[2].OK {
+		t.Errorf("host CPU = %+v, want only minute 1, at 25%%", got)
+	}
+	if got := hostHist.Memory[0]; !got.OK || got.Avg != 4<<30 {
+		t.Errorf("host memory at minute 0 = %+v, want 4 GiB (total minus available)", got)
+	}
+	if got := hostHist.Disk[1]; !got.OK || got.Avg != 50<<30 {
+		t.Errorf("host disk at minute 1 = %+v, want 50 GiB", got)
+	}
+	mem := containers["mc"].Memory
+	if len(containers) != 1 || !mem[0].OK || !mem[1].OK || mem[2].OK {
+		t.Errorf("containers = %+v, want one mc series with memory in minutes 0 and 1 across the recreate, and a gap for the failed poll", containers)
+	}
+}

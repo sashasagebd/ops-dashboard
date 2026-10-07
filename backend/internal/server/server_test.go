@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/history"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/host"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/monitor"
 )
@@ -22,6 +23,18 @@ type fakeSource struct {
 
 func (f *fakeSource) Snapshot() (monitor.Snapshot, bool) {
 	return f.snap, f.ok
+}
+
+// fakeHistory is a HistorySource that returns a canned view and records the
+// windows it was asked for.
+type fakeHistory struct {
+	view  history.View
+	asked []time.Duration
+}
+
+func (f *fakeHistory) History(window time.Duration) history.View {
+	f.asked = append(f.asked, window)
+	return f.view
 }
 
 func TestHealthz(t *testing.T) {
@@ -40,7 +53,7 @@ func TestHealthz(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/healthz", nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeSource{}, nil).ServeHTTP(rec, req)
+			New(&fakeSource{}, nil, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -161,7 +174,7 @@ func TestListContainers(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/containers", nil)
 			rec := httptest.NewRecorder()
 
-			New(tt.source, nil).ServeHTTP(rec, req)
+			New(tt.source, nil, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -204,7 +217,7 @@ func TestStaticFiles(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeSource{ok: true}, tt.static).ServeHTTP(rec, req)
+			New(&fakeSource{ok: true}, nil, tt.static).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -214,6 +227,103 @@ func TestStaticFiles(t *testing.T) {
 			}
 			if got := strings.TrimSpace(rec.Body.String()); got != tt.wantBody {
 				t.Errorf("body = %q, want %q", got, tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestHistoryWindow(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantStatus int
+		wantWindow time.Duration // 0: the source mustn't be asked
+		wantBody   string        // checked only if set
+	}{
+		{name: "defaults to 1h", query: "", wantStatus: http.StatusOK, wantWindow: time.Hour},
+		{name: "1h", query: "?window=1h", wantStatus: http.StatusOK, wantWindow: time.Hour},
+		{name: "24h", query: "?window=24h", wantStatus: http.StatusOK, wantWindow: 24 * time.Hour},
+		{
+			name: "anything else is rejected", query: "?window=7d", wantStatus: http.StatusBadRequest,
+			wantBody: `{"error":"window must be 1h or 24h"}` + "\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hist := &fakeHistory{}
+			req := httptest.NewRequest(http.MethodGet, "/api/history"+tt.query, nil)
+			rec := httptest.NewRecorder()
+
+			New(&fakeSource{}, hist, nil).ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			if tt.wantWindow == 0 && len(hist.asked) != 0 {
+				t.Errorf("source asked for %v, want not asked", hist.asked)
+			}
+			if tt.wantWindow != 0 && (len(hist.asked) != 1 || hist.asked[0] != tt.wantWindow) {
+				t.Errorf("source asked for %v, want [%v]", hist.asked, tt.wantWindow)
+			}
+			if tt.wantBody != "" && rec.Body.String() != tt.wantBody {
+				t.Errorf("body = %q, want %q", rec.Body.String(), tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestHistoryBody(t *testing.T) {
+	start := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	gap := history.Point{}
+	pt := func(avg, max float64) history.Point { return history.Point{OK: true, Avg: avg, Max: max} }
+
+	tests := []struct {
+		name string
+		view history.View
+		want string
+	}{
+		{
+			// CPU is rounded to 2 places and bytes to whole numbers; gaps
+			// are null.
+			name: "values, gaps and rounding",
+			view: history.View{
+				Start: start,
+				Step:  time.Minute,
+				Host: history.HostHistory{
+					CPU:    []history.Point{gap, pt(12.3456, 80)},
+					Memory: []history.Point{pt(1073741824.6, 0), gap},
+					Disk:   []history.Point{pt(50<<30, 0), pt(50<<30, 0)},
+				},
+				Containers: map[string]history.ContainerHistory{
+					"mc": {
+						CPU:    []history.Point{pt(1.5, 3), gap},
+						Memory: []history.Point{pt(100, 0), pt(200, 0)},
+					},
+				},
+			},
+			want: `{"start":"2026-10-06T12:00:00Z","stepSeconds":60,` +
+				`"host":{"cpuPercent":[null,12.35],"cpuPercentMax":[null,80],"memoryBytes":[1073741825,null],"diskUsedBytes":[53687091200,53687091200]},` +
+				`"containers":{"mc":{"cpuPercent":[1.5,null],"cpuPercentMax":[3,null],"memoryBytes":[100,200]}}}` + "\n",
+		},
+		{
+			name: "no data: empty lists and object, not null",
+			view: history.View{Start: start, Step: time.Minute},
+			want: `{"start":"2026-10-06T12:00:00Z","stepSeconds":60,` +
+				`"host":{"cpuPercent":[],"cpuPercentMax":[],"memoryBytes":[],"diskUsedBytes":[]},"containers":{}}` + "\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/history", nil)
+			rec := httptest.NewRecorder()
+
+			New(&fakeSource{}, &fakeHistory{view: tt.view}, nil).ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if got := rec.Body.String(); got != tt.want {
+				t.Errorf("body =\n%s\nwant\n%s", got, tt.want)
 			}
 		})
 	}

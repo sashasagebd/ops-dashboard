@@ -1,7 +1,8 @@
 # Ops Dashboard
 
 A self-hosted monitoring dashboard for my home server: which containers are
-running, what they're using, and how the host is doing.
+running, what they're using, how the host is doing, and how that has changed
+over the last day.
 
 See [docs/spec.md](docs/spec.md) for scope and [docs/decisions/](docs/decisions/)
 for the reasoning behind the main design choices.
@@ -91,6 +92,7 @@ Check it's up, from the server:
 docker compose ps                              # dashboard shows "(healthy)" ~30s after start
 curl -s http://127.0.0.1:8080/healthz          # {"status":"ok"}
 curl -s http://127.0.0.1:8080/api/containers   # JSON: host stats plus every container, including stopped ones
+curl -s http://127.0.0.1:8080/api/history      # JSON: the last hour per minute; starts empty after every restart
 ```
 
 Expose it to your tailnet over HTTPS (needs MagicDNS and HTTPS certificates
