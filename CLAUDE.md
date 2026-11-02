@@ -34,7 +34,7 @@ over Tailscale.
   - `internal/docker/`: Docker Engine API client (plain `net/http`, no SDK)
   - `internal/host/`: host CPU (`/proc/stat`), memory (`/proc/meminfo`) and disk (`statfs`, Linux-only via build tag; stub elsewhere so Windows dev still builds)
 - `frontend/`: Vite + React + TypeScript, Oxlint, Vitest + Testing Library
-- `Dockerfile`, `compose.yaml`: one image (Go serves the built frontend from `STATIC_DIR`) plus the socket proxy
+- `Dockerfile`, `compose.yaml`: one image with both binaries (Go serves the built frontend from `STATIC_DIR`); compose runs the dashboard and its socket proxy, and the platform (entrypoint `/platform`) and its `postgres` (volume `platform-db`, internal `platform-db` network)
 
 ## API
 
@@ -58,7 +58,7 @@ npm run lint && npm test && npm run build
 npm run dev                       # :5173, forwards /api to :8080 (or $API_TARGET, e.g. the server's ts.net URL for real data)
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly these checks, with a `postgres:18.6` service container so the database tests run (they fail rather than skip when `CI` is set without `DATABASE_URL`). A separate job builds the Docker image and runs `/dashboard -healthcheck` inside it, then starts `/platform` from the same image against a real Postgres and checks its healthcheck too. That job is the only place the image is tested, since the dev PC has no Docker. Keep all of them green. CI runs on pushes to `main` and on pull requests, so a draft PR is the way to run it before merging.
+CI (`.github/workflows/ci.yml`) runs exactly these checks, with a `postgres:18.6` service container so the database tests run (they fail rather than skip when `CI` is set without `DATABASE_URL`). A separate job builds the Docker image and runs `/dashboard -healthcheck` inside it, then starts `/platform` from the same image against a real Postgres and checks its healthcheck too, and finally runs the real `compose.yaml` with `docker compose up --wait`. That job is the only place the image is tested, since the dev PC has no Docker. Keep all of them green. CI runs on pushes to `main` and on pull requests, so a draft PR is the way to run it before merging.
 
 Deploying is done by the owner on the server (`homelab`), which only pulls: `cd ~/apps/dashboard && git pull && docker compose up -d --build`. The server's only local file is its git-ignored `.env`. After a change that needs checking on the real server, end the step with exact commands for the owner to run and what output to expect.
 
@@ -66,6 +66,7 @@ Deploying is done by the owner on the server (`homelab`), which only pulls: `cd 
 
 - Never mount `/var/run/docker.sock` into the dashboard container. Docker is reached only through `tecnativa/docker-socket-proxy` (`POST=0`, only needed endpoints enabled) on the internal `docker-api` network. The Go client accepts only `tcp://` hosts.
 - Publish the dashboard only on `127.0.0.1` (Docker bypasses UFW); remote access is via `tailscale serve`.
+- The platform and Postgres publish no ports. Postgres is only on the internal `platform-db` network; nothing but the platform can reach it.
 - Keep Docker access behind Go interfaces so logic is tested against fakes; tests use `httptest`, never a real Docker daemon.
 - Secrets come from env vars; document every variable in `.env.example` and the README's configuration table.
 - API errors to clients are generic; details go to the server log.

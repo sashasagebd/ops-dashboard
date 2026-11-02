@@ -40,7 +40,85 @@ services:
     networks:
       - docker-api
 
+  # The deploy platform's control plane (docs/platform-plan.md). Same image
+  # as the dashboard, different binary. A separate service so monitoring
+  # keeps working when the platform doesn't (docs/decisions/platform.md).
+  # No Docker access and no published port yet: P1 adds both its own socket
+  # proxy and the dashboard's route to it.
+  platform:
+    build: .
+    entrypoint: ["/platform"]
+    restart: unless-stopped
+    environment:
+      # Hex passwords (see .env.example) need no escaping in a URL. No TLS:
+      # the connection never leaves the internal platform-db network.
+      DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/platform?sslmode=disable
+    # The image's HEALTHCHECK is the dashboard's, so it's replaced here. The
+    # platform only listens once Postgres answers and migrations have run,
+    # hence the longer start period.
+    healthcheck:
+      test: ["CMD", "/platform", "-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      # Check often while starting, so it reports healthy (and depends_on /
+      # `up --wait` move on) seconds after it's ready, not up to 30s later.
+      start_interval: 2s
+      retries: 3
+    # Only applies to `docker compose up`. After a reboot Docker starts
+    # containers in any order, and the platform waits for Postgres itself.
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - platform-db
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+
+  postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: platform
+      # Only read when the volume is first initialised. Changing it later
+      # means ALTER USER inside Postgres as well as editing .env.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: platform
+    volumes:
+      # Postgres 18 images keep data under /var/lib/postgresql/18/docker and
+      # expect the volume one level up, at /var/lib/postgresql (older guides
+      # say /var/lib/postgresql/data, which 18 refuses to start with).
+      - platform-db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "platform", "-d", "platform"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      start_interval: 2s
+      retries: 5
+    # The image stops with SIGINT (fast shutdown), which can take longer than
+    # Compose's default 10s before it resorts to SIGKILL; a killed Postgres
+    # has to run crash recovery on its next start.
+    stop_grace_period: 1m
+    networks:
+      - platform-db
+    security_opt: ["no-new-privileges:true"]
+    # A ceiling, not a reservation: idle use is far lower. Leaves the game
+    # servers their headroom.
+    mem_limit: 512m
+
 networks:
   docker-api:
     # No route to the outside world; only services attached to it can talk.
     internal: true
+  platform-db:
+    # Only the platform and Postgres are on it, so Postgres has no published
+    # port and nothing else can reach it.
+    internal: true
+
+volumes:
+  # The platform's database. `docker compose down` keeps it; only
+  # `docker compose down -v` (or `docker volume rm`) deletes it.
+  platform-db:

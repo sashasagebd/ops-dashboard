@@ -237,3 +237,35 @@ tests. Each binary decides what its own `/healthz` means.
 
 **Alternatives:** copying the code into `cmd/platform` (two copies to keep in
 sync).
+
+### Running Postgres and the platform in Compose
+
+**What:** both services live in the dashboard's `compose.yaml`. Postgres
+(`postgres:18.6`) has a named volume, a 512 MB memory ceiling, a 1-minute
+stop grace period, and no published port. The platform has a 128 MB ceiling
+and the same hardening as the dashboard (read-only filesystem, no Linux
+capabilities). The password is a hex string from `.env`, and the connection
+doesn't use TLS.
+
+**Why:**
+- *One compose file:* one `docker compose up -d --build` deploys everything,
+  the way the server is already run, and the two services are only useful
+  together.
+- *Memory ceilings:* they protect the game servers if something misbehaves.
+  They're limits, not reservations; Postgres idles far below its limit.
+- *The stop grace period:* the image stops Postgres with a fast shutdown,
+  which can outlast Compose's default 10s. Being killed instead means crash
+  recovery on the next start.
+- *Hex password:* it can go into the connection URL without escaping.
+- *No TLS:* the connection never leaves an internal Docker network on one
+  host, so TLS would add certificate handling for no real protection.
+- *Volume path:* Postgres 18 images expect the volume at
+  `/var/lib/postgresql`, not the `/var/lib/postgresql/data` older guides use.
+
+**Alternatives:** a separate compose project for the platform (independent
+deploys, but two places to configure and deploy for services that go
+together); Postgres installed directly on the host (survives Docker problems,
+but goes against "everything in Docker" and is harder to pin and reproduce);
+the `-alpine` image (smaller download, but musl's locale behaviour differs
+from the glibc that most Postgres guides assume, and disk space isn't the
+constraint here).

@@ -132,3 +132,30 @@ jobs:
           done
           docker logs dashboard
           exit 1
+
+      # The whole stack exactly as the server runs it: compose.yaml's
+      # volumes, networks, healthchecks and hardening options, which the
+      # docker run steps above don't exercise. --wait fails the step unless
+      # every service becomes healthy.
+      - name: Compose stack
+        env:
+          POSTGRES_PASSWORD: ci-only
+        run: |
+          docker compose up -d --build --wait --wait-timeout 180 || { docker compose ps -a; docker compose logs; exit 1; }
+          curl -fsS http://127.0.0.1:8080/healthz
+          # The dashboard sees the new services (proxy -> Docker works). Plain
+          # grep, not -q: -q exits at the first match, which can fail curl
+          # with a broken pipe, and pipefail would count that as no match.
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:8080/api/containers | grep '"name":"dashboard-postgres-1"' >/dev/null; then
+              break
+            fi
+            [ "$i" = 10 ] && { docker compose logs dashboard; exit 1; }
+            sleep 1
+          done
+          # A restart (like a redeploy) keeps the volume and finds nothing
+          # left to migrate.
+          docker compose restart platform
+          docker compose up -d --wait --wait-timeout 60 platform
+          docker compose logs --no-log-prefix platform | grep 'database schema up to date' | tail -1 | grep -F 'applied=[]'
+          docker compose down -v
