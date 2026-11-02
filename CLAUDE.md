@@ -9,6 +9,8 @@ over Tailscale.
 - `docs/roadmap.md`: milestone plan, current status, pending decisions and open questions. Start here when resuming.
 - `docs/spec.md`: v1 scope, out-of-scope list, constraints, server context.
 - `docs/decisions/stack.md`: reasoning behind the main design choices.
+- `docs/decisions/platform.md`: the platform's design log (what, why, alternatives). Add an entry for each significant platform decision.
+- `docs/platform-plan.md`: the next big goal, evolving the dashboard into a self-hosted deploy platform (phases, design principles, ground rules). Read it before any platform work; where it conflicts with the constraints below, ask before changing either.
 
 ## How to work on this repo
 
@@ -22,7 +24,10 @@ over Tailscale.
 ## Layout
 
 - `backend/`: Go module `github.com/sashasagebd/ops-dashboard/backend`
-  - `cmd/dashboard/`: entrypoint, config from env vars; `-healthcheck` flag for the Dockerfile's `HEALTHCHECK` (GETs its own `/healthz`, exits 0/1)
+  - `cmd/dashboard/`: entrypoint, config from env vars; `-healthcheck` flag for the Dockerfile's `HEALTHCHECK` (GETs its own `/healthz`, exits 0/1, via `internal/healthcheck`)
+  - `cmd/platform/`: the deploy platform's control plane, a separate service (`docs/decisions/platform.md`). Needs `DATABASE_URL`; waits for Postgres, migrates, then listens on `:8081`. Same `-healthcheck` flag.
+  - `internal/store/`: the platform's Postgres access (`pgx` pool). Schema in `migrations/NNNN_description.sql`, embedded and applied on startup under an advisory lock, one transaction per file. Migrations that have been deployed are never edited; changes go in a new file.
+  - `internal/healthcheck/`: the self-check both binaries use for `-healthcheck`
   - `internal/server/`: HTTP routes; reads snapshots through its `SnapshotSource` interface, never Docker directly
   - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %; feeds `internal/history` after each successful poll
   - `internal/history/`: in-memory trend data (1-minute buckets of avg/max, 24h ring per series, keyed by container name; gaps are `OK: false`, never 0). Not persisted.
@@ -45,13 +50,15 @@ over Tailscale.
 gofmt -l . && go vet ./... && go test -race ./... && go build ./...
 GOOS=linux go vet ./...           # dev PC is Windows; this type-checks Linux-only code (disk_linux.go)
 go run ./cmd/dashboard            # :8080; /api/containers is 502 without a proxy
+# Database tests in internal/store skip unless DATABASE_URL is set; CI sets it.
+# The dev PC has no Postgres, so they (and `go run ./cmd/platform`) only run in CI and on the server.
 
 # Frontend (from frontend/)
 npm run lint && npm test && npm run build
 npm run dev                       # :5173, forwards /api to :8080 (or $API_TARGET, e.g. the server's ts.net URL for real data)
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly these checks, plus a job that builds the Docker image and runs `/dashboard -healthcheck` inside it (the only place the image is tested, since the dev PC has no Docker); keep them green.
+CI (`.github/workflows/ci.yml`) runs exactly these checks, with a `postgres:18.6` service container so the database tests run (they fail rather than skip when `CI` is set without `DATABASE_URL`). A separate job builds the Docker image and runs `/dashboard -healthcheck` inside it, then starts `/platform` from the same image against a real Postgres and checks its healthcheck too. That job is the only place the image is tested, since the dev PC has no Docker. Keep all of them green. CI runs on pushes to `main` and on pull requests, so a draft PR is the way to run it before merging.
 
 Deploying is done by the owner on the server (`homelab`), which only pulls: `cd ~/apps/dashboard && git pull && docker compose up -d --build`. The server's only local file is its git-ignored `.env`. After a change that needs checking on the real server, end the step with exact commands for the owner to run and what output to expect.
 

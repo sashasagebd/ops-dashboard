@@ -1,9 +1,11 @@
-# v1 Roadmap
+# Roadmap
 
-Milestones for the v1 scope in [spec.md](spec.md). Each numbered step is one
-small, reviewed commit. Design reasoning lives in [decisions/](decisions/).
+Milestones for the v1 scope in [spec.md](spec.md) (M1–M6), then the deploy
+platform in [platform-plan.md](platform-plan.md) (P0 onwards, numbered after
+the plan's phases). Each numbered step is one small, reviewed commit. Design
+reasoning lives in [decisions/](decisions/).
 
-_Last updated: 2026-10-06_
+_Last updated: 2026-10-28_
 
 | Milestone | Status |
 |---|---|
@@ -12,18 +14,17 @@ _Last updated: 2026-10-06_
 | M3: Host stats | ✅ Done, deployed |
 | M4: Discord alerts | ⏸️ Deferred (not in v1; plan kept below) |
 | M5: Portfolio polish | 🚧 In progress (5.1–5.3 done, 5.4 dropped) |
-| M6: History sparklines | 🚧 Code done (6.1–6.4, docs for 6.5); not committed or deployed |
+| M6: History sparklines | 🚧 Committed (`17f6f1e`); deploy not confirmed |
+| P0: Platform foundations | 🚧 In progress (0.1–0.3 written, not committed; CI not yet run) |
 
-**Where we left off (2026-10-06):** 5.1–5.3 are committed but not deployed.
-M6 was started ahead of finishing v1 (owner's call); 5.5 and 5.6 are still
-to do. Next:
-1. Check the new **Docker image** job in GitHub Actions is green (it's the
-   only test of the image itself).
-2. Deploy (`cd ~/apps/dashboard && git pull && docker compose up -d --build`),
-   then check `docker ps` shows the dashboard `(healthy)` after ~30s and the
-   page shows `healthy` badges on `mc` and the dashboard.
-3. Review M6 (6.1–6.4), commit, push, then deploy and run the 6.5 checks
-   (they cover the 5.1–5.3 checks above too). Then back to 5.5 and 5.6.
+**Where we left off (2026-10-28):** platform work has started. M5's 5.5
+(README) and 5.6 (`v1.0.0` tag) are set aside for now (owner's call); the
+README gets rewritten for the platform later anyway. 5.1–5.3 and M6 are
+committed, but it isn't confirmed that they're deployed. P0's deploy step
+(0.4) ships them too, so its checks include theirs. The owner commits P0 as
+a whole at the end of the phase. Next: push 0.1–0.3 to a branch and open a
+draft PR so CI runs the database tests and the platform smoke test for the
+first time; fix anything they find; then 0.4.
 
 ## M1: Thinnest end-to-end slice ✅
 
@@ -203,6 +204,30 @@ Decisions (approved 2026-10-06):
   doesn't matter for a trend line.
 - **No chart library.** A sparkline is ~40 lines of SVG; Recharts or similar
   would add far more bundle than it saves.
+
+## P0: Platform foundations 🚧
+
+Phase 0 of [platform-plan.md](platform-plan.md). Plan approved 2026-10-28;
+decisions in [decisions/platform.md](decisions/platform.md).
+
+**Goal:** a platform service with its own Postgres and migrations, running in
+CI and on the server, with the dashboard working exactly as before. Changed
+from the plan's "locally and on the server": the dev PC has no Postgres for
+now, so database tests skip locally and run in CI.
+
+| Step | What | Status |
+|---|---|---|
+| 0.1 | Docs: decision log ([decisions/platform.md](decisions/platform.md)), this milestone, spec note. No code. | ✅ Not committed |
+| 0.2 | `cmd/platform` skeleton (`/healthz`, `-healthcheck`, `DATABASE_URL` config) and `internal/store`: `pgx` pool and the embedded migration runner (advisory lock, one transaction per file, `schema_migrations`). First migration creates `apps`. Unit tests for anything that doesn't need a database; database tests skip without `DATABASE_URL`. Dockerfile builds both binaries. | ✅ Reviewed, not committed. Also: the healthcheck moved to `internal/healthcheck` for both binaries; the platform waits for Postgres with backoff before migrating and listening; a database newer than the binary is refused. Database tests written but not yet run (they need 0.3's CI). |
+| 0.3 | CI: a Postgres service container so the database tests run (migrations apply, re-running does nothing, concurrent runs are serialized by the lock). The image job also checks the platform binary is in the image. | 🚧 In review; CI not yet run. `postgres:18.6` (newest; there's no 19 image yet), the same tag 0.4's compose will pin. Database tests fail instead of skipping if `CI` is set without `DATABASE_URL`. `cache-dependency-path` is now `go.sum`. The image job goes beyond checking the binary exists: it starts `/platform` before its Postgres, so the smoke test also covers waiting for the database, then migrating and passing its healthcheck. |
+| 0.4 | Compose: `postgres` (pinned, named volume, memory limit, internal `platform-db` network, no published port) and `platform` services; `.env.example` and README config table. The platform has no Docker access yet (that arrives with its write proxy in P1). Deploy; owner checks the platform is healthy, migrations ran, and the dashboard is unchanged. | |
+
+Decisions (approved 2026-10-28): see
+[decisions/platform.md](decisions/platform.md). In short: a separate service
+in the same module and image; the dashboard stays read-only and forwards
+`/api/platform/*` (wired up in P1, when there's an API to forward to); the
+Docker SDK for the platform only; Postgres reachable only from the platform;
+`pgx`; an embedded migration runner; real-Postgres tests in CI.
 
 ## Open questions
 

@@ -1,4 +1,4 @@
-package main
+package healthcheck
 
 import (
 	"net/http"
@@ -40,7 +40,7 @@ func TestHealthURL(t *testing.T) {
 	}
 }
 
-func TestHealthcheck(t *testing.T) {
+func TestCheck(t *testing.T) {
 	tests := []struct {
 		name    string
 		status  int
@@ -60,20 +60,20 @@ func TestHealthcheck(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			err := healthcheck(strings.TrimPrefix(srv.URL, "http://"))
+			err := Check(strings.TrimPrefix(srv.URL, "http://"))
 			if (err != nil) != tt.wantErr {
-				t.Errorf("healthcheck error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("Check error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func TestHealthcheckNothingListening(t *testing.T) {
+func TestCheckNothingListening(t *testing.T) {
 	// Closed straight away, so the port is known to be free.
 	srv := httptest.NewServer(nil)
 	srv.Close()
 
-	if err := healthcheck(strings.TrimPrefix(srv.URL, "http://")); err == nil {
-		t.Error("healthcheck succeeded with nothing listening, want error")
+	if err := Check(strings.TrimPrefix(srv.URL, "http://")); err == nil {
+		t.Error("Check succeeded with nothing listening, want error")
 	}
 }

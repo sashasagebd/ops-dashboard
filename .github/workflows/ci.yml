@@ -12,15 +12,31 @@ jobs:
     defaults:
       run:
         working-directory: backend
+    # Real Postgres for internal/store's database tests, which skip without
+    # DATABASE_URL (the dev PC has no Postgres, so this is where they run).
+    # Same version as compose.yaml. The password only exists for this job.
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_USER: platform
+          POSTGRES_PASSWORD: ci-only
+          POSTGRES_DB: platform
+        ports:
+          - 5432:5432
+        # Actions waits for the service to be healthy before running steps.
+        options: >-
+          --health-cmd "pg_isready -U platform"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-go@v6
         with:
           go-version-file: backend/go.mod
-          # go.mod, not go.sum: go.sum doesn't exist until the first
-          # dependency is added, and setup-go fails if this file is missing.
-          cache-dependency-path: backend/go.mod
+          cache-dependency-path: backend/go.sum
 
       - name: Check formatting
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
@@ -29,6 +45,8 @@ jobs:
         run: go vet ./...
 
       - name: Test
+        env:
+          DATABASE_URL: postgres://platform:ci-only@localhost:5432/platform?sslmode=disable
         run: go test -race -cover ./...
 
       - name: Build
@@ -75,6 +93,30 @@ jobs:
       - name: Check the HEALTHCHECK is set
         run: |
           test "$(docker inspect -f '{{json .Config.Healthcheck.Test}}' ops-dashboard:ci)" = '["CMD","/dashboard","-healthcheck"]'
+
+      # The platform binary from the same image, against a real Postgres. The
+      # platform is started first, on purpose: Postgres takes a few seconds to
+      # initialise, so this also covers waiting for the database (as after a
+      # reboot) before migrating and listening.
+      - name: Smoke test the platform
+        run: |
+          docker network create ci
+          docker run -d --name platform --network ci --entrypoint /platform \
+            -e DATABASE_URL='postgres://platform:ci-only@db:5432/platform?sslmode=disable' \
+            ops-dashboard:ci
+          docker run -d --name db --network ci \
+            -e POSTGRES_USER=platform -e POSTGRES_PASSWORD=ci-only -e POSTGRES_DB=platform \
+            postgres:18.6
+          for i in $(seq 1 30); do
+            if docker exec platform /platform -healthcheck; then
+              docker logs platform 2>&1 | grep 'database schema up to date'
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs platform
+          docker logs db
+          exit 1
 
       # Start the image and run the same command Docker's HEALTHCHECK runs.
       # There's no socket proxy here, so polling Docker fails (and logs

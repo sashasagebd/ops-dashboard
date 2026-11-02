@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/host"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/monitor"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/server"
@@ -29,7 +30,8 @@ func main() {
 	addr := envOr("LISTEN_ADDR", ":8080")
 
 	if *checkHealth {
-		if err := healthcheck(addr); err != nil {
+		// Checks the process only, not Docker: see server.handleHealthz.
+		if err := healthcheck.Check(addr); err != nil {
 			fmt.Fprintln(os.Stderr, "unhealthy:", err)
 			os.Exit(1)
 		}
