@@ -7,14 +7,19 @@ over the last day.
 See [docs/spec.md](docs/spec.md) for scope and [docs/decisions/](docs/decisions/)
 for the reasoning behind the main design choices.
 
+**In progress:** turning this into a small self-hosted deploy platform, with
+the dashboard as its UI; see [docs/platform-plan.md](docs/platform-plan.md).
+So far that's a separate `platform` service with its own Postgres; it doesn't
+deploy anything yet.
+
 ## Layout
 
 | Path | What |
 |---|---|
-| `backend/` | Go API server. Also serves the built frontend in production. |
+| `backend/` | Go: `cmd/dashboard` (API server; also serves the built frontend in production) and `cmd/platform` (the deploy platform). |
 | `frontend/` | React + TypeScript + Vite single-page app. |
-| `Dockerfile` | Builds the frontend and backend into one small image. |
-| `compose.yaml` | The dashboard plus a read-only Docker socket proxy. |
+| `Dockerfile` | Builds the frontend and both Go binaries into one small image. |
+| `compose.yaml` | The dashboard and its read-only Docker socket proxy; the platform and its Postgres. |
 
 ## How it reaches Docker
 
@@ -67,11 +72,13 @@ cd frontend && npm run lint && npm test && npm run build
 
 | Variable | Default | Used by |
 |---|---|---|
-| `LISTEN_ADDR` | `:8080` | backend: address to listen on |
-| `DOCKER_HOST` | `tcp://docker-proxy:2375` | backend: socket proxy address (`tcp://` only) |
-| `POLL_INTERVAL` | `5s` | backend: how often to poll Docker (Go duration, minimum `1s`) |
-| `STATIC_DIR` | unset | backend: built frontend to serve (set to `/static` in the image) |
+| `LISTEN_ADDR` | `:8080` (dashboard), `:8081` (platform) | backend: address to listen on |
+| `DOCKER_HOST` | `tcp://docker-proxy:2375` | dashboard: socket proxy address (`tcp://` only) |
+| `POLL_INTERVAL` | `5s` | dashboard: how often to poll Docker (Go duration, minimum `1s`) |
+| `STATIC_DIR` | unset | dashboard: built frontend to serve (set to `/static` in the image) |
+| `DATABASE_URL` | required | platform: Postgres connection URL (compose builds it from `POSTGRES_PASSWORD`). Database tests in `internal/store` also use it, and skip without it. |
 | `DASHBOARD_PORT` | `8080` | compose: host port, always bound to `127.0.0.1` |
+| `POSTGRES_PASSWORD` | required | compose: password for the platform's Postgres; `openssl rand -hex 32`. Only read when the database volume is first created. |
 | `API_TARGET` | `http://localhost:8080` | frontend dev server only: where `npm run dev` forwards `/api` |
 
 ## Deploying to the server
@@ -83,13 +90,14 @@ mkdir -p ~/apps
 git clone https://github.com/sashasagebd/ops-dashboard.git ~/apps/dashboard
 cd ~/apps/dashboard
 cp .env.example .env        # adjust DASHBOARD_PORT if 8080 is taken
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" .env
 docker compose up -d --build
 ```
 
 Check it's up, from the server:
 
 ```sh
-docker compose ps                              # dashboard shows "(healthy)" ~30s after start
+docker compose ps                              # dashboard shows "(healthy)" ~30s after start; platform and postgres within seconds
 curl -s http://127.0.0.1:8080/healthz          # {"status":"ok"}
 curl -s http://127.0.0.1:8080/api/containers   # JSON: host stats plus every container, including stopped ones
 curl -s http://127.0.0.1:8080/api/history      # JSON: the last hour per minute; starts empty after every restart
@@ -112,3 +120,7 @@ cd ~/apps/dashboard
 git pull
 docker compose up -d --build
 ```
+
+The platform's database lives in the `dashboard_platform-db` volume, which
+survives `docker compose down` and rebuilds. `docker compose down -v` deletes
+it.

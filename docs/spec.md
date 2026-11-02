@@ -4,6 +4,12 @@ A self-hosted monitoring dashboard for my home server.
 
 Progress and the milestone plan are in [roadmap.md](roadmap.md).
 
+**Beyond v1:** the dashboard is being extended into a self-hosted deploy
+platform; see [platform-plan.md](platform-plan.md). The platform is a separate
+service ([decisions/platform.md](decisions/platform.md)), so everything below
+still holds for the dashboard itself, including its read-only Docker access.
+The platform's own scope and constraints are in the plan.
+
 ## Context
 - Server: Lenovo ThinkCentre M700 Tiny (hostname `homelab`), Ubuntu Server, Docker + Docker Compose
 - Services running on it: a Minecraft server (itzg/minecraft-server container), a Stardew Valley server, and a Discord bot, with personal websites coming later

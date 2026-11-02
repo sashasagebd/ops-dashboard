@@ -1,4 +1,9 @@
-package main
+// Package healthcheck lets a binary check its own /healthz, for a Docker
+// HEALTHCHECK. The images are distroless, with no curl or shell to do this,
+// so the binary checks itself: Docker runs e.g. `/dashboard -healthcheck`
+// inside the container, with the same environment as the server, so the
+// listen address matches.
+package healthcheck
 
 import (
 	"fmt"
@@ -7,14 +12,9 @@ import (
 	"time"
 )
 
-// healthcheck asks a running dashboard on listenAddr whether it's serving,
-// for the Dockerfile's HEALTHCHECK. The image is distroless, with no curl or
-// shell to do this, so the binary checks itself: Docker runs
-// `/dashboard -healthcheck` inside the container, with the same environment
-// as the server, so listenAddr matches.
-//
-// It only checks /healthz (the process is up), not Docker: see handleHealthz.
-func healthcheck(listenAddr string) error {
+// Check asks a server running on listenAddr whether it's serving, by GETting
+// its /healthz. What "healthy" means is up to each binary's /healthz handler.
+func Check(listenAddr string) error {
 	url, err := healthURL(listenAddr)
 	if err != nil {
 		return err
