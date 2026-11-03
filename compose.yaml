@@ -78,6 +78,11 @@ services:
     networks:
       - platform-db
       - docker-rw
+      # The project's default network, which (unlike the internal ones) has
+      # internet access: the platform downloads app code from GitHub. In
+      # 1.6 it's also how the dashboard reaches the platform. Apps are never
+      # on it.
+      - default
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

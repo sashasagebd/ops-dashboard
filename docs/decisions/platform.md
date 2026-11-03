@@ -455,3 +455,42 @@ which is what Phase 2's queue will rely on.
 **Alternatives:** a Go mutex per app (only works within one process, and is
 lost on restart); `SELECT ... FOR UPDATE` then check then update (correct, but
 more code and round trips for the same guarantee).
+
+### Health checks go through Caddy (2026-11-02)
+
+**What:** to check a new deployment is healthy, the platform adds a
+temporary Caddy route for it (a probe hostname only the platform uses) and
+sends requests to the app's health-check path through Caddy. Caddy is on the
+apps network; the platform isn't.
+
+**Why:** apps are isolated from the platform on purpose (see "Apps can only
+reach Caddy"), so the platform can't reach a new container directly. Going
+through Caddy keeps that isolation, and checks the same path real visitors
+use, so a route or network mistake fails the check rather than going live.
+It's also exactly Phase 3's zero-downtime switch: probe the new version
+through Caddy, then move the real hostname to it.
+
+**Alternatives:** putting the platform on the apps network (every app could
+then call the platform's unauthenticated API); Docker's own `HEALTHCHECK`
+(needs `curl` or similar inside every app image, which can't be assumed); a
+short-lived helper container on the apps network per check (works, but adds
+an image pull and a container per deploy).
+
+### Fixed hardening on every app container
+
+**What:** besides the app's own limits, `engine.Run` always sets: no
+privileged mode, no host mounts, no published ports, `no-new-privileges`, a
+512-process limit, log rotation (3 × 10 MB) and a 10 s stop timeout. Callers
+can't change these; the spec only carries image, env, labels, network and
+limits.
+
+**Why:** the socket proxy can't stop a container being created privileged,
+with the host's `/` mounted (it doesn't read request bodies), so the
+platform's own code is the real boundary, and it's simplest to audit when
+it's one function with no options. The process limit stops one app's fork
+bomb or leak from exhausting the host. Log rotation matters on a 256 GB
+disk: Docker's default log file grows forever.
+
+**Alternatives:** a read-only root filesystem and `cap_drop: ALL` as well
+(stronger, but breaks many ordinary images that write temp files or switch
+users; could become an opt-in per app later).

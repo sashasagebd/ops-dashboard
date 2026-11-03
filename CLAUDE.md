@@ -33,7 +33,8 @@ over Tailscale.
   - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %; feeds `internal/history` after each successful poll
   - `internal/history/`: in-memory trend data (1-minute buckets of avg/max, 24h ring per series, keyed by container name; gaps are `OK: false`, never 0). Not persisted.
   - `internal/docker/`: the dashboard's read-only Docker Engine API client (plain `net/http`, no SDK)
-  - `internal/engine/`: the platform's Docker client (official SDK, `github.com/moby/moby/client`), through `docker-proxy-rw`; `tcp://` only. Methods are added only as the deploy flow needs them.
+  - `internal/engine/`: the platform's Docker client (official SDK, `github.com/moby/moby/client`), through `docker-proxy-rw`; `tcp://` only. Methods are added only as the deploy flow needs them: `Version`, `Build` (BuildKit, context in the body), `Run` / `Remove` (app containers, with fixed hardening callers can't override), `ManagedContainers` (filtered by the `ops.platform.managed` label, so unmanaged containers like the game servers never reach the platform).
+  - `internal/source/`: fetches an app's code at a commit as GitHub's tarball and streams it, re-packed, as a build context; size-capped, rejects paths outside the context.
   - `internal/host/`: host CPU (`/proc/stat`), memory (`/proc/meminfo`) and disk (`statfs`, Linux-only via build tag; stub elsewhere so Windows dev still builds)
 - `frontend/`: Vite + React + TypeScript, Oxlint, Vitest + Testing Library
 - `Dockerfile`, `compose.yaml`: one image with both binaries (Go serves the built frontend from `STATIC_DIR`); compose runs the dashboard and its socket proxy, and the platform (entrypoint `/platform`) and its `postgres` (volume `platform-db`, internal `platform-db` network)
