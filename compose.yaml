@@ -213,6 +213,12 @@ networks:
     ipam:
       config:
         - subnet: 10.203.0.0/29
+          # Containers without a fixed address (the platform) get one from
+          # .4-.6 only, so Caddy's fixed .2 is never taken, whatever order
+          # they start in. Without this, Docker gives the first free address
+          # (.2) to whichever starts first; after a reboot that was the
+          # platform, and Caddy then failed with "Address already in use".
+          ip_range: 10.203.0.4/30
   apps:
     # Every deployed app, and Caddy's proxy side; nothing else. The platform
     # creates app containers on it by this fixed name. Not internal: apps

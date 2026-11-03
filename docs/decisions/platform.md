@@ -542,6 +542,18 @@ the platform only, and CI checks an app can't connect. The subnet is outside
 Docker's default address pools, so it can't clash with networks Docker
 creates on its own.
 
+**Lesson (2026-11-03, first reboot on the server):** Caddy didn't come back
+up after a reboot: "failed to set up container networking: Address already
+in use". The address in question was Caddy's fixed `.2`, not a port. Docker
+gives containers without a fixed address the first free one in the subnet,
+so whichever starts first gets `.2`. `docker compose up` happened to start
+Caddy first, in CI and on the first deploy. A reboot starts containers in
+any order, and this time the platform went first. Fix: `ip_range:
+10.203.0.4/30`, so automatic addresses come only from `.4`–`.6`, and `.2`
+is reserved in effect. CI now stops both and starts the platform first.
+The same applies to any future fixed address: it must sit outside the
+network's `ip_range`.
+
 **Alternatives:** a Unix socket shared through a volume (no network at all,
 but Caddy runs as root and the platform as a non-root user, so socket
 permissions get fiddly); Caddy's admin API with authentication (only
@@ -700,7 +712,9 @@ public later through cloudflared, not by widening this.
   container before `tailscaled` has brought the address up. 1.6's reboot
   test checks this. The fix, if needed, is `net.ipv4.ip_nonlocal_bind=1`
   (lets a socket bind an address that isn't up yet), or ordering Docker
-  after Tailscale in systemd.
+  after Tailscale in systemd. The first reboot failed for a different
+  reason (Caddy's admin address, see "Caddy's admin API on a fixed IP"),
+  so this one is still untested until a reboot after that fix.
 - **Spoofed destinations.** A device on the same LAN segment could, in
   principle, send packets addressed to the Tailscale IP straight to the
   server's LAN interface, and Docker's forwarding rule matches on the
