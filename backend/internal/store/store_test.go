@@ -3,9 +3,12 @@ package store
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
 )
@@ -314,32 +317,179 @@ func TestDeploymentStatusOnlyMovesForward(t *testing.T) {
 	}
 }
 
-func TestFailInterruptedDeployments(t *testing.T) {
+func TestRetriedDeploymentCanBuildAgain(t *testing.T) {
 	s := testStore(t)
+	app := createTestApp(t, s, "hello")
 	ctx := t.Context()
-	building := createTestApp(t, s, "building")
-	live := createTestApp(t, s, "live")
+	d, _ := s.CreateDeployment(ctx, app.ID, sha1)
+	mustDo(t, s.MarkBuilding(ctx, d.ID))
+	mustDo(t, s.MarkStarting(ctx, d.ID, "img"))
+	first, _ := s.Deployment(ctx, d.ID)
 
-	b, _ := s.CreateDeployment(ctx, building.ID, sha1)
-	mustDo(t, s.MarkBuilding(ctx, b.ID))
-	l, _ := s.CreateDeployment(ctx, live.ID, sha1)
-	mustDo(t, s.MarkBuilding(ctx, l.ID))
-	mustDo(t, s.MarkStarting(ctx, l.ID, "img"))
-	mustDo(t, s.MarkHealthy(ctx, l.ID))
+	// An attempt cut off while starting is retried from the build.
+	mustDo(t, s.MarkBuilding(ctx, d.ID))
+	again, _ := s.Deployment(ctx, d.ID)
+	if again.Status != StatusBuilding || !again.StartedAt.Equal(*first.StartedAt) {
+		t.Errorf("after retry: %+v; want building, started_at kept from the first attempt", again)
+	}
+}
 
-	n, err := s.FailInterruptedDeployments(ctx, "interrupted")
+func TestCreateDeploymentQueuesItsJob(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+
+	if _, ok, err := s.ClaimJob(ctx, "w1", time.Minute); err != nil || ok {
+		t.Fatalf("ClaimJob on an empty queue = %v, %v; want nothing", ok, err)
+	}
+	d, err := s.CreateDeployment(ctx, app.ID, sha1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Errorf("failed %d deployments, want 1 (only the building one)", n)
+	job := mustClaim(t, s, "w1")
+	if job.Kind != "deploy" || job.DeploymentID != d.ID || job.Attempts != 1 {
+		t.Errorf("claimed %+v; want the deployment's deploy job, attempt 1", job)
 	}
-	assertStatus(t, s, b.ID, StatusFailed)
-	assertStatus(t, s, l.ID, StatusHealthy)
-	// The app is free to deploy again.
-	if _, err := s.CreateDeployment(ctx, building.ID, sha2); err != nil {
-		t.Errorf("CreateDeployment after clearing: %v", err)
+	// Held, with a live lease: nobody else gets it.
+	if _, ok, _ := s.ClaimJob(ctx, "w2", time.Minute); ok {
+		t.Error("a held job was claimed by a second worker")
 	}
+
+	// A refused deployment queues no job either.
+	if _, err := s.CreateDeployment(ctx, app.ID, sha2); !errors.Is(err, ErrDeployInProgress) {
+		t.Fatalf("second CreateDeployment error = %v, want ErrDeployInProgress", err)
+	}
+	var jobs int
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM jobs").Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Errorf("%d jobs, want 1", jobs)
+	}
+}
+
+func TestJobLifecycle(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	s.CreateDeployment(ctx, app.ID, sha1)
+	job := mustClaim(t, s, "w1")
+
+	// Only the holder can change it.
+	for name, err := range map[string]error{
+		"renew":    s.RenewLease(ctx, job.ID, "w2", time.Minute),
+		"complete": s.CompleteJob(ctx, job.ID, "w2"),
+		"retry":    s.RetryJob(ctx, job.ID, "w2", 0, "x"),
+		"fail":     s.FailJob(ctx, job.ID, "w2", "x"),
+		"release":  s.ReleaseJob(ctx, job.ID, "w2"),
+	} {
+		if !errors.Is(err, ErrLeaseLost) {
+			t.Errorf("%s by another worker: error = %v, want ErrLeaseLost", name, err)
+		}
+	}
+	mustDo(t, s.RenewLease(ctx, job.ID, "w1", time.Minute))
+
+	// A retry waits out its backoff before it can be claimed again.
+	mustDo(t, s.RetryJob(ctx, job.ID, "w1", time.Hour, "docker unreachable"))
+	if _, ok, _ := s.ClaimJob(ctx, "w1", time.Minute); ok {
+		t.Error("claimed a job still backing off")
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE jobs SET run_after = now()"); err != nil {
+		t.Fatal(err)
+	}
+	if job = mustClaim(t, s, "w2"); job.Attempts != 2 {
+		t.Errorf("retried job's attempts = %d, want 2", job.Attempts)
+	}
+
+	// Released at shutdown: claimable straight away, attempt not counted.
+	mustDo(t, s.ReleaseJob(ctx, job.ID, "w2"))
+	if job = mustClaim(t, s, "w1"); job.Attempts != 2 {
+		t.Errorf("released job's attempts = %d, want 2 (the release isn't counted)", job.Attempts)
+	}
+
+	mustDo(t, s.CompleteJob(ctx, job.ID, "w1"))
+	if _, ok, _ := s.ClaimJob(ctx, "w1", time.Minute); ok {
+		t.Error("claimed a finished job")
+	}
+	if err := s.CompleteJob(ctx, job.ID, "w1"); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("completing it twice: error = %v, want ErrLeaseLost", err)
+	}
+}
+
+func TestExpiredLeaseIsClaimedAgain(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	s.CreateDeployment(ctx, app.ID, sha1)
+	first := mustClaim(t, s, "w1")
+
+	// w1 dies: it stops renewing, and its lease runs out.
+	if _, err := s.pool.Exec(ctx, "UPDATE jobs SET locked_until = now() - interval '1 second'"); err != nil {
+		t.Fatal(err)
+	}
+	second := mustClaim(t, s, "w2")
+	if second.ID != first.ID || second.Attempts != 2 {
+		t.Errorf("claimed %+v; want job %d again, attempt 2", second, first.ID)
+	}
+	// If w1 was only slow, not dead, it can't touch the job now.
+	if err := s.CompleteJob(ctx, first.ID, "w1"); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("old holder completing: error = %v, want ErrLeaseLost", err)
+	}
+	mustDo(t, s.FailJob(ctx, second.ID, "w2", "build failed"))
+}
+
+func TestConcurrentClaimsTakeDifferentJobs(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	const jobs, workers = 30, 8
+	for i := range jobs {
+		app := createTestApp(t, s, fmt.Sprintf("app-%d", i))
+		if _, err := s.CreateDeployment(ctx, app.ID, sha1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Every worker claims until the queue is empty, all at once.
+	var mu sync.Mutex
+	claimed := map[int64]string{}
+	var wg sync.WaitGroup
+	for w := range workers {
+		worker := fmt.Sprintf("w%d", w)
+		wg.Go(func() {
+			for {
+				job, ok, err := s.ClaimJob(ctx, worker, time.Minute)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if !ok {
+					return
+				}
+				mu.Lock()
+				if other, dup := claimed[job.ID]; dup {
+					t.Errorf("job %d claimed by both %s and %s", job.ID, other, worker)
+				}
+				claimed[job.ID] = worker
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if len(claimed) != jobs {
+		t.Errorf("%d jobs claimed, want all %d", len(claimed), jobs)
+	}
+}
+
+func mustClaim(t *testing.T, s *Store, worker string) Job {
+	t.Helper()
+	job, ok, err := s.ClaimJob(t.Context(), worker, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatalf("%s found no job to claim", worker)
+	}
+	return job
 }
 
 func mustDo(t *testing.T, err error) {

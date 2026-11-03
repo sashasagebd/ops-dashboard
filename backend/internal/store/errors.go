@@ -22,6 +22,9 @@ var (
 	// ErrWrongStatus: the deployment isn't in a status that allows the
 	// change, e.g. marking a failed deployment healthy.
 	ErrWrongStatus = errors.New("deployment is not in a status that allows this")
+	// ErrLeaseLost: the worker no longer holds the job (its lease ran out
+	// and another worker claimed it, or the job was deleted with its app).
+	ErrLeaseLost = errors.New("job is no longer held by this worker")
 )
 
 // Postgres error codes (https://www.postgresql.org/docs/current/errcodes-appendix.html).

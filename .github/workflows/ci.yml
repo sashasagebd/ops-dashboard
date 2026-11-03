@@ -221,15 +221,26 @@ jobs:
             docker run --rm --network platform-apps curlimages/curl:8.11.1 -sS --max-time 10 \
               -H "Host: $1" "http://caddy$2"
           }
-          # Deploys $1 and waits for it to finish, printing its final status.
-          deploy() {
-            id=$(api POST "/api/platform/apps/$APP/deployments" "{\"commitSha\":\"$1\"}" | jq -r .id)
+          # Queues a deploy of commit $1, printing the deployment's ID.
+          start_deploy() {
+            api POST "/api/platform/apps/$APP/deployments" "{\"commitSha\":\"$1\"}" | jq -r .id
+          }
+          # Prints deployment $1's status ("" while the platform is down).
+          deploy_status() {
+            api GET "/api/platform/apps/$APP/deployments" 2>/dev/null | jq -r ".[] | select(.id == $1) | .status" 2>/dev/null
+          }
+          # Waits for deployment $1 to finish, printing its final status.
+          wait_deploy() {
             for i in $(seq 1 180); do
-              status=$(api GET "/api/platform/apps/$APP/deployments" | jq -r ".[] | select(.id == $id) | .status")
+              status=$(deploy_status "$1")
               case "$status" in healthy|failed) echo "$status"; return ;; esac
               sleep 5
             done
             echo "timed out"
+          }
+          # Deploys $1 and waits for it to finish, printing its final status.
+          deploy() {
+            wait_deploy "$(start_deploy "$1")"
           }
           on_failure() {
             api GET "/api/platform/apps/$APP" | jq .
@@ -243,8 +254,23 @@ jobs:
           api PUT "/api/platform/apps/$APP/env/GREETING" '{"value":"hello"}'
 
           # First deploy: download, build, start, health-check via Caddy,
-          # route. Then a visitor reaches it by hostname.
-          [ "$(deploy "$DEPLOY_SHA")" = healthy ] || on_failure
+          # route. The platform is killed mid-build (SIGKILL, no chance to
+          # clean up, as in a crash), and the same deployment must still
+          # finish once it's back: its job's lease runs out and the restarted
+          # platform claims it again. The build is a cold one (the legacy
+          # builder doesn't share BuildKit's cache), so it takes minutes.
+          DEP=$(start_deploy "$DEPLOY_SHA")
+          for i in $(seq 1 60); do
+            [ "$(deploy_status "$DEP")" = building ] && break
+            [ "$i" = 60 ] && on_failure
+            sleep 1
+          done
+          sleep 10
+          [ "$(deploy_status "$DEP")" = building ] || on_failure
+          docker compose kill platform
+          docker compose up -d --wait --wait-timeout 60 platform || on_failure
+          [ "$(wait_deploy "$DEP")" = healthy ] || on_failure
+          docker compose logs --no-log-prefix platform | grep "job started.*deployment=$DEP.*attempt=2" || on_failure
           visit selftest.apps.test /healthz | grep '"ok"' || on_failure
 
           # Redeploy: the new container replaces the old one, which is

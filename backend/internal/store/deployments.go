@@ -44,11 +44,17 @@ const deploymentColumns = `id, app_id, commit_sha, status,
 	created_at, started_at, finished_at`
 
 // CreateDeployment queues a deploy of commitSHA (40 lowercase hex characters)
-// for an app. ErrDeployInProgress if the app already has one in progress;
-// ErrNotFound if the app doesn't exist.
+// for an app: the deployment, and the job that runs it, in one statement, so
+// there's never a deployment that nothing will run. ErrDeployInProgress if
+// the app already has one in progress; ErrNotFound if the app doesn't exist.
 func (s *Store) CreateDeployment(ctx context.Context, appID int64, commitSHA string) (Deployment, error) {
-	rows, _ := s.pool.Query(ctx,
-		"INSERT INTO deployments (app_id, commit_sha) VALUES ($1, $2) RETURNING "+deploymentColumns,
+	rows, _ := s.pool.Query(ctx, `
+		WITH d AS (
+			INSERT INTO deployments (app_id, commit_sha) VALUES ($1, $2) RETURNING *
+		), j AS (
+			INSERT INTO jobs (kind, deployment_id) SELECT 'deploy', id FROM d
+		)
+		SELECT `+deploymentColumns+` FROM d`,
 		appID, commitSHA)
 	d, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[Deployment])
 	return d, translate(err)
@@ -103,10 +109,14 @@ func (s *Store) LiveApps(ctx context.Context) ([]LiveApp, error) {
 // so it's atomic: if the deployment has moved on in the meantime (or never
 // got there), nothing changes and the caller gets ErrWrongStatus.
 
-// MarkBuilding moves a queued deployment to building.
+// MarkBuilding moves an unfinished deployment to building. Usually it's
+// queued; building or starting means an earlier attempt was cut off (the
+// platform restarted, or Docker was unreachable) and its job is retrying it.
+// That's the one move back a deployment can make: once finished, it stays
+// finished. started_at keeps the first attempt's time.
 func (s *Store) MarkBuilding(ctx context.Context, id int64) error {
-	return s.transition(ctx, s.pool, id, "SET status = 'building', started_at = now()",
-		[]string{string(StatusQueued)})
+	return s.transition(ctx, s.pool, id, "SET status = 'building', started_at = COALESCE(started_at, now())",
+		inProgress)
 }
 
 // MarkStarting records the built image and moves a building deployment to
@@ -140,22 +150,6 @@ func (s *Store) MarkHealthy(ctx context.Context, id int64) error {
 func (s *Store) MarkFailed(ctx context.Context, id int64, reason string) error {
 	return s.transition(ctx, s.pool, id, "SET status = 'failed', error = $3, finished_at = now()",
 		inProgress, reason)
-}
-
-// FailInterruptedDeployments marks every unfinished deployment failed, and
-// returns how many there were. The platform calls it at startup: in P1 a
-// deploy runs in a goroutine, so one that was in progress when the platform
-// stopped will never finish, and would otherwise block the app's next deploy
-// forever (see deployments_one_in_progress_per_app). P2's job queue replaces
-// this with retrying the deploy instead.
-func (s *Store) FailInterruptedDeployments(ctx context.Context, reason string) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE deployments SET status = 'failed', error = $2, finished_at = now()
-		WHERE status = ANY($1)`, inProgress, reason)
-	if err != nil {
-		return 0, translate(err)
-	}
-	return tag.RowsAffected(), nil
 }
 
 // querier is what transition needs: the pool, or a transaction.

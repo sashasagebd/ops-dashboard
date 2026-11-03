@@ -352,6 +352,11 @@ story than starting with the queue.
 **Alternatives:** building the queue first (more correct from day one, but
 two hard things at once in the same phase).
 
+_Superseded in P2 step 2.1 (2026-11-03) by the job queue: see "How the job
+queue works" below. Migration 0005 fails any deployment still in progress
+from before it, since it has no job; the startup code that did this is
+gone._
+
 ### Docker's restart policy keeps apps up until the reconciler exists
 
 **What:** app containers get `restart: unless-stopped`.
@@ -752,6 +757,55 @@ rebuilding something that will fail the same way again.
 back up, for a single-host system that already has Postgres); a plain
 `locked = true` flag (a crashed worker's jobs stay locked forever without a
 lease); retrying every error (wastes minutes on builds that can't succeed).
+
+### How the job queue works (2.1, 2026-11-03)
+
+**What:** the details behind the entry above.
+- **The deployment and its job are created in one statement** (a CTE), so
+  there's never a deployment nothing will run, or a job for a deployment
+  that was refused. "One deploy per app at a time" needs no queue logic: a
+  job belongs to one deployment, and the existing partial unique index
+  allows one in progress per app.
+- **A typed `deployment_id` column, not a JSON payload.** The database can
+  check it (foreign key, deleted with the deployment), and there's only one
+  kind of job. A later kind gets its own column.
+- **Attempts are counted when a job is claimed**, not when it fails. A job
+  whose worker keeps dying (say a build that takes the platform down with
+  it) would otherwise be retried forever. A job claimed a fourth time gives
+  up without running: "the platform stopped during every attempt".
+- **A lease of 30s, renewed every 10s.** Every change to a job after the
+  claim requires `locked_by` to still be this worker (fencing), so a worker
+  that stalled past its lease can't overwrite the outcome of the worker
+  that took over. If the worker can't renew (Postgres unreachable), it
+  stops the job before the lease runs out, rather than risk two workers
+  building the same deployment.
+- **A clean shutdown hands the job back** (queued, attempt not counted), so
+  `docker compose up -d` mid-deploy costs a rebuild, not an attempt and a
+  30-second wait. Only a crash waits for the lease.
+- **Each attempt is safe to repeat.** It removes any container an earlier
+  attempt left for this deployment (same name), then rebuilds, mostly from
+  Docker's cache. A deployment already marked healthy (the platform died
+  between marking it live and switching the route) only finishes the
+  switch. Cleanup after a switch removes only *older* deployments'
+  containers, since the next deploy may already be starting one.
+- **Which errors retry:** build failed, health check failed, repo, commit
+  or folder not found, source too large, and the 20-minute attempt timeout
+  are permanent. Anything else (Docker, GitHub or Postgres unreachable,
+  unexpected errors) retries after 15s, then 30s, up to 3 attempts.
+  Unknown errors retry because the transient ones come in too many shapes
+  (network errors, 5xx, proxy errors) to list, and 3 attempts bound the
+  cost.
+- **Two workers, woken directly.** The API wakes a worker in-process when
+  it queues a deploy; workers also poll every 5s for retries that are due
+  and expired leases. Workers start only after the startup cleanup of
+  orphaned containers, which would otherwise race a resumed deploy.
+
+**Alternatives:** Postgres `LISTEN/NOTIFY` to wake workers (needs a
+dedicated connection, and gains nothing while the API and the workers are
+one process); a `max_attempts` column per job (one limit for every deploy
+is enough); keeping the half-built image or container between attempts
+(rebuilding from cache is cheap, and starting clean is easier to reason
+about).
 
 ### The webhook arrives through Tailscale Funnel until there's a domain
 

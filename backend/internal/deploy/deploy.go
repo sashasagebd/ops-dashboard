@@ -2,10 +2,12 @@
 // build it, start a container, check it's healthy through Caddy, switch the
 // app's route to it, and remove the previous version.
 //
-// In P1 each deploy runs in its own goroutine, started by the API (see
-// docs/decisions/platform.md); P2 moves this onto a job queue in Postgres.
-// The rules that must hold under concurrency (one deploy in progress and
-// one live deployment per app) are enforced by the database, not here.
+// Each deploy is a job in the platform's queue (internal/jobs): the
+// Deployer is its handler, and Run makes one attempt. An attempt can be cut
+// off anywhere (the platform restarting, Docker unreachable) and run again,
+// so each one starts by clearing up after the last. The rules that must hold
+// under concurrency (one deploy in progress and one live deployment per app)
+// are enforced by the database, not here.
 package deploy
 
 import (
@@ -21,6 +23,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/jobs"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/router"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
@@ -33,6 +36,7 @@ import (
 type Store interface {
 	App(ctx context.Context, id int64) (store.App, error)
 	CreateDeployment(ctx context.Context, appID int64, commitSHA string) (store.Deployment, error)
+	Deployment(ctx context.Context, id int64) (store.Deployment, error)
 	MarkBuilding(ctx context.Context, id int64) error
 	MarkStarting(ctx context.Context, id int64, imageTag string) error
 	MarkHealthy(ctx context.Context, id int64) error
@@ -60,12 +64,12 @@ type Router interface {
 // Config holds the deployer's settings.
 type Config struct {
 	AppsNetwork    string        // the Docker network app containers join
-	DeployTimeout  time.Duration // the whole deploy, download to switch
+	DeployTimeout  time.Duration // one attempt at a deploy, download to switch
 	HealthTimeout  time.Duration // how long a new container gets to answer healthily
 	HealthInterval time.Duration // time between health probes
 }
 
-// Deployer starts and runs deployments.
+// Deployer queues deployments and runs them as jobs.
 type Deployer struct {
 	store  Store
 	source Source
@@ -73,10 +77,9 @@ type Deployer struct {
 	router Router
 	cfg    Config
 
-	// baseCtx is cancelled when the platform shuts down, which cancels
-	// every deploy in flight.
-	baseCtx context.Context
-	wg      sync.WaitGroup
+	// Notify, if set, is called after a deploy is queued, so a worker
+	// starts it straight away (the job runner's Wake).
+	Notify func()
 
 	// applyMu makes route updates one at a time, so two deploys finishing
 	// together can't send Caddy their tables in the wrong order.
@@ -85,30 +88,28 @@ type Deployer struct {
 	probes  map[int64]router.Route // deployment ID -> its temporary probe route
 }
 
-// New returns a Deployer. Deploys it starts are cancelled when ctx is.
-func New(ctx context.Context, cfg Config, st Store, src Source, eng Engine, rt Router) *Deployer {
+// New returns a Deployer.
+func New(cfg Config, st Store, src Source, eng Engine, rt Router) *Deployer {
 	return &Deployer{
 		store: st, source: src, engine: eng, router: rt, cfg: cfg,
-		baseCtx: ctx,
-		probes:  map[int64]router.Route{},
+		probes: map[int64]router.Route{},
 	}
 }
 
-// Start queues a deploy of commitSHA for an app and runs it in the
-// background, returning the new deployment. If the app already has a deploy
-// in progress, it returns store.ErrDeployInProgress and starts nothing.
+// Start queues a deploy of commitSHA for an app (the deployment and its job),
+// returning the new deployment; a worker runs it in the background. If the
+// app already has a deploy in progress, it returns store.ErrDeployInProgress
+// and queues nothing.
 func (d *Deployer) Start(ctx context.Context, appID int64, commitSHA string) (store.Deployment, error) {
 	dep, err := d.store.CreateDeployment(ctx, appID, commitSHA)
 	if err != nil {
 		return store.Deployment{}, err
 	}
-	d.wg.Go(func() { d.run(dep) })
+	if d.Notify != nil {
+		d.Notify()
+	}
 	return dep, nil
 }
-
-// Wait blocks until every deploy in flight has finished (or, after shutdown,
-// given up), so the platform doesn't close the database under them.
-func (d *Deployer) Wait() { d.wg.Wait() }
 
 // Names the platform gives things, derived so they never need storing.
 
@@ -127,29 +128,88 @@ func probeHost(deploymentID int64) string {
 	return "probe-" + strconv.FormatInt(deploymentID, 10) + ".platform.internal"
 }
 
-func (d *Deployer) run(dep store.Deployment) {
-	ctx, cancel := context.WithTimeout(d.baseCtx, d.cfg.DeployTimeout)
-	defer cancel()
+// errTimedOut ends an attempt that ran past DeployTimeout.
+var errTimedOut = errors.New("deploy timed out")
 
-	log := slog.With("deployment", dep.ID, "app", dep.AppID, "commit", dep.CommitSHA)
-	log.Info("deploy started")
-	if err := d.deploy(ctx, log, dep); err != nil {
-		log.Error("deploy failed", "err", err)
-		// Recorded even if the deploy's own context is done (timeout or
-		// shutdown), so the deployment doesn't stay "in progress".
-		if err := d.store.MarkFailed(context.WithoutCancel(ctx), dep.ID, publicReason(err, d.cfg.DeployTimeout)); err != nil {
-			log.Error("recording the failure", "err", err)
-		}
-		return
+// Run makes one attempt at a deploy job (jobs.Handler). Errors that another
+// attempt can't fix (the build failed, the app never got healthy, the commit
+// doesn't exist, the attempt timed out) are marked jobs.Permanent; anything
+// else, such as Docker or GitHub being unreachable, is retried.
+func (d *Deployer) Run(ctx context.Context, job store.Job) error {
+	ctx, cancel := context.WithTimeoutCause(ctx, d.cfg.DeployTimeout, errTimedOut)
+	defer cancel()
+	log := slog.With("deployment", job.DeploymentID, "attempt", job.Attempts)
+
+	err := d.deploy(ctx, log, job.DeploymentID)
+	if err != nil && context.Cause(ctx) == errTimedOut {
+		// Whatever failed, it failed because time ran out. (Checked on
+		// the context rather than err: an HTTP client's own timeout also
+		// matches context.DeadlineExceeded, and that's worth a retry.)
+		err = errTimedOut
 	}
-	log.Info("deploy finished: healthy")
+	if err != nil && permanent(err) {
+		return jobs.Permanent(err)
+	}
+	return err
 }
 
-func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, dep store.Deployment) error {
+// GiveUp records why a deploy failed for good on its deployment, where the
+// dashboard shows it (jobs.Handler).
+func (d *Deployer) GiveUp(ctx context.Context, job store.Job, err error) {
+	err = d.store.MarkFailed(ctx, job.DeploymentID, publicReason(err, d.cfg.DeployTimeout))
+	// Already finished (recorded by an earlier call that the platform died
+	// just after), or deleted with its app: nothing left to record.
+	if err != nil && !errors.Is(err, store.ErrWrongStatus) && !errors.Is(err, store.ErrNotFound) {
+		slog.Error("recording a failed deploy", "deployment", job.DeploymentID, "err", err)
+	}
+}
+
+// permanent reports whether err is one that trying the deploy again won't
+// fix.
+func permanent(err error) bool {
+	var buildErr *engine.BuildError
+	var healthErr *HealthError
+	return errors.As(err, &buildErr) || errors.As(err, &healthErr) ||
+		errors.Is(err, source.ErrNotFound) || errors.Is(err, source.ErrTooLarge) ||
+		errors.Is(err, source.ErrDirNotFound) || errors.Is(err, errTimedOut) ||
+		// The app or deployment was deleted, or the deployment finished
+		// some other way.
+		errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrWrongStatus)
+}
+
+func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, deploymentID int64) error {
+	dep, err := d.store.Deployment(ctx, deploymentID)
+	if err != nil {
+		return err
+	}
 	app, err := d.store.App(ctx, dep.AppID)
 	if err != nil {
 		return err
 	}
+	log = log.With("app", app.Name, "commit", dep.CommitSHA)
+
+	switch dep.Status {
+	case store.StatusQueued, store.StatusBuilding, store.StatusStarting:
+		// Building or starting: an earlier attempt was cut off. Its
+		// container, if it got that far, has this deployment's name, so it
+		// goes first; the build is simply redone, mostly from Docker's
+		// cache. A probe route it left is dropped by the next ApplyRoutes.
+		log.Info("deploy started", "from", dep.Status)
+		if err := d.removeDeploymentContainers(ctx, app.Name, dep.ID); err != nil {
+			return err
+		}
+	case store.StatusHealthy:
+		// An earlier attempt made it live, then was cut off before
+		// switching the route or removing the old version: finish those.
+		log.Info("deploy already healthy; finishing the route switch")
+		return d.switchTo(ctx, log, app.Name, dep.ID)
+	default:
+		// Finished some other way (superseded by a later deploy, or failed
+		// and recorded just before the platform died): nothing to do.
+		log.Info("deploy already finished", "status", dep.Status)
+		return nil
+	}
+
 	if err := d.store.MarkBuilding(ctx, dep.ID); err != nil {
 		return err
 	}
@@ -218,18 +278,27 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, dep store.Deplo
 	if err := d.store.MarkHealthy(ctx, dep.ID); err != nil {
 		return err
 	}
-	if err := d.ApplyRoutes(ctx); err != nil {
+	if err := d.switchTo(ctx, log, app.Name, dep.ID); err != nil {
 		// The database says the new deployment is live, but Caddy still
 		// routes to the old container, which is still running, so the
 		// site stays up on the old version. Keeping the old container is
 		// what makes that safe; the next route update (another deploy, or
-		// the platform's startup) corrects Caddy.
+		// the platform's startup) corrects Caddy. Not retried: the deploy
+		// itself has succeeded.
 		log.Error("deployment is healthy but switching its route failed; keeping the previous container", "err", err)
 		return nil
 	}
+	log.Info("deploy finished: healthy")
+	return nil
+}
 
-	// The route has switched: the previous version can go.
-	d.removeOtherContainers(context.WithoutCancel(ctx), log, app.Name, dep.ID)
+// switchTo points Caddy at a deployment that's now live, then removes the
+// app's older containers. If the route update fails, nothing is removed.
+func (d *Deployer) switchTo(ctx context.Context, log *slog.Logger, app string, deploymentID int64) error {
+	if err := d.ApplyRoutes(ctx); err != nil {
+		return err
+	}
+	d.removeOlderContainers(context.WithoutCancel(ctx), log, app, deploymentID)
 	return nil
 }
 
@@ -331,18 +400,20 @@ func (d *Deployer) ApplyRoutes(ctx context.Context) error {
 	return d.router.Apply(ctx, routes)
 }
 
-// removeOtherContainers removes the app's containers other than deployment
-// keep's: the version it replaced, and any left over from earlier failures.
-// Failures are logged rather than failing the deploy, which has succeeded.
-func (d *Deployer) removeOtherContainers(ctx context.Context, log *slog.Logger, app string, keep int64) {
+// removeOlderContainers removes the app's containers from deployments before
+// live: the version it replaced, and any left over from earlier failures.
+// Newer ones are left alone: once live is no longer in progress, the app's
+// next deploy may already have started its container. Failures are logged
+// rather than failing the deploy, which has succeeded.
+func (d *Deployer) removeOlderContainers(ctx context.Context, log *slog.Logger, app string, live int64) {
 	containers, err := d.engine.ManagedContainers(ctx, app)
 	if err != nil {
 		log.Error("listing old containers", "err", err)
 		return
 	}
-	keepLabel := strconv.FormatInt(keep, 10)
 	for _, c := range containers {
-		if c.Labels[engine.LabelDeployment] == keepLabel {
+		id, err := strconv.ParseInt(c.Labels[engine.LabelDeployment], 10, 64)
+		if err != nil || id >= live {
 			continue
 		}
 		if err := d.engine.Remove(ctx, c.ID); err != nil {
@@ -351,10 +422,31 @@ func (d *Deployer) removeOtherContainers(ctx context.Context, log *slog.Logger, 
 	}
 }
 
+// removeDeploymentContainers removes any container an earlier attempt at a
+// deployment left, so this attempt can create it afresh under the same name.
+func (d *Deployer) removeDeploymentContainers(ctx context.Context, app string, deploymentID int64) error {
+	containers, err := d.engine.ManagedContainers(ctx, app)
+	if err != nil {
+		return err
+	}
+	label := strconv.FormatInt(deploymentID, 10)
+	for _, c := range containers {
+		if c.Labels[engine.LabelDeployment] != label {
+			continue
+		}
+		slog.Info("removing the container of an earlier attempt", "container", c.Name)
+		if err := d.engine.Remove(ctx, c.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RemoveOrphans removes every platform container that isn't an app's live
-// deployment. It's for startup only, when no deploy is in flight: then any
-// such container was left by a deploy cut off by a crash or restart (its
-// restart policy would otherwise keep it running forever, unrouted). It only
+// deployment. It's for startup only, before the job workers start, so no
+// deploy is in flight: any such container was left by a deploy cut off by a
+// crash or restart (its restart policy would otherwise keep it running
+// forever, unrouted; if that deploy's job is retried, it starts a new one). It only
 // ever sees containers with the platform's label, so nothing else on the
 // host is touched. P4's reconciler does this continuously.
 func (d *Deployer) RemoveOrphans(ctx context.Context) error {
@@ -400,10 +492,10 @@ func publicReason(err error, deployTimeout time.Duration) string {
 		return source.ErrTooLarge.Error()
 	case errors.Is(err, source.ErrDirNotFound):
 		return source.ErrDirNotFound.Error()
-	case errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, errTimedOut):
 		return fmt.Sprintf("deploy timed out after %s", deployTimeout)
-	case errors.Is(err, context.Canceled):
-		return "interrupted: the platform shut down during this deploy"
+	case errors.Is(err, jobs.ErrNoAttemptsLeft):
+		return "gave up: " + jobs.ErrNoAttemptsLeft.Error()
 	}
 	return "internal error; see the platform's logs"
 }

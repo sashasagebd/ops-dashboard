@@ -1,6 +1,6 @@
 // Command platform runs the deploy platform's control plane: the API for
-// registering and deploying apps, the deploys themselves, and Caddy's routes.
-// Job workers and the reconciler come in later phases (see
+// registering and deploying apps, the job workers that run the deploys, and
+// Caddy's routes. The reconciler comes in a later phase (see
 // docs/platform-plan.md and docs/roadmap.md). It's a separate service from the
 // dashboard so that monitoring keeps working when the platform doesn't, and
 // so the dashboard never needs write access to Docker (see
@@ -24,6 +24,7 @@ import (
 	"github.com/sashasagebd/ops-dashboard/backend/internal/deploy"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/jobs"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/router"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
@@ -112,18 +113,6 @@ func run(addr string) error {
 	}
 	slog.Info("database schema up to date", "applied", applied)
 
-	// Nothing is deploying yet at this point, so any deployment still marked
-	// in progress was cut off by the platform stopping. In P1 nothing can
-	// resume it, so it's failed (which also unblocks the app's next deploy).
-	// P2's job queue retries it instead.
-	interrupted, err := st.FailInterruptedDeployments(ctx, "interrupted: the platform restarted during this deploy")
-	if err != nil {
-		return fmt.Errorf("clearing interrupted deployments: %w", err)
-	}
-	if interrupted > 0 {
-		slog.Warn("marked interrupted deployments failed", "count", interrupted)
-	}
-
 	github := source.NewGitHub()
 	github.Token = os.Getenv("GITHUB_TOKEN") // optional
 	// Caddy's admin API and proxy port, on the internal network only the
@@ -132,19 +121,39 @@ func run(addr string) error {
 		envOr("CADDY_ADMIN_URL", "http://10.203.0.2:2019"),
 		envOr("CADDY_PROXY_URL", "http://10.203.0.2:80"),
 	)
-	deployer := deploy.New(ctx, deploy.Config{
+	deployer := deploy.New(deploy.Config{
 		AppsNetwork:    envOr("APPS_NETWORK", "platform-apps"),
 		DeployTimeout:  20 * time.Minute,
 		HealthTimeout:  time.Minute,
 		HealthInterval: time.Second,
 	}, st, github, dockerClient, caddy)
+	runner := jobs.New(jobs.Config{
+		// Two deploys (of different apps) at once: builds are heavy, and
+		// the game servers share these 4 cores.
+		Workers:     2,
+		MaxAttempts: 3,
+		// A crashed platform's deploy is picked up again within 30s of it
+		// coming back.
+		Lease:        30 * time.Second,
+		PollInterval: 5 * time.Second,
+		RetryDelay:   15 * time.Second,
+	}, st, deployer)
+	deployer.Notify = runner.Wake
 
 	// Caddy keeps routes in memory (plus its autosave), so it may have
 	// restarted or missed an update while the platform was down. Re-send the
 	// full table from the database, and clear away containers left by
-	// deploys that were cut off. In the background, retrying until Caddy
-	// and Docker answer: neither should stop the API from starting.
-	go startupSync(ctx, deployer)
+	// deploys that were cut off. Then start the job workers, which resume
+	// any deploy the platform was in the middle of: only afterwards, so the
+	// cleanup can't remove a container a deploy has just started. In the
+	// background, retrying until Caddy and Docker answer: neither should
+	// stop the API from starting, and deploys queue up meanwhile.
+	workersDone := make(chan struct{})
+	go func() {
+		defer close(workersDone)
+		startupSync(ctx, deployer)
+		runner.Run(ctx) // returns at once if ctx is already done
+	}()
 
 	// Only listen once the database is ready, so /healthz passing means the
 	// platform started up fully.
@@ -172,9 +181,9 @@ func run(addr string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	err = srv.Shutdown(shutdownCtx)
-	// ctx is cancelled, so deploys in flight are stopping; wait for them to
-	// record that before the database closes.
-	deployer.Wait()
+	// ctx is cancelled, so deploys in flight are stopping; wait for their
+	// jobs to be handed back before the database closes.
+	<-workersDone
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

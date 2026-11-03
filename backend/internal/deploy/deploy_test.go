@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/jobs"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/router"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
@@ -39,7 +40,7 @@ type fakes struct {
 	applyErr    func(n int) error // error for the nth Apply
 	applies     [][]router.Route
 	runSpec     engine.RunSpec
-	containers  []engine.ManagedContainer
+	containers  []engine.ManagedContainer // what's running; Run adds, Remove takes away
 	removed     []string
 	onProbe     func() // hook, e.g. to cancel mid-check
 }
@@ -85,6 +86,16 @@ func (f *fakes) CreateDeployment(_ context.Context, appID int64, commit string) 
 	}
 	f.setStatus(f.nextID, store.StatusQueued)
 	return store.Deployment{ID: f.nextID, AppID: appID, CommitSHA: commit, Status: store.StatusQueued}, nil
+}
+
+func (f *fakes) Deployment(_ context.Context, id int64) (store.Deployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.statuses[id]
+	if !ok {
+		return store.Deployment{}, store.ErrNotFound
+	}
+	return store.Deployment{ID: id, AppID: f.app.ID, CommitSHA: sha, Status: s}, nil
 }
 
 func (f *fakes) MarkBuilding(_ context.Context, id int64) error {
@@ -167,22 +178,26 @@ func (f *fakes) Run(_ context.Context, spec engine.RunSpec) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.runSpec = spec
-	return "new", nil
+	f.containers = append(f.containers, newContainer)
+	return newContainer.ID, nil
 }
+
+// newContainer is what Run starts for deployment 7, the one under test.
+var newContainer = engine.ManagedContainer{ID: "new", Name: "app-hello-7", Labels: map[string]string{engine.LabelDeployment: "7"}}
 
 func (f *fakes) Remove(_ context.Context, id string) error {
 	f.event("remove %s", id)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.removed = append(f.removed, id)
+	f.containers = slices.DeleteFunc(f.containers, func(c engine.ManagedContainer) bool { return c.ID == id })
 	return nil
 }
 
 func (f *fakes) ManagedContainers(context.Context, string) ([]engine.ManagedContainer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	new := engine.ManagedContainer{ID: "new", Name: "app-hello-7", Labels: map[string]string{engine.LabelDeployment: "7"}}
-	return append(slices.Clone(f.containers), new), nil
+	return slices.Clone(f.containers), nil
 }
 
 // Router
@@ -220,8 +235,8 @@ func describe(routes []router.Route) string {
 	return "[" + strings.Join(parts, " ") + "]"
 }
 
-func (f *fakes) deployer(ctx context.Context) *Deployer {
-	return New(ctx, Config{
+func (f *fakes) deployer() *Deployer {
+	return New(Config{
 		AppsNetwork:    "platform-apps",
 		DeployTimeout:  time.Minute,
 		HealthTimeout:  200 * time.Millisecond,
@@ -229,22 +244,36 @@ func (f *fakes) deployer(ctx context.Context) *Deployer {
 	}, f, f, f, f)
 }
 
-// deployAndWait starts a deploy and waits for it to finish.
-func deployAndWait(t *testing.T, f *fakes, ctx context.Context) store.Deployment {
+// deploy queues a deploy and runs one attempt at it as the job runner would,
+// on its last attempt: an error gives up, recording the failure.
+func deploy(t *testing.T, f *fakes, ctx context.Context) (store.Deployment, error) {
 	t.Helper()
-	d := f.deployer(ctx)
+	d := f.deployer()
 	dep, err := d.Start(t.Context(), 1, sha)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.Wait()
-	return dep
+	job := store.Job{ID: 1, Kind: "deploy", DeploymentID: dep.ID, Attempts: 1}
+	err = d.Run(ctx, job)
+	if err != nil && ctx.Err() == nil {
+		d.GiveUp(t.Context(), job, err)
+	}
+	return dep, err
+}
+
+// retry runs another attempt at deployment 7, as after a crash.
+func retry(t *testing.T, f *fakes) error {
+	t.Helper()
+	return f.deployer().Run(t.Context(), store.Job{ID: 1, Kind: "deploy", DeploymentID: 7, Attempts: 2})
 }
 
 func TestDeploySuccess(t *testing.T) {
 	f := newFakes()
 	f.probeStatus = func(n int) int { return []int{502, 502, 200}[min(n, 2)] } // up on the third try
-	dep := deployAndWait(t, f, t.Context())
+	dep, err := deploy(t, f, t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if f.statuses[dep.ID] != store.StatusHealthy || f.statuses[6] != store.StatusSuperseded {
 		t.Errorf("statuses = %v, want 7 healthy, 6 superseded", f.statuses)
@@ -277,34 +306,51 @@ func TestDeploySuccess(t *testing.T) {
 
 func TestDeployFailures(t *testing.T) {
 	tests := []struct {
-		name       string
-		setup      func(f *fakes)
-		wantReason string
-		wantRemove []string
+		name          string
+		setup         func(f *fakes)
+		timeout       time.Duration // DeployTimeout, if not the default
+		wantPermanent bool
+		wantReason    string
+		wantRemove    []string
 	}{
 		{
-			name:       "build fails",
-			setup:      func(f *fakes) { f.buildErr = &engine.BuildError{Message: "npm ci returned 1"} },
-			wantReason: "build failed: npm ci returned 1",
+			name:          "build fails",
+			setup:         func(f *fakes) { f.buildErr = &engine.BuildError{Message: "npm ci returned 1"} },
+			wantPermanent: true,
+			wantReason:    "build failed: npm ci returned 1",
 		},
 		{
-			name:       "repo not found",
-			setup:      func(f *fakes) { f.sourceErr = fmt.Errorf("fetching: %w", source.ErrNotFound) },
-			wantReason: source.ErrNotFound.Error(),
+			name:          "repo not found",
+			setup:         func(f *fakes) { f.sourceErr = fmt.Errorf("fetching: %w", source.ErrNotFound) },
+			wantPermanent: true,
+			wantReason:    source.ErrNotFound.Error(),
 		},
 		{
-			name:       "source directory missing",
-			setup:      func(f *fakes) { f.streamErr = source.ErrDirNotFound },
-			wantReason: source.ErrDirNotFound.Error(),
+			name:          "source directory missing",
+			setup:         func(f *fakes) { f.streamErr = source.ErrDirNotFound },
+			wantPermanent: true,
+			wantReason:    source.ErrDirNotFound.Error(),
 		},
 		{
-			name:       "never healthy",
-			setup:      func(f *fakes) { f.probeStatus = func(int) int { return 502 } },
-			wantReason: "health check failed: GET /healthz didn't succeed within 200ms (last result: 502)",
-			wantRemove: []string{"new"},
+			name:          "never healthy",
+			setup:         func(f *fakes) { f.probeStatus = func(int) int { return 502 } },
+			wantPermanent: true,
+			wantReason:    "health check failed: GET /healthz didn't succeed within 200ms (last result: 502)",
+			wantRemove:    []string{"new"},
 		},
 		{
-			name:       "internal error stays generic",
+			// The attempt's own deadline, while waiting for the app.
+			name:          "deploy times out",
+			setup:         func(f *fakes) { f.probeStatus = func(int) int { return 502 } },
+			timeout:       50 * time.Millisecond,
+			wantPermanent: true,
+			wantReason:    "deploy timed out after 50ms",
+			wantRemove:    []string{"new"},
+		},
+		{
+			// Docker or GitHub unreachable: worth another attempt, and if
+			// the attempts run out, the reason stays generic.
+			name:       "internal error is retried, and stays generic",
 			setup:      func(f *fakes) { f.buildErr = errors.New("dial tcp 10.0.0.3:2375: connection refused") },
 			wantReason: "internal error; see the platform's logs",
 		},
@@ -313,7 +359,17 @@ func TestDeployFailures(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFakes()
 			tt.setup(f)
-			dep := deployAndWait(t, f, t.Context())
+			d := f.deployer()
+			if tt.timeout != 0 {
+				d.cfg.DeployTimeout = tt.timeout
+			}
+			dep, _ := d.Start(t.Context(), 1, sha)
+			job := store.Job{ID: 1, DeploymentID: dep.ID, Attempts: 1}
+			err := d.Run(t.Context(), job)
+			if err == nil || jobs.IsPermanent(err) != tt.wantPermanent {
+				t.Fatalf("Run error = %v; want an error, permanent %v", err, tt.wantPermanent)
+			}
+			d.GiveUp(t.Context(), job, err)
 
 			if f.statuses[dep.ID] != store.StatusFailed || f.failReason != tt.wantReason {
 				t.Errorf("status %s, reason %q; want failed, %q", f.statuses[dep.ID], f.failReason, tt.wantReason)
@@ -342,12 +398,12 @@ func TestRouteSwitchFailureKeepsOldContainer(t *testing.T) {
 		}
 		return nil
 	}
-	dep := deployAndWait(t, f, t.Context())
+	dep, err := deploy(t, f, t.Context())
 
 	// The deployment is healthy (it is), but Caddy still points at the old
 	// container, so that must keep running.
-	if f.statuses[dep.ID] != store.StatusHealthy {
-		t.Errorf("status = %s, want healthy", f.statuses[dep.ID])
+	if err != nil || f.statuses[dep.ID] != store.StatusHealthy {
+		t.Errorf("status = %s, err %v; want healthy, no error", f.statuses[dep.ID], err)
 	}
 	if len(f.removed) != 0 {
 		t.Errorf("removed %v; the old container must stay while Caddy still routes to it", f.removed)
@@ -359,19 +415,103 @@ func TestShutdownDuringHealthCheck(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	f.probeStatus = func(int) int { return 502 }
 	f.onProbe = cancel // the platform shuts down while the new version is being checked
-	dep := deployAndWait(t, f, ctx)
+	dep, err := deploy(t, f, ctx)
 
-	if f.statuses[dep.ID] != store.StatusFailed || !strings.HasPrefix(f.failReason, "interrupted") {
-		t.Errorf("status %s, reason %q; want failed, interrupted", f.statuses[dep.ID], f.failReason)
+	// Not a failure: the job is handed back and retried after the restart,
+	// so the deployment stays in progress.
+	if !errors.Is(err, context.Canceled) || jobs.IsPermanent(err) {
+		t.Errorf("Run error = %v, want a (non-permanent) cancellation", err)
+	}
+	if f.statuses[dep.ID] != store.StatusStarting {
+		t.Errorf("status %s, want still starting", f.statuses[dep.ID])
 	}
 	if !slices.Contains(f.removed, "new") {
 		t.Errorf("removed %v, want the half-started container removed", f.removed)
 	}
 }
 
+func TestRetryAfterCutOffAttempt(t *testing.T) {
+	f := newFakes()
+	// The first attempt got as far as starting a container, then the
+	// platform died.
+	f.statuses[7] = store.StatusStarting
+	f.containers = append(f.containers, newContainer)
+	if err := retry(t, f); err != nil {
+		t.Fatal(err)
+	}
+
+	// Its container goes first, so the new one can take the same name; then
+	// the deploy runs from the build, as normal.
+	want := []string{"remove new", "building", "download " + sha + " /web", "build ops-platform/hello:" + sha}
+	if len(f.events) < len(want) || !slices.Equal(f.events[:len(want)], want) {
+		t.Errorf("events start %q, want %q", f.events, want)
+	}
+	if f.statuses[7] != store.StatusHealthy {
+		t.Errorf("status = %s, want healthy", f.statuses[7])
+	}
+}
+
+func TestRetryOfHealthyDeploymentFinishesSwitch(t *testing.T) {
+	f := newFakes()
+	// The first attempt marked 7 live, then died before switching the
+	// route or removing the old version.
+	f.statuses = map[int64]store.DeploymentStatus{6: store.StatusSuperseded, 7: store.StatusHealthy}
+	f.containers = append(f.containers, newContainer)
+	if err := retry(t, f); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []string{"apply [hello.apps.test->app-hello-7:8080]", "remove old6", "remove stale3"}
+	if !slices.Equal(f.events, want) {
+		t.Errorf("events:\n  got  %q\n  want %q (no rebuild)", f.events, want)
+	}
+}
+
+func TestRetryOfFinishedDeploymentDoesNothing(t *testing.T) {
+	for _, status := range []store.DeploymentStatus{store.StatusFailed, store.StatusSuperseded} {
+		f := newFakes()
+		f.statuses[7] = status
+		if err := retry(t, f); err != nil {
+			t.Errorf("%s: Run error = %v, want nil", status, err)
+		}
+		if len(f.events) != 0 {
+			t.Errorf("%s: events %q, want none", status, f.events)
+		}
+	}
+
+	f := newFakes() // no deployment 7: deleted with its app
+	if err := retry(t, f); !jobs.IsPermanent(err) {
+		t.Errorf("deleted deployment: Run error = %v, want permanent", err)
+	}
+}
+
+func TestNewerDeploymentsContainerIsKept(t *testing.T) {
+	f := newFakes()
+	// Deployment 9 was queued as soon as 7 went live, and has started its
+	// container already.
+	newer := engine.ManagedContainer{ID: "newer9", Name: "app-hello-9", Labels: map[string]string{engine.LabelDeployment: "9"}}
+	f.containers = append(f.containers, newer)
+	if _, err := deploy(t, f, t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(f.removed, "newer9") {
+		t.Errorf("removed %v; a later deployment's container must be left alone", f.removed)
+	}
+}
+
+func TestGaveUpAfterRepeatedCrashes(t *testing.T) {
+	f := newFakes()
+	f.statuses[7] = store.StatusBuilding
+	f.deployer().GiveUp(t.Context(), store.Job{DeploymentID: 7, Attempts: 4}, jobs.ErrNoAttemptsLeft)
+	if f.statuses[7] != store.StatusFailed || f.failReason != "gave up: the platform stopped during every attempt" {
+		t.Errorf("status %s, reason %q", f.statuses[7], f.failReason)
+	}
+}
+
 func TestRemoveOrphansKeepsOnlyLiveDeployments(t *testing.T) {
 	f := newFakes() // deployment 6 is live; containers for 6, 3 and 7 exist
-	if err := f.deployer(t.Context()).RemoveOrphans(t.Context()); err != nil {
+	f.containers = append(f.containers, newContainer)
+	if err := f.deployer().RemoveOrphans(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	slices.Sort(f.removed)
@@ -380,16 +520,22 @@ func TestRemoveOrphansKeepsOnlyLiveDeployments(t *testing.T) {
 	}
 }
 
-func TestStartRefusedWhileDeployInProgress(t *testing.T) {
+func TestStartQueuesAndNotifies(t *testing.T) {
 	f := newFakes()
-	f.createErr = store.ErrDeployInProgress
-	d := f.deployer(t.Context())
+	d := f.deployer()
+	notified := 0
+	d.Notify = func() { notified++ }
 
-	if _, err := d.Start(t.Context(), 1, sha); !errors.Is(err, store.ErrDeployInProgress) {
-		t.Errorf("Start error = %v, want ErrDeployInProgress", err)
+	if _, err := d.Start(t.Context(), 1, sha); err != nil || notified != 1 {
+		t.Errorf("Start: err %v, notified %d times; want queued and notified once", err, notified)
 	}
-	d.Wait()
+	// Queueing runs nothing itself: that's the workers' job.
 	if len(f.events) != 0 {
 		t.Errorf("events %v; nothing should run", f.events)
+	}
+
+	f.createErr = store.ErrDeployInProgress
+	if _, err := d.Start(t.Context(), 1, sha); !errors.Is(err, store.ErrDeployInProgress) || notified != 1 {
+		t.Errorf("Start while in progress: err %v, notified %d; want ErrDeployInProgress, no notify", err, notified)
 	}
 }
