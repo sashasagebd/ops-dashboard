@@ -730,3 +730,90 @@ public later through cloudflared, not by widening this.
 machine, not a wildcard, so it can't route `<app>.<domain>`); publishing on
 127.0.0.1 and relaying (an extra moving part for no gain).
 
+## Phase 2 (approved 2026-11-03)
+
+### Deploys become jobs in a Postgres queue
+
+**What:** a `jobs` table. Workers inside the platform claim jobs with
+`SELECT … FOR UPDATE SKIP LOCKED` and hold a lease they keep renewing; a job
+whose lease runs out (its worker died) is claimable again. Transient errors
+(GitHub or Docker unreachable) are retried with backoff, up to 3 attempts.
+Permanent ones (build failed, health check failed, commit not found) fail at
+once.
+
+**Why:** P1's goroutines lose a deploy when the platform restarts mid-build;
+the best they can do is mark it failed at startup. A row in Postgres outlives
+the process. `SKIP LOCKED` lets several workers claim jobs without blocking
+each other or taking the same one, and the lease is what tells a running job
+apart from one whose worker died. Retrying only transient errors avoids
+rebuilding something that will fail the same way again.
+
+**Alternatives:** a separate queue (Redis, NATS: another service to run and
+back up, for a single-host system that already has Postgres); a plain
+`locked = true` flag (a crashed worker's jobs stay locked forever without a
+lease); retrying every error (wastes minutes on builds that can't succeed).
+
+### The webhook arrives through Tailscale Funnel until there's a domain
+
+**What:** GitHub's push webhook reaches the platform through Tailscale
+Funnel, on port 8443 of the existing `homelab.<tailnet>.ts.net` name, mapped
+to the webhook listener only. The owner will buy a domain (most likely for
+pokewordle in P5); then the webhook moves to Cloudflare Tunnel, as the plan
+intends, and Funnel is turned off.
+
+**Why:** the plan's Cloudflare Tunnel needs a domain, and push-to-deploy
+shouldn't wait for one. Funnel is free, gives a public HTTPS URL with a real
+certificate, and is configured per port, so the dashboard on 443 stays
+tailnet-only.
+
+**Alternatives:** wait for the domain (P2's main feature blocked on a
+purchase); polling GitHub for new commits (no public endpoint at all, but up
+to a minute's delay and no webhook to show); a cloudflared quick tunnel (its
+random URL changes on every restart, so the webhook would break).
+
+### A separate listener for the webhook, on 127.0.0.1
+
+**What:** the platform runs a second HTTP server that serves only the
+webhook route, published on `127.0.0.1` only, for Funnel to forward to. The
+main API stays unpublished. This relaxes the constraint "the platform
+publishes no ports" (approved by the owner).
+
+**Why:** the webhook is the platform's only public endpoint, so it gets its
+own server: one route, a small body limit, short timeouts, and nothing else
+reachable through it. 127.0.0.1 keeps it off the LAN (Docker bypasses UFW);
+only tailscaled on the host connects to it.
+
+**Alternatives:** routing the webhook path through the dashboard's port
+(no new port, but public requests would reach the process that serves the
+admin pages, and one Funnel mistake would expose them); publishing the main
+API's port (everything one misconfiguration away from public).
+
+### App logs are read live from Docker, not stored
+
+**What:** deploy logs (build output, stage messages) are stored per
+deployment. App (runtime) logs are streamed from Docker when someone is
+watching, and not stored.
+
+**Why:** Docker already keeps each container's logs (json-file, 3 × 10 MB),
+enough for watching live and recent history. Storing them would grow the
+database with app output on a server shared with game servers, and keep any
+secrets an app prints. What's lost is a replaced container's logs; P4's
+reconciler saves a crashed container's last lines in its event, which covers
+the useful part. Fuller log storage belongs to P5's observability work.
+
+**Alternatives:** storing everything in Postgres (growth, retention jobs,
+secrets at rest); a log stack such as Loki (another service, too early).
+
+### Logs stream over Server-Sent Events
+
+**What:** log endpoints use SSE (`text/event-stream`): stored lines first,
+then new ones as they're written.
+
+**Why:** logs only go one way, server to browser. SSE is plain HTTP, so it
+passes through the dashboard's reverse proxy (with flushing) unchanged, and
+`EventSource` reconnects by itself, resuming from the last line ID.
+
+**Alternatives:** WebSockets (two-way, which isn't needed, and an upgrade the
+proxy must handle); polling (simpler, but laggy and wasteful for a build
+that prints hundreds of lines).
+
