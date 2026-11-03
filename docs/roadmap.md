@@ -17,13 +17,13 @@ _Last updated: 2026-11-03_
 | M6: History sparklines | ✅ Done, deployed (with P0, 2026-11-02) |
 | P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
 | P1: Manual deploy of one app | ✅ Done, deployed 2026-11-03 |
+| P2: Push-to-deploy, job queue, live logs | 📋 Plan approved 2026-11-03; 2.1 next |
 
 **Where we left off (2026-11-03):** P0 and P1 are done and deployed. A real
 app (`examples/hello`) is registered, configured and deployed from the
 dashboard's Apps page and served over the tailnet, and the whole stack comes
-back by itself after a reboot. The owner commits, pushes and merges; feature
-branches with a PR run CI. **Next:** propose the P2 plan (push-to-deploy, a
-Postgres job queue, live build logs) and get it approved before any code.
+back by itself after a reboot. The P2 plan is approved (see P2 below).
+**Next:** step 2.1, the job queue, on a new feature branch.
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -245,7 +245,7 @@ in the same module and image; the dashboard stays read-only and forwards
 Docker SDK for the platform only; Postgres reachable only from the platform;
 `pgx`; an embedded migration runner; real-Postgres tests in CI.
 
-## P1: Manual deploy of one app 🚧
+## P1: Manual deploy of one app ✅
 
 Phase 1 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-02
 (owner: "get started", taking the recommended option for each choice below).
@@ -329,11 +329,51 @@ Steps regrouped 2026-11-02 at the owner's request (fewer push/review
 rounds): the original 1.4–1.9 became 1.4–1.6, each pairing two steps that
 touch the same part of the system and are checked the same way.
 
+## P2: Push-to-deploy, job queue, live logs 📋
+
+Phase 2 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-03.
+
+**Done when** (from the plan): pushing to an app's repo deploys it
+automatically, the build log can be watched live in the dashboard, and
+killing the platform mid-build gets the deploy retried, not lost.
+
+| Step | What | Status |
+|---|---|---|
+| 2.1 | **Durable job queue.** A `jobs` table; workers inside the platform claim with `SELECT … FOR UPDATE SKIP LOCKED` and hold a renewed lease, so a crashed platform's jobs are picked up again after a restart (replacing "interrupted deploys are marked failed"). Retries with backoff only for transient errors (GitHub/Docker unreachable), at most 3 attempts; build or health-check failures fail at once. Retries are idempotent (leftover containers from the attempt removed first; the build cache makes rebuilding cheap). Still one deploy per app at a time, enforced by the database. Database tests for concurrent claims; CI kills the platform mid-build and requires the deploy to finish after it restarts. | |
+| 2.2 | **Live logs.** Deploy logs (Docker's build output and the platform's own stage messages) stored per deployment, capped per deployment, last few deployments per app kept. An SSE endpoint replays stored lines then streams new ones; the dashboard's proxy flushes immediately. App (runtime) logs tailed live from Docker, not stored. UI: a log viewer per deployment and an "App logs" tab. | |
+| 2.3 | **Push-to-deploy.** A webhook endpoint on its own listener (see decisions): HMAC signature check (`GITHUB_WEBHOOK_SECRET`, constant-time), body cap, GitHub's redelivered events ignored (delivery ID), a deploy queued for each app whose repo and branch match. A per-app auto-deploy switch (on by default). A "Deploy latest" button that looks up the branch's newest commit. Server work: Tailscale Funnel for the webhook port, the GitHub webhook, and checking the three done-when points on the real server. | |
+
+Decisions (approved 2026-11-03), with entries in
+[decisions/platform.md](decisions/platform.md):
+- **Tailscale Funnel for the webhook, until there's a domain.** The plan
+  says Cloudflare Tunnel, which needs a domain. The owner will buy one (see
+  Open questions); until then Funnel gives a public HTTPS URL on the
+  existing `homelab.<tailnet>.ts.net` name at no cost. Funnel runs on a
+  separate port (8443) mapped to the webhook listener only; the dashboard on
+  443 stays tailnet-only. When the domain arrives, the webhook moves to
+  Cloudflare Tunnel and Funnel is turned off.
+- **A separate webhook listener, published on 127.0.0.1 only.** A second
+  HTTP server inside the platform that serves only the webhook route, with
+  its own timeouts and limits, so the public surface is that one handler.
+  This relaxes the constraint "the platform publishes no ports" (approved by
+  the owner; CLAUDE.md updated). Chosen over sending the webhook through the
+  dashboard's port, which would put public traffic on the process that
+  serves the admin pages.
+- **App logs aren't stored.** Docker keeps them (3 × 10 MB per container),
+  which covers watching live and recent history. Storing them would grow the
+  database with app output and keep any secrets apps print. The one gap, a
+  crashed container's last lines, is for P4: the reconciler saves them in
+  its event when it replaces the container. Fuller observability is P5.
+- **SSE, not WebSockets,** for streaming logs: one-way, works through the
+  dashboard's plain HTTP proxy, and browsers reconnect on their own.
+
 ## Open questions
 
-- **Domain for public apps** (deferred, not blocking P1). The owner will
-  probably buy one (Cloudflare Registrar, cost price) when something needs to
-  be public, likely pokewordle in P5. One domain covers every public site via
+- **Domain for public apps** (deferred, not blocking P1 or P2). The owner
+  will buy one (Cloudflare Registrar, cost price; confirmed 2026-11-03), most
+  likely for pokewordle in P5. When it arrives: cloudflared (Cloudflare
+  Tunnel) for public app hostnames, the GitHub webhook moved from Tailscale
+  Funnel to the tunnel, and Funnel turned off. One domain covers every public site via
   subdomains. `pokewordle.sashasagebd.workers.dev` is Cloudflare's free
   Workers subdomain and can't carry a tunnel or per-app hostnames. Also worth
   checking then: whether pokewordle's Worker could reach its backend through
@@ -346,6 +386,7 @@ Resolved:
 - **M6 plan** approved 2026-10-06.
 - **P0 plan** approved 2026-10-28.
 - **P1 plan** approved 2026-11-02.
+- **P2 plan** approved 2026-11-03.
 - **Docker version on the server** (2026-11-02): 29.8.1, API 1.56; see P1's
   risks for what it means for building.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
