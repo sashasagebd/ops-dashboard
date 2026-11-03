@@ -269,3 +269,447 @@ but goes against "everything in Docker" and is harder to pin and reproduce);
 the `-alpine` image (smaller download, but musl's locale behaviour differs
 from the glibc that most Postgres guides assume, and disk space isn't the
 constraint here).
+
+## Phase 1 (approved 2026-11-02)
+
+### The platform's write proxy: few endpoint groups, nothing finer
+
+**What:** a second `tecnativa/docker-socket-proxy` for the platform only, on
+its own internal network, with `POST=1` and only the `CONTAINERS`, `IMAGES`,
+`BUILD` and `NETWORKS` groups enabled. The dashboard keeps its read-only
+proxy.
+
+**Why:** the proxy's rules are per endpoint group, and with `POST=1` every
+write method in an enabled group is allowed (its config is one
+`deny unless GET or POST=1` line, then an allow line per group). So the only
+control is which groups are on. These four are what building and running
+apps need. Exec, volumes, swarm, secrets, plugins and the rest stay off,
+which blocks e.g. running commands inside the game servers' containers.
+Being able to create containers is still root-equivalent, as the Phase 0
+entry says. The proxy narrows the API surface; it doesn't make that safe.
+The real guarantees are that the platform builds every container config
+itself, and that the proxy is reachable only from the platform.
+
+**Alternatives:** the proxy's `ALLOW_START`/`ALLOW_STOP` switches (they allow
+start and stop without `POST=1`, but not create, build or remove, which
+deploys need); a proxy that filters request bodies (e.g. refusing privileged
+containers), which would be stronger but is a custom component to write and
+maintain; mounting the socket into the platform (no narrowing at all).
+
+### Code comes from GitHub's tarball API
+
+**What:** to deploy commit `abc123`, the platform downloads
+`/repos/{owner}/{repo}/tarball/abc123`, strips GitHub's top-level folder,
+and streams the result to Docker as the build context, with a size cap.
+Public repos only in Phase 1.
+
+**Why:** a Docker build context is a tar file anyway, so this is one
+streaming download and one streaming upload, with no git anywhere. It's
+pinned to an exact commit, and private repos later only need a token header.
+Because the platform handles the bytes, it can cap the size and record
+exactly what was built.
+
+**Alternatives:** cloning with `go-git` (works with any git host, but a large
+dependency, and a full clone where a snapshot is enough); passing the repo
+URL to Docker and letting the daemon clone it (least code, but the platform
+can't limit or inspect what's fetched, and Docker's daemon would need to be
+able to reach GitHub on the platform's behalf).
+
+### Caddy, configured through its admin API
+
+**What:** a Caddy container receives all app traffic. The platform adds,
+replaces and removes one route per app through Caddy's admin API, which is
+only reachable on an internal network that apps aren't on. Because routes
+set this way live in Caddy's memory, the platform re-applies them all when it
+starts.
+
+**Why:** routing is part of the deploy. Phase 3's zero-downtime switch is
+"start the new container, then repoint the route", and that's easiest to
+reason about when the platform does it explicitly. Caddy's admin API takes
+small JSON changes with no reload. The admin API has no authentication, so
+keeping it off any network an app can reach is what protects it.
+
+**Alternatives:** Traefik with Docker label discovery (very little code, but
+Traefik would need Docker access of its own, and the routing logic would
+live in Traefik rather than in code you can show and test); generating a
+Caddyfile and reloading (simpler to inspect, but rewrites everything for one
+route, and is file-based state to keep in sync).
+
+### Deploys run in a goroutine (Phase 1 only)
+
+**What:** the "deploy" API call records a `queued` deployment and starts a
+goroutine that runs the whole flow, allowing one deploy per app at a time.
+
+**Why:** it gets an end-to-end deploy working without the job queue, so
+Phase 2 can focus on the queue itself. The known gap is deliberate: if the
+platform restarts mid-deploy, that deploy is lost. At startup the platform
+marks any deployment still in progress as failed ("interrupted"), since
+nothing can resume it and it would otherwise block the app's next deploy
+forever. Phase 2 fixes this properly with jobs in Postgres that survive
+restarts and are retried. "Here's what broke, here's the queue that fixed it" is a better
+story than starting with the queue.
+
+**Alternatives:** building the queue first (more correct from day one, but
+two hard things at once in the same phase).
+
+### Docker's restart policy keeps apps up until the reconciler exists
+
+**What:** app containers get `restart: unless-stopped`.
+
+**Why:** without a restart policy, a crashed app would stay down until
+Phase 4. Docker's policy restarts a container that exits, which covers the
+common case. Phase 4 decides whether the reconciler takes this over
+completely or works alongside it.
+
+**Alternatives:** no restart policy until Phase 4 (crashes stay down for
+weeks of development).
+
+### Apps can only reach Caddy
+
+**What:** app containers are on one network, `apps`, shared with Caddy's
+proxy side and nothing else. The platform, Postgres, both socket proxies and
+Caddy's admin API are on other internal networks.
+
+**Why:** an app is someone's code (even if that someone is you) exposed to
+the internet. If it's compromised, the attacker should land in a container
+that can talk to Caddy and the internet, not to the database holding every
+app's encrypted secrets or the proxy that can create containers.
+
+**Alternatives:** one shared network (simpler, but every app could reach the
+control plane).
+
+### No domain yet: sslip.io hostnames over Tailscale (2026-11-02)
+
+**What:** until there's a domain, apps get hostnames like
+`hello.100-101-102-103.sslip.io`. Caddy is published on the server's
+Tailscale IP only, so apps are reachable from tailnet devices and nowhere
+else. cloudflared and public hostnames wait until a domain is bought.
+
+**Why:** sslip.io is a free public DNS service that resolves any name
+containing an IP address to that IP. It gives each app a real, distinct
+hostname with no domain and no DNS setup, so Caddy's hostname routing
+(the part that matters for the platform) is built and tested exactly as it
+will run publicly. Swapping in a real domain later is configuration: a
+different `APPS_DOMAIN` plus the cloudflared service. It also keeps the
+platform off the internet until it has proven itself. Traffic inside the
+tailnet is plain HTTP, which is acceptable because Tailscale already
+encrypts it.
+
+**Alternatives:** buying a domain now (about $10–12/year; the owner will
+likely do this later anyway); Cloudflare quick tunnels (free, but a random
+URL that changes on every restart, and meant for testing); Tailscale Funnel
+(free and public, but one hostname per machine, so apps would share it by
+path, which many apps don't handle); free registries such as `eu.org` (slow,
+uncertain approval).
+
+### Env vars are encrypted with AES-256-GCM, bound to their row
+
+**What:** `internal/secrets` seals each env var value with AES-256-GCM from
+Go's standard library, under `PLATFORM_SECRET_KEY` (32 random bytes, in
+`.env`, never in the database or repo). A stored value is a format byte,
+a random 12-byte nonce, then the ciphertext and tag. The app ID and key name
+are passed as associated data. Only the store encrypts and decrypts, and the
+API will only ever return key names.
+
+**Why:**
+- *GCM is authenticated:* a tampered value, or the wrong key, fails loudly
+  instead of decrypting to garbage that would be injected into an app.
+- *Associated data binds a value to its row:* someone who can write to the
+  database but doesn't have the key can't copy app A's secret into app B's
+  row and have app B receive it. A test does exactly that and checks it
+  fails.
+- *Random nonces:* the same value sealed twice gives different bytes, so
+  equal secrets aren't visible as such.
+- *The format byte:* lets the scheme (or key, for a rotation) change later
+  while old values stay readable.
+- *Encryption in the store, not the API:* nothing else can write a value
+  unencrypted by accident.
+- *A missing or malformed key stops the platform at startup:* a default or
+  generated key would silently lose every value on the next restart.
+
+The cost: lose the key and every stored value is gone, so `.env.example`
+and the README say to back it up.
+
+**Alternatives:** Postgres's `pgcrypto` (encryption inside the database
+means the key travels to it with every query, and may appear in its logs);
+a secrets manager such as Vault (the "right" answer at scale, but a large
+extra service for one person's server); envelope encryption with a key per
+app (only worth it once keys need rotating per app).
+
+### Invariants live in the database, not in Go checks
+
+**What:** "at most one deploy in progress per app" and "at most one live
+deployment per app" are partial unique indexes on `deployments`. Status
+changes are single `UPDATE ... WHERE id = $1 AND status = ANY(allowed)`
+statements, so a deployment only moves forward. Making a deployment live and
+superseding the old one happen in one transaction.
+
+**Why:** a "check, then write" in Go (e.g. "is a deploy running? if not,
+start one") has a gap between the check and the write, where two requests,
+or in Phase 2 two workers, can both pass the check. A unique index or a
+conditional `UPDATE` makes the database decide atomically: exactly one wins,
+and the other gets a clear error (`ErrDeployInProgress`, `ErrWrongStatus`).
+This holds no matter how many platform processes or goroutines there are,
+which is what Phase 2's queue will rely on.
+
+**Alternatives:** a Go mutex per app (only works within one process, and is
+lost on restart); `SELECT ... FOR UPDATE` then check then update (correct, but
+more code and round trips for the same guarantee).
+
+### Health checks go through Caddy (2026-11-02)
+
+**What:** to check a new deployment is healthy, the platform adds a
+temporary Caddy route for it (a probe hostname only the platform uses) and
+sends requests to the app's health-check path through Caddy. Caddy is on the
+apps network; the platform isn't.
+
+**Why:** apps are isolated from the platform on purpose (see "Apps can only
+reach Caddy"), so the platform can't reach a new container directly. Going
+through Caddy keeps that isolation, and checks the same path real visitors
+use, so a route or network mistake fails the check rather than going live.
+It's also exactly Phase 3's zero-downtime switch: probe the new version
+through Caddy, then move the real hostname to it.
+
+**Alternatives:** putting the platform on the apps network (every app could
+then call the platform's unauthenticated API); Docker's own `HEALTHCHECK`
+(needs `curl` or similar inside every app image, which can't be assumed); a
+short-lived helper container on the apps network per check (works, but adds
+an image pull and a container per deploy).
+
+### Fixed hardening on every app container
+
+**What:** besides the app's own limits, `engine.Run` always sets: no
+privileged mode, no host mounts, no published ports, `no-new-privileges`, a
+512-process limit, log rotation (3 × 10 MB) and a 10 s stop timeout. Callers
+can't change these; the spec only carries image, env, labels, network and
+limits.
+
+**Why:** the socket proxy can't stop a container being created privileged,
+with the host's `/` mounted (it doesn't read request bodies), so the
+platform's own code is the real boundary, and it's simplest to audit when
+it's one function with no options. The process limit stops one app's fork
+bomb or leak from exhausting the host. Log rotation matters on a 256 GB
+disk: Docker's default log file grows forever.
+
+**Alternatives:** a read-only root filesystem and `cap_drop: ALL` as well
+(stronger, but breaks many ordinary images that write temp files or switch
+users; could become an opt-in per app later).
+
+### Builds use Docker's legacy builder, for now (2026-11-03)
+
+**What:** `engine.Build` asks Docker for its legacy builder (`version=1`),
+sending the code as the request body.
+
+**Why:** the first plan was BuildKit, Docker's current builder. Its source
+showed it accepts the build context in the request body without a session,
+which is true. But CI's real build through the proxy failed with
+`no active sessions`: BuildKit also uses a client-side session to look up
+`FROM` images in the registry, even public ones. The legacy builder pulls
+base images itself, so it works through `/build` alone, with no extra
+dependency or proxy permission. It's deprecated (since Docker 23, with no
+removal date) and lacks newer features such as `RUN --mount=type=cache` and
+heredocs, which apps deployed here must avoid. A side benefit: its progress
+is plain text, which makes Phase 2's live build logs simpler. The choice is
+contained in one function, so it's cheap to change.
+
+**Alternatives:**
+- *BuildKit with a session implemented in Go* (what the `docker` CLI does).
+  It's the upgrade path if an app needs BuildKit features. Cost: the large
+  `moby/buildkit` library, the proxy's `SESSION` group, and a long-lived
+  hijacked connection through a proxy with a 10-minute idle timeout.
+- *BuildKit after pre-pulling every base image:* fragile, since `# syntax=`
+  lines, `ARG`s in `FROM` and `COPY --from=<image>` all still need the
+  registry.
+- *A separate build service:* a standalone BuildKit daemon, or a builder
+  container per build. More moving parts than this phase needs.
+
+**Lesson:** reading the source got the first half right and missed the
+second. The CI check that does a real build is what caught it, before any
+deploy depended on it.
+
+### Caddy's admin API on a fixed IP, on a network apps aren't on (2026-11-03)
+
+**What:** Caddy's admin API listens only on `10.203.0.2:2019`, its address on
+an internal `caddy-admin` network (fixed subnet `10.203.0.0/29`) that only
+the platform shares. Caddy's proxy side is on `platform-apps`, the network
+apps are on.
+
+**Why:** the admin API has no authentication: anything that can reach it can
+rewrite routing. Caddy has to be on the apps network to proxy to them, so
+listening on all interfaces would hand every deployed app that power.
+Binding to one known address on a separate network keeps it reachable from
+the platform only, and CI checks an app can't connect. The subnet is outside
+Docker's default address pools, so it can't clash with networks Docker
+creates on its own.
+
+**Alternatives:** a Unix socket shared through a volume (no network at all,
+but Caddy runs as root and the platform as a non-root user, so socket
+permissions get fiddly); Caddy's admin API with authentication (only
+available through an extra module and remote-admin certificates).
+
+### Routes are applied declaratively, from the database (2026-11-03)
+
+**What:** every routing change sends Caddy the complete table, built from
+the database (each app's live deployment) plus probe routes for deployments
+being checked, replacing Caddy's whole app server in one PATCH. Caddy runs
+with `--resume`, so it restarts with its last config, and the platform
+re-sends the table whenever it starts.
+
+**Why:** incremental add/remove calls can drift from reality (a request
+fails halfway, Caddy restarts, the platform crashes between steps), and then
+need their own bookkeeping to repair. Sending the whole desired state makes
+every update self-correcting and safe to repeat. This is the reconciliation
+idea of Phase 4 in miniature, for routes. At a handful of apps the table is
+tiny. PATCHing the whole server object, rather than only its routes array,
+means it doesn't depend on Caddy keeping an empty array in its saved config.
+
+**Alternatives:** per-route `@id`s with `PUT`/`DELETE` (less data per
+request, but state to keep in step); regenerating a Caddyfile and reloading
+(file-based state, and a reload per change).
+
+### Startup cleanup of orphaned app containers (2026-11-03)
+
+**What:** when the platform starts (no deploys in flight yet), it removes
+every platform-labelled container that isn't an app's live deployment.
+
+**Why:** a deploy cut off by a crash leaves its container behind. With the
+`unless-stopped` restart policy it would run forever, unrouted, using
+memory. Only containers carrying the platform's label are considered, so
+nothing else on the host is touched. Phase 4's reconciler does this
+continuously; this covers the restart case until then.
+
+**Alternatives:** leaving cleanup to Phase 4 (orphans pile up for weeks of
+development).
+
+### Simple cross-site protection for an API without a login (2026-11-03)
+
+**What:** the platform API only accepts request bodies with
+`Content-Type: application/json` (otherwise 415), and rejects unknown JSON
+fields.
+
+**Why:** the API has no login, because only tailnet devices can reach it. But
+a web page on any site, opened in a browser on one of those devices, could
+still send requests to it (cross-site request forgery). A cross-site request
+can only carry a JSON content type after a CORS preflight, which this API
+never approves, so such a page can't trigger a deploy or change env vars.
+Step 1.6 adds Go's `http.CrossOriginProtection` in the dashboard, which
+forwards to the API, as a second check based on the browser's
+`Sec-Fetch-Site`/`Origin` headers.
+
+**Alternatives:** CSRF tokens (needs sessions, which a single-user API with
+no login doesn't have); a login (worth adding if the API is ever reachable
+from outside the tailnet).
+
+### CI deploys this very commit end to end (2026-11-03)
+
+**What:** CI's compose step uses the platform's API to register an app
+pointing at this repo, then deploys the commit being tested. The root
+Dockerfile builds the dashboard image, which serves `/healthz` without
+needing anything else. CI then checks:
+- a visitor reaches it through Caddy by hostname;
+- a redeploy replaces the container;
+- a failing deploy (a commit that doesn't exist) leaves the site up and
+  says why;
+- apps can reach neither Caddy's admin API nor the platform;
+- routes survive restarts of Caddy and of the platform.
+
+**Why:** unit tests use fakes, and the dev PC has no Docker, so this is the
+first place the real pieces (GitHub, the proxy, the legacy builder, Docker
+networks, Caddy) meet before anything goes to the server. It already earned
+its keep at the build step: BuildKit's need for a session only showed up in a
+real build. The cost is a few minutes of CI per run.
+
+**Alternatives:** a separate sample repo (another repo to keep in step);
+testing only on the server (a slow, manual feedback loop).
+
+### The dashboard forwards the platform's API (2026-11-03)
+
+**What:** the dashboard serves `/api/platform/*` by forwarding each request
+to the platform (`httputil.ReverseProxy`, `PLATFORM_URL`), and wraps all its
+routes in Go's `http.CrossOriginProtection`. The platform keeps no published
+port.
+
+**Why:** the browser only ever talks to one origin, the dashboard at its
+`tailscale serve` URL. So there's no CORS to configure, and the platform needs
+no address of its own on the tailnet. The cross-origin check is the second
+CSRF layer promised in 1.5. Go 1.25+ has it built in: it refuses
+state-changing requests (not GET/HEAD/OPTIONS) that the browser marks
+cross-origin through `Sec-Fetch-Site` (or `Origin` vs `Host` on older
+browsers), and passes requests with neither header (curl, scripts), which
+CSRF can't involve. The proxy uses `Rewrite`, which drops any
+`X-Forwarded-*` headers the client sent. If the platform is down, the
+monitoring pages keep working and only `/api/platform/` answers 502.
+
+**Alternatives:** publishing the platform behind its own `tailscale serve`
+port (a second origin needs CORS, plus a second thing to keep tailnet-only);
+merging the two binaries (rejected in P0, because monitoring should survive
+a broken platform).
+
+### Hash routing in the frontend (2026-11-03)
+
+**What:** pages live in the URL hash (`#/`, `#/apps`, `#/apps/3`), parsed by
+a 20-line `route.ts`, with no router library.
+
+**Why:** the hash never reaches the server, so Go's file server needs no
+"serve index.html for unknown paths" fallback, and reloads and bookmarks work
+on every page. With three pages, a library would be more code to depend on
+than the code it replaces.
+
+**Alternatives:** path routing with a fallback in Go (nicer URLs, but every
+unknown path would then answer 200 with the app instead of 404); React
+Router (a dependency for three routes). Worth revisiting if the frontend
+grows many pages.
+
+### Apps can be built from a folder of their repo (2026-11-03)
+
+**What:** apps have a `sourceDir` (migration 0004, default `''`, the repo's
+root). The code fetcher keeps only that folder, re-rooted, as the build
+context, so its Dockerfile is the one built.
+
+**Why:** `examples/hello` lives in this repo, and a repo often holds more
+than one deployable thing (pokewordle's backend is likely to be one folder of
+its repo). The path is checked three times, because it selects files: the API
+gives a clear 400, the database's CHECK refuses `.`/`..` parts, absolute
+paths and trailing slashes, and the fetcher refuses anything that isn't a
+clean relative path. A folder missing at that commit is only discovered
+while the archive streams into Docker's build. So the deploy keeps the
+stream's own error and reports it ("source directory not found…") rather
+than whatever Docker's client made of the cut-off upload. The same applies
+to a repo over the size limit. CI deploys `examples/hello` this way, and
+checks the reason for a missing folder.
+
+**Alternatives:** a separate repo for each example (more to keep in step, and
+it doesn't help monorepos); a Dockerfile path option instead of a folder
+(the build context would still be the whole repo, which is larger and
+leaks more into each image's build).
+
+### Caddy is published on the Tailscale IP (2026-11-03)
+
+**What:** Caddy's port 80 is published on `APPS_LISTEN_IP:80` (required, no
+default). On the server that's its Tailscale IP, the same one sslip.io
+resolves app hostnames to.
+
+**Why:** that address exists only on the `tailscale0` interface, so tailnet
+devices can reach the apps and the LAN and internet can't. Docker bypasses
+UFW, so a mistaken `0.0.0.0` would expose every app; making the variable
+required, with no default, means it can't happen by omission. Apps go
+public later through cloudflared, not by widening this.
+
+**Known limits:**
+- **Boot order.** Binding to the Tailscale IP fails if Docker starts the
+  container before `tailscaled` has brought the address up. 1.6's reboot
+  test checks this. The fix, if needed, is `net.ipv4.ip_nonlocal_bind=1`
+  (lets a socket bind an address that isn't up yet), or ordering Docker
+  after Tailscale in systemd.
+- **Spoofed destinations.** A device on the same LAN segment could, in
+  principle, send packets addressed to the Tailscale IP straight to the
+  server's LAN interface, and Docker's forwarding rule matches on the
+  destination address alone. That needs someone on the home LAN, and app
+  sites aren't admin surfaces (the dashboard and platform stay on
+  127.0.0.1 and internal networks). Not mitigated now; a firewall rule
+  limiting the published port to `tailscale0` would close it.
+
+**Alternatives:** `tailscale serve` in front of Caddy (it serves one name per
+machine, not a wildcard, so it can't route `<app>.<domain>`); publishing on
+127.0.0.1 and relaying (an extra moving part for no gain).
+

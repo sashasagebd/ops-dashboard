@@ -26,19 +26,38 @@ type HistorySource interface {
 	History(window time.Duration) history.View
 }
 
-// New returns the dashboard's HTTP handler. If static is non-nil, its files
-// (the built frontend) are served for every path the API doesn't claim.
-func New(snapshots SnapshotSource, hist HistorySource, static fs.FS) http.Handler {
+// New returns the dashboard's HTTP handler. If platform is non-nil,
+// /api/platform/ is forwarded to it (see NewPlatformProxy). If static is
+// non-nil, its files (the built frontend) are served for every path the API
+// doesn't claim.
+func New(snapshots SnapshotSource, hist HistorySource, platform http.Handler, static fs.FS) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /api/containers", handleListContainers(snapshots))
 	mux.HandleFunc("GET /api/history", handleHistory(hist))
+	if platform != nil {
+		// One pattern per method, not a bare "/api/platform/": that and
+		// "GET /" below would each be more specific in one way (path vs
+		// method), which ServeMux refuses as a conflict. GET covers HEAD.
+		for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
+			mux.Handle(method+" /api/platform/", platform)
+		}
+	}
 	if static != nil {
 		// "GET /" matches everything, but ServeMux always prefers the most
 		// specific pattern, so the API routes above still win.
 		mux.Handle("GET /", http.FileServerFS(static))
 	}
-	return mux
+	// The platform's API changes things (deploys, env vars), and there's no
+	// login: anyone who can reach the dashboard can use it. Being on the
+	// tailnet is the access control, so what's left to stop is a web page on
+	// another site making the browser of someone on the tailnet send a
+	// request (CSRF). This refuses any non-GET/HEAD/OPTIONS request the
+	// browser marks as cross-origin (Sec-Fetch-Site, or Origin vs Host for
+	// older browsers). Requests without either header (curl, scripts) aren't
+	// from a browser, so CSRF doesn't apply and they pass. The platform's
+	// JSON-only bodies are a second, independent layer.
+	return http.NewCrossOriginProtection().Handler(mux)
 }
 
 // handleHealthz reports that the process is up and serving requests.

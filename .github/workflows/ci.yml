@@ -52,6 +52,14 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # The sample app is its own module, outside backend/. CI's compose
+      # step builds and deploys it; this checks the code itself.
+      - name: Example app
+        working-directory: examples/hello
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+          go vet ./...
+
   frontend:
     name: Frontend (React/Vite)
     runs-on: ubuntu-latest
@@ -103,6 +111,8 @@ jobs:
           docker network create ci
           docker run -d --name platform --network ci --entrypoint /platform \
             -e DATABASE_URL='postgres://platform:ci-only@db:5432/platform?sslmode=disable' \
+            -e PLATFORM_SECRET_KEY="$(openssl rand -hex 32)" \
+            -e APPS_DOMAIN=apps.test \
             ops-dashboard:ci
           docker run -d --name db --network ci \
             -e POSTGRES_USER=platform -e POSTGRES_PASSWORD=ci-only -e POSTGRES_DB=platform \
@@ -140,7 +150,20 @@ jobs:
       - name: Compose stack
         env:
           POSTGRES_PASSWORD: ci-only
+          APPS_DOMAIN: apps.test
+          # The server uses its Tailscale IP; here, the runner's loopback.
+          APPS_LISTEN_IP: 127.0.0.1
+          # Raises the platform's GitHub rate limit; CI runners share IPs,
+          # so the anonymous 60 requests an hour can run out.
+          GITHUB_TOKEN: ${{ github.token }}
+          # The commit to deploy in the end-to-end test: this one. (For a
+          # pull request, the branch head rather than GitHub's merge commit.)
+          DEPLOY_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPO_URL: https://github.com/${{ github.repository }}
         run: |
+          # A fresh key per run rather than one committed to the repo. It
+          # must stay the same for the whole step, across the restart below.
+          export PLATFORM_SECRET_KEY="$(openssl rand -hex 32)"
           docker compose up -d --build --wait --wait-timeout 180 || { docker compose ps -a; docker compose logs; exit 1; }
           curl -fsS http://127.0.0.1:8080/healthz
           # The dashboard sees the new services (proxy -> Docker works). Plain
@@ -153,9 +176,146 @@ jobs:
             [ "$i" = 10 ] && { docker compose logs dashboard; exit 1; }
             sleep 1
           done
-          # A restart (like a redeploy) keeps the volume and finds nothing
-          # left to migrate.
+          # The platform reaches Docker through its write proxy (logged in the
+          # background at startup, so allow it a few seconds).
+          for i in $(seq 1 10); do
+            docker compose logs --no-log-prefix platform | grep 'docker reachable' && break
+            [ "$i" = 10 ] && { docker compose logs platform; exit 1; }
+            sleep 1
+          done
+          # The write proxy allows what deploys need and refuses the rest,
+          # probed from a throwaway container on its network.
+          probe() {
+            docker run --rm --network dashboard_docker-rw curlimages/curl:8.11.1 \
+              -s -o /dev/null -w '%{http_code}' -X "$1" "http://docker-proxy-rw:2375$2"
+          }
+          test "$(probe GET /containers/json)" = 200
+          test "$(probe GET /images/json)" = 200
+          test "$(probe POST /exec/none/start)" = 403
+          test "$(probe GET /volumes)" = 403
+          test "$(probe GET /secrets)" = 403
+          # A real build through the write proxy, sent the way engine.Build
+          # sends it: the legacy builder (version=1), the context as the
+          # request body, a base image Docker has to pull. Unit tests use a
+          # fake daemon, so this is what proves builds work through /build
+          # alone. (BuildKit failed here with "no active sessions": it needs
+          # a client-side session to resolve base images.)
+          mkdir -p /tmp/build-probe
+          printf 'FROM busybox:1.37.0\nRUN echo built > /done\n' > /tmp/build-probe/Dockerfile
+          tar -C /tmp/build-probe -c Dockerfile | docker run --rm -i --network dashboard_docker-rw curlimages/curl:8.11.1 \
+            -sS --data-binary @- -H 'Content-Type: application/x-tar' \
+            'http://docker-proxy-rw:2375/build?version=1&t=ci-build-probe:latest' > /tmp/build-probe/out.json
+          if grep '"errorDetail"' /tmp/build-probe/out.json; then exit 1; fi
+          docker image inspect ci-build-probe:latest > /dev/null
+
+          # End to end, through the platform's API: register an app and
+          # deploy this very commit. The repo's own Dockerfile builds the
+          # dashboard image, which serves /healthz on 8080 without needing
+          # anything else, so it makes a fine test app.
+          api() {
+            docker run --rm --network dashboard_default curlimages/curl:8.11.1 -sS \
+              -X "$1" -H 'Content-Type: application/json' ${3:+--data "$3"} "http://platform:8081$2"
+          }
+          # Requests a visitor would make: from the apps network, via Caddy.
+          visit() {
+            docker run --rm --network platform-apps curlimages/curl:8.11.1 -sS --max-time 10 \
+              -H "Host: $1" "http://caddy$2"
+          }
+          # Deploys $1 and waits for it to finish, printing its final status.
+          deploy() {
+            id=$(api POST "/api/platform/apps/$APP/deployments" "{\"commitSha\":\"$1\"}" | jq -r .id)
+            for i in $(seq 1 180); do
+              status=$(api GET "/api/platform/apps/$APP/deployments" | jq -r ".[] | select(.id == $id) | .status")
+              case "$status" in healthy|failed) echo "$status"; return ;; esac
+              sleep 5
+            done
+            echo "timed out"
+          }
+          on_failure() {
+            api GET "/api/platform/apps/$APP" | jq .
+            docker compose logs platform caddy
+            exit 1
+          }
+
+          APP=$(api POST /api/platform/apps \
+            "{\"name\":\"selftest\",\"repoUrl\":\"$REPO_URL\",\"port\":8080,\"healthCheckPath\":\"/healthz\"}" | jq -r .id)
+          [ "$APP" != null ] || on_failure
+          api PUT "/api/platform/apps/$APP/env/GREETING" '{"value":"hello"}'
+
+          # First deploy: download, build, start, health-check via Caddy,
+          # route. Then a visitor reaches it by hostname.
+          [ "$(deploy "$DEPLOY_SHA")" = healthy ] || on_failure
+          visit selftest.apps.test /healthz | grep '"ok"' || on_failure
+
+          # Redeploy: the new container replaces the old one, which is
+          # removed once the route has switched.
+          [ "$(deploy "$DEPLOY_SHA")" = healthy ] || on_failure
+          test "$(docker ps -q --filter label=ops.platform.app=selftest | wc -l)" = 1 || on_failure
+
+          # A deploy that fails (a commit that doesn't exist) leaves the
+          # live version serving, and says why.
+          [ "$(deploy 0000000000000000000000000000000000000000)" = failed ] || on_failure
+          api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].error' | grep 'not found'
+          visit selftest.apps.test /healthz | grep '"ok"' || on_failure
+
+          # The published port, as a tailnet device reaches it (here on
+          # 127.0.0.1 rather than the Tailscale IP).
+          curl -fsS --max-time 10 -H 'Host: selftest.apps.test' http://127.0.0.1/healthz | grep '"ok"' || on_failure
+
+          # The dashboard forwards the platform's API (the Apps pages use
+          # it), and refuses changes a browser marks as cross-site (CSRF).
+          dash() {
+            curl -sS -X "$1" -H 'Content-Type: application/json' ${3:+--data "$3"} "http://127.0.0.1:8080$2"
+          }
+          dash GET /api/platform/apps | jq -e '.[] | select(.name == "selftest")' > /dev/null || on_failure
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Sec-Fetch-Site: cross-site' \
+            -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:8080/api/platform/apps)" = 403
+
+          # examples/hello, registered through the dashboard as the Apps page
+          # does it: built from a folder of the repo, with an env var.
+          APP=$(dash POST /api/platform/apps \
+            "{\"name\":\"hello\",\"repoUrl\":\"$REPO_URL\",\"sourceDir\":\"examples/hello\",\"port\":8080,\"healthCheckPath\":\"/healthz\"}" | jq -r .id)
+          [ "$APP" != null ] || on_failure
+          dash PUT "/api/platform/apps/$APP/env/GREETING" '{"value":"Howdy"}'
+          [ "$(deploy "$DEPLOY_SHA")" = healthy ] || on_failure
+          visit hello.apps.test / | grep 'Howdy from the platform' || on_failure
+
+          # A source directory that doesn't exist fails with a clear reason
+          # (found mid-stream, so this also checks the reason survives
+          # Docker's client).
+          APP=$(api POST /api/platform/apps \
+            "{\"name\":\"nodir\",\"repoUrl\":\"$REPO_URL\",\"sourceDir\":\"no/such/dir\",\"port\":8080}" | jq -r .id)
+          [ "$APP" != null ] || on_failure
+          [ "$(deploy "$DEPLOY_SHA")" = failed ] || on_failure
+          api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].error' | grep 'source directory not found' || on_failure
+
+          # Isolation: an app can reach neither Caddy's admin API nor the
+          # platform.
+          if docker run --rm --network platform-apps curlimages/curl:8.11.1 -s --max-time 5 http://caddy:2019/config/; then
+            echo "Caddy admin API reachable from the apps network"; exit 1
+          fi
+          if docker run --rm --network platform-apps curlimages/curl:8.11.1 -s --max-time 5 http://platform:8081/healthz; then
+            echo "platform reachable from the apps network"; exit 1
+          fi
+
+          # Restarts: Caddy comes back with its routes (--resume), and the
+          # platform comes back with nothing left to migrate, re-applies the
+          # routes, and leaves the live container alone.
+          docker compose restart caddy
+          sleep 2
+          visit selftest.apps.test /healthz | grep '"ok"' || on_failure
           docker compose restart platform
           docker compose up -d --wait --wait-timeout 60 platform
           docker compose logs --no-log-prefix platform | grep 'database schema up to date' | tail -1 | grep -F 'applied=[]'
+          for i in $(seq 1 15); do
+            docker compose logs --no-log-prefix platform | grep 'routes applied' && break
+            [ "$i" = 15 ] && on_failure
+            sleep 1
+          done
+          visit selftest.apps.test /healthz | grep '"ok"' || on_failure
+          test "$(docker ps -q --filter label=ops.platform.app=selftest | wc -l)" = 1 || on_failure
+
+          # App containers aren't Compose's, so remove them first, or the
+          # apps network can't be deleted.
+          docker rm -f $(docker ps -aq --filter label=ops.platform.managed=true)
           docker compose down -v

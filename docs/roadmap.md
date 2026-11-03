@@ -5,7 +5,7 @@ platform in [platform-plan.md](platform-plan.md) (P0 onwards, numbered after
 the plan's phases). Each numbered step is one small, reviewed commit. Design
 reasoning lives in [decisions/](decisions/).
 
-_Last updated: 2026-10-28_
+_Last updated: 2026-11-03_
 
 | Milestone | Status |
 |---|---|
@@ -13,18 +13,39 @@ _Last updated: 2026-10-28_
 | M2: Full container status | ✅ Done, deployed |
 | M3: Host stats | ✅ Done, deployed |
 | M4: Discord alerts | ⏸️ Deferred (not in v1; plan kept below) |
-| M5: Portfolio polish | 🚧 In progress (5.1–5.3 done, 5.4 dropped) |
-| M6: History sparklines | 🚧 Committed (`17f6f1e`); deploy not confirmed |
-| P0: Platform foundations | 🚧 In progress (0.1–0.3 green in CI on the `platform-p0` draft PR; 0.4 in review) |
+| M5: Portfolio polish | ⏸️ Set aside (5.1–5.3 done and deployed, 5.4 dropped, 5.5–5.6 set aside for the platform) |
+| M6: History sparklines | ✅ Done, deployed (with P0, 2026-11-02) |
+| P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
+| P1: Manual deploy of one app | 🚧 In progress (1.1–1.5 green in CI; 1.6 in review, then merge and deploy) |
 
-**Where we left off (2026-10-28):** platform work has started. M5's 5.5
-(README) and 5.6 (`v1.0.0` tag) are set aside for now (owner's call); the
-README gets rewritten for the platform later anyway. 5.1–5.3 and M6 are
-committed, but it isn't confirmed that they're deployed. P0's deploy step
-(0.4) ships them too, so its checks include theirs. The owner commits P0 as
-a whole at the end of the phase (squash-merging the `platform-p0` PR). Next:
-push 0.4 to the PR, check CI is green, squash-merge, deploy and run 0.4's
-server checks.
+**Where we left off (2026-11-03):** P0 is done and deployed (PR #1). P1 is
+on the `platform-p1` branch, with a draft PR that runs CI on each push. The
+owner commits and pushes after each step, and merges at the end of the
+phase. Steps 1.1–1.5 are green in CI. 1.6 (the Apps pages, the dashboard
+forwarding the platform API, Caddy published on the Tailscale IP,
+`sourceDir`, `examples/hello`) is written and passes locally; not pushed yet.
+**Next:** push 1.6 and get CI green. Then merge the PR, deploy on the server
+with the new `.env` values, run the owner's checks (step 1.6's row), and
+record the results here. That closes P1.
+
+Notes for resuming:
+- **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
+  to 6 steps). Within a step, keep going without stopping unless owner
+  action is needed. Only the owner commits.
+- **Undecided:** whether to let Claude commit and push to feature branches
+  (never `main`), with GitHub branch protection on `main` requiring a PR
+  and green CI. Suggested, not decided; leave commits to the owner until
+  they say so.
+- **CI vs the server:** CI's Docker is 28.0.4 and the server's is 29.8.1, so
+  the server deploy in 1.6 is the final check (the legacy builder exists in
+  both).
+- **Not yet done from P0:** the platform's baseline memory footprint
+  (`docker stats --no-stream dashboard-platform-1 dashboard-postgres-1` on
+  the server; a measured number the plan asks for), and a reboot test of the
+  P0 services. Both fit naturally into 1.6's server checks, which include a
+  reboot anyway.
+- M5's 5.5 (README) and 5.6 (`v1.0.0` tag) are set aside; the README gets
+  rewritten for the platform later.
 
 ## M1: Thinnest end-to-end slice ✅
 
@@ -139,7 +160,7 @@ Draft decisions (not approved):
   dropped. No persistence: a restart forgets pending alerts, which is fine for
   a home server.
 
-## M5: Portfolio polish 🚧
+## M5: Portfolio polish ⏸️
 
 **Goal:** someone landing on the GitHub repo understands what it is, how it's
 built and why, in a couple of minutes, and the deploy is a bit more robust.
@@ -166,7 +187,7 @@ Decisions (approved 2026-10-01):
 - **No image publishing** (e.g. to GHCR) for now: the server builds from
   source, so a registry would add moving parts for no gain.
 
-## M6: History sparklines 🚧
+## M6: History sparklines ✅
 
 Post-v1 scope (see [spec.md](spec.md)), but started before `v1.0.0` was
 tagged, at the owner's request. Plan approved 2026-10-06.
@@ -205,7 +226,7 @@ Decisions (approved 2026-10-06):
 - **No chart library.** A sparkline is ~40 lines of SVG; Recharts or similar
   would add far more bundle than it saves.
 
-## P0: Platform foundations 🚧
+## P0: Platform foundations ✅
 
 Phase 0 of [platform-plan.md](platform-plan.md). Plan approved 2026-10-28;
 decisions in [decisions/platform.md](decisions/platform.md).
@@ -217,10 +238,10 @@ now, so database tests skip locally and run in CI.
 
 | Step | What | Status |
 |---|---|---|
-| 0.1 | Docs: decision log ([decisions/platform.md](decisions/platform.md)), this milestone, spec note. No code. | ✅ Not committed |
-| 0.2 | `cmd/platform` skeleton (`/healthz`, `-healthcheck`, `DATABASE_URL` config) and `internal/store`: `pgx` pool and the embedded migration runner (advisory lock, one transaction per file, `schema_migrations`). First migration creates `apps`. Unit tests for anything that doesn't need a database; database tests skip without `DATABASE_URL`. Dockerfile builds both binaries. | ✅ Reviewed, not committed. Also: the healthcheck moved to `internal/healthcheck` for both binaries; the platform waits for Postgres with backoff before migrating and listening; a database newer than the binary is refused. Database tests written but not yet run (they need 0.3's CI). |
+| 0.1 | Docs: decision log ([decisions/platform.md](decisions/platform.md)), this milestone, spec note. No code. | ✅ `8595b2a` |
+| 0.2 | `cmd/platform` skeleton (`/healthz`, `-healthcheck`, `DATABASE_URL` config) and `internal/store`: `pgx` pool and the embedded migration runner (advisory lock, one transaction per file, `schema_migrations`). First migration creates `apps`. Unit tests for anything that doesn't need a database; database tests skip without `DATABASE_URL`. Dockerfile builds both binaries. | ✅ `8595b2a`. Also: the healthcheck moved to `internal/healthcheck` for both binaries; the platform waits for Postgres with backoff before migrating and listening; a database newer than the binary is refused. Database tests first ran in 0.3's CI, green. |
 | 0.3 | CI: a Postgres service container so the database tests run (migrations apply, re-running does nothing, concurrent runs are serialized by the lock). The image job also checks the platform binary is in the image. | ✅ Green in CI (draft PR, `8595b2a`). `postgres:18.6` (newest; there's no 19 image yet), the same tag 0.4's compose will pin. Database tests fail instead of skipping if `CI` is set without `DATABASE_URL`. `cache-dependency-path` is now `go.sum`. The image job goes beyond checking the binary exists: it starts `/platform` before its Postgres, so the smoke test also covers waiting for the database, then migrating and passing its healthcheck. |
-| 0.4 | Compose: `postgres` (pinned, named volume, memory limit, internal `platform-db` network, no published port) and `platform` services; `.env.example` and README config table. The platform has no Docker access yet (that arrives with its write proxy in P1). Deploy; owner checks the platform is healthy, migrations ran, and the dashboard is unchanged. | 🚧 In review; CI not yet run. Memory limits 128 MB (platform) and 512 MB (Postgres); volume at `/var/lib/postgresql` (Postgres 18's layout); `start_interval` so services report healthy within seconds; a 1-minute stop grace period for Postgres. CI gains a "Compose stack" step: `docker compose up --wait` of the real file, checks the dashboard lists the new containers, restarts the platform and checks it finds nothing left to migrate. |
+| 0.4 | Compose: `postgres` (pinned, named volume, memory limit, internal `platform-db` network, no published port) and `platform` services; `.env.example` and README config table. The platform has no Docker access yet (that arrives with its write proxy in P1). Deploy; owner checks the platform is healthy, migrations ran, and the dashboard is unchanged. | ✅ `2666fae`, deployed 2026-11-02; owner confirmed the server checks. Memory limits 128 MB (platform) and 512 MB (Postgres); volume at `/var/lib/postgresql` (Postgres 18's layout); `start_interval` so services report healthy within seconds; a 1-minute stop grace period for Postgres. CI gains a "Compose stack" step: `docker compose up --wait` of the real file, checks the dashboard lists the new containers, restarts the platform and checks it finds nothing left to migrate. |
 
 Decisions (approved 2026-10-28): see
 [decisions/platform.md](decisions/platform.md). In short: a separate service
@@ -229,15 +250,109 @@ in the same module and image; the dashboard stays read-only and forwards
 Docker SDK for the platform only; Postgres reachable only from the platform;
 `pgx`; an embedded migration runner; real-Postgres tests in CI.
 
+## P1: Manual deploy of one app 🚧
+
+Phase 1 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-02
+(owner: "get started", taking the recommended option for each choice below).
+
+**Goal (definition of done):** register a sample app in the dashboard, click
+Deploy, and reach it at its own hostname from any device on the tailnet, with
+the dashboard still working as before and nothing new reachable from the LAN
+or the internet.
+
+Changed 2026-11-02 (owner's call): no domain yet, so P1 apps get
+`<app>.<tailscale-ip-with-dashes>.sslip.io` hostnames. sslip.io is a free
+public DNS service that resolves any name containing an IP to that IP, so
+every app has its own hostname with no domain or DNS setup, reachable only
+over Tailscale. Caddy routes by hostname either way, so going public later
+(a domain on Cloudflare plus cloudflared, likely by P5 for pokewordle) is a
+config change, not a code change.
+
+**How it fits together:**
+
+```
+you ──tailscale──► dashboard ──/api/platform/*──► platform ──► Postgres
+                                                     ├──► docker-proxy-rw ──► Docker
+                                                     ├──► Caddy admin API (:2019, internal)
+                                                     └──► GitHub (code tarball at a commit)
+tailnet ──► <app>.<ip>.sslip.io ──► Caddy :80 (bound to the Tailscale IP) ──► app containers (apps network)
+(later)  public ──► Cloudflare ──tunnel──► cloudflared ──► Caddy :80
+```
+
+Deploy flow (one `deployments` row per attempt): `queued` → download the
+repo at the exact commit → build its Dockerfile, tagged `<app>:<sha>`
+(`building`) → start a container with platform labels, decrypted env vars and
+the app's limits, on the `apps` network only (`starting`) → point the app's
+Caddy route at it and stop the previous one (`healthy`), or `failed` with an
+error.
+
+| Step | What | Status |
+|---|---|---|
+| 1.1 | This plan; decision entries. No code. | ✅ `3763550`; amended 2026-11-02 for the no-domain approach |
+| 1.2 | Docker access for the platform: `docker-proxy-rw` (its own internal network; `POST=1` with only `CONTAINERS`, `IMAGES`, `BUILD`, `NETWORKS`), the official SDK (`github.com/moby/moby/client`) behind `internal/engine`, `tcp://` only. The platform logs the Docker version at startup (best effort, non-fatal). No container operations yet. | ✅ `3763550`, green in CI (incl. the proxy probes). The SDK adds ~18 indirect modules (mostly OpenTelemetry and OCI types) but only ~0.5 MB to the binary. CI probes the proxy's rules from a container on its network (containers/images 200; exec, volumes, secrets 403). Also: `.gitattributes` keeps `.go` files LF, since Git for Windows' `autocrlf` checked P0's files out with CRLF and broke the local `gofmt` check. |
+| 1.3 | Migrations: `deployments` (status, commit, image, timestamps, error) and `app_env_vars` (AES-256-GCM encrypted values; key `PLATFORM_SECRET_KEY` from `.env`); `internal/secrets` for encryption, the app ID bound in as associated data so a value can't be moved to another app. Store methods for apps, env vars and deployments. | ✅ Green in CI. The key name is bound in as well as the app ID. The two rules "one deploy in progress per app" and "one live deployment per app" are partial unique indexes; status changes are conditional `UPDATE`s, so they only move forward. `PLATFORM_SECRET_KEY` is required (the platform won't start without it). At startup the platform marks deployments left in progress as failed ("interrupted"), which stops a lost deploy from blocking the app forever. |
+| 1.4 | **Build and run** (was 1.4 + 1.5). `internal/source`: download GitHub's tarball for a commit (download and unpacked size caps, public repos only for now) and stream it, re-packed, as a build context. `internal/engine`: build with Docker's legacy builder through `/build` (`version=1`, context in the request body; BuildKit needs a session, see risks), image `<app>:<sha>`, the build's error kept as a `BuildError`; run an app container (platform labels, limits, decrypted env, one network, `unless-stopped` until P4) and stop/remove it; list the platform's containers by label. Health-checking moved to 1.5 (it goes through Caddy). Tested against fakes and `httptest`. | ✅ Green in CI, including a real build through the proxy. Every app container also gets fixed hardening the caller can't override: no privileged mode, mounts or published ports; `no-new-privileges`; a 512-process limit; rotated logs (3 × 10 MB). The platform joins the compose default network for internet access (GitHub). CI does a real build through the write proxy. The first CI run proved BuildKit can't build there without a session, so builds use the legacy builder (see risks). |
+| 1.5 | **Route and deploy** (was 1.6 + 1.7). Caddy: a pinned service, its admin API only on an internal network apps can't reach, `internal/router` to add/replace/remove an app's route, all routes re-applied at platform startup. Health checks go through Caddy: a temporary probe route per new deployment, so the platform never joins the apps network. The deploy orchestration (one goroutine per deploy, status written at each stage) and the platform API: create/list/get apps, set/delete env vars (values never returned), trigger a deploy of a commit, list deployments. | ✅ `047ed91`, `8542ca3` (CI fix), green in CI. Caddy's admin API binds a fixed IP on an internal network only the platform shares (apps can't reach it). `Apply` replaces Caddy's whole app server from the database each time (declarative). Caddy runs with `--resume`. Startup re-applies routes and removes orphaned app containers. API bodies must be JSON (blocks simple cross-site requests; the dashboard adds an origin check in 1.6). Optional `GITHUB_TOKEN`, sent to the API only (stripped on redirects, by an explicit check). CI now deploys this very commit end to end through the API and Caddy: redeploy, failed deploy (site stays up), isolation and restarts. |
+| 1.6 | **Dashboard and go live** (was 1.8 + 1.9). The dashboard forwards `/api/platform/*` to the platform; frontend routing; Apps list and App detail pages (current deployment and status, Deploy button, env var names). Caddy published on the server's Tailscale IP only (`APPS_DOMAIN` and the IP in `.env`), an `examples/hello` sample app. Merge, deploy, and the owner checks the definition of done from a tailnet device, including a reboot. cloudflared waits for a domain. || 🚧 In review; CI not yet run. The dashboard forwards with `httputil.ReverseProxy` behind `http.CrossOriginProtection`. Hash routing, no library. Apps can be built from a folder of their repo (`sourceDir`, migration 0004), which `examples/hello` needs. Caddy is published on `APPS_LISTEN_IP` (required, no default). A deploy reports the code stream's own error (missing folder, too large) rather than Docker's. CI adds: the published port, forwarding and the CSRF check through the dashboard, deploying `examples/hello` with an env var, and a missing `sourceDir`. Owner checks on the server still to do. |
+
+Decisions (approved 2026-11-02), with entries in
+[decisions/platform.md](decisions/platform.md):
+- **Code via GitHub's tarball API**, not `go-git` or letting Docker clone:
+  no git dependency, pinned to an exact SHA, and the platform controls the
+  build context (size limit).
+- **Caddy via its admin API**, not Traefik's label discovery: the platform
+  owns routing as code, and Traefik would need Docker access of its own.
+- **Deploys run in a goroutine in P1.** Known gap: a platform restart
+  mid-deploy leaves the deployment stuck in `building`/`starting`. P2's
+  Postgres job queue fixes it; the before/after is part of the story.
+- **Docker's `unless-stopped` restarts crashed apps until P4.** Without it a
+  crashed app would stay down until the reconciler exists.
+- **Network isolation:** apps are only on `apps` (shared with Caddy). They
+  can't reach the platform, Postgres, the proxies or Caddy's admin API.
+- **Frontend routing:** small and dependency-free if it stays at two or three
+  pages; revisited in 1.6.
+
+Risks to check early:
+- **Building through the API** (resolved 2026-11-03 by CI, after a wrong
+  first call). The plan was BuildKit (`version=2`): Docker's source showed it
+  reads the build context from the request body with no session. True, but
+  CI's real build then failed with `no active sessions`: BuildKit also needs
+  a client-side session to look up the `FROM` image in the registry, even a
+  public one. Decision: the legacy builder (`version=1`), which pulls base
+  images itself through `/build` alone. It's deprecated (Docker 23, no
+  removal date), lacks newer Dockerfile features such as `RUN --mount`, and
+  its progress is plain text. Upgrade path, if an app needs BuildKit: a
+  session in Go (`moby/buildkit`'s session package) and the proxy's
+  `SESSION` group, changing only `engine.Build`. CI's compose step does a
+  real build through the write proxy.
+- **Publishing Caddy on the Tailscale IP.** If Docker starts before
+  Tailscale has its IP after a reboot, binding to that IP fails and Caddy
+  won't start. 1.6 checks this with a real reboot and picks a fix if needed
+  (e.g. a systemd ordering override, or `tailscale serve` in front instead).
+
+Steps regrouped 2026-11-02 at the owner's request (fewer push/review
+rounds): the original 1.4–1.9 became 1.4–1.6, each pairing two steps that
+touch the same part of the system and are checked the same way.
+
 ## Open questions
 
-None right now.
+- **Domain for public apps** (deferred, not blocking P1). The owner will
+  probably buy one (Cloudflare Registrar, cost price) when something needs to
+  be public, likely pokewordle in P5. One domain covers every public site via
+  subdomains. `pokewordle.sashasagebd.workers.dev` is Cloudflare's free
+  Workers subdomain and can't carry a tunnel or per-app hostnames. Also worth
+  checking then: whether pokewordle's Worker could reach its backend through
+  a tunnel without a public hostname (Cloudflare "Workers VPC").
 
 Resolved:
 - **M2 plan** approved 2026-10-01.
 - **M3 plan** approved 2026-10-01.
 - **M5 plan** approved 2026-10-01; 5.4 (demo mode) dropped 2026-10-06.
 - **M6 plan** approved 2026-10-06.
+- **P0 plan** approved 2026-10-28.
+- **P1 plan** approved 2026-11-02.
+- **Docker version on the server** (2026-11-02): 29.8.1, API 1.56; see P1's
+  risks for what it means for building.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
   `Dockerfile` and `compose.yaml`). It wasn't started; it was brought up with
   `docker compose up -d` on 2026-10-01 and the dashboard shows it with no code

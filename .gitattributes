@@ -1,0 +1,3 @@
+# gofmt requires LF. Git for Windows defaults to core.autocrlf=true, which
+# would check Go files out with CRLF and make `gofmt -l` flag every one.
+*.go text eol=lf

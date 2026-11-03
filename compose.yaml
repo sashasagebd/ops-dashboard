@@ -12,10 +12,12 @@ services:
     environment:
       DOCKER_HOST: tcp://docker-proxy:2375
       POLL_INTERVAL: ${POLL_INTERVAL:-5s}
+      # The dashboard forwards /api/platform/ here (the Apps pages).
+      PLATFORM_URL: http://platform:8081
     depends_on:
       - docker-proxy
     networks:
-      - default # for the published port
+      - default # for the published port, and to reach the platform
       - docker-api # to reach the socket proxy
     # Hardening: the app writes nothing to disk and needs no Linux capabilities.
     read_only: true
@@ -42,9 +44,8 @@ services:
 
   # The deploy platform's control plane (docs/platform-plan.md). Same image
   # as the dashboard, different binary. A separate service so monitoring
-  # keeps working when the platform doesn't (docs/decisions/platform.md).
-  # No Docker access and no published port yet: P1 adds both its own socket
-  # proxy and the dashboard's route to it.
+  # keeps working when the platform doesn't, and so only the platform can
+  # write to Docker (docs/decisions/platform.md). No published port.
   platform:
     build: .
     entrypoint: ["/platform"]
@@ -53,6 +54,17 @@ services:
       # Hex passwords (see .env.example) need no escaping in a URL. No TLS:
       # the connection never leaves the internal platform-db network.
       DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/platform?sslmode=disable
+      DOCKER_HOST: tcp://docker-proxy-rw:2375
+      # Encrypts app env vars in the database. Losing it means losing every
+      # stored env var value (see .env.example).
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?set PLATFORM_SECRET_KEY in .env}
+      # Apps are served at <name>.<APPS_DOMAIN> (see .env.example).
+      APPS_DOMAIN: ${APPS_DOMAIN:?set APPS_DOMAIN in .env}
+      # Optional: raises GitHub's rate limit and allows private repos.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      APPS_NETWORK: platform-apps
+      CADDY_ADMIN_URL: http://10.203.0.2:2019
+      CADDY_PROXY_URL: http://10.203.0.2:80
     # The image's HEALTHCHECK is the dashboard's, so it's replaced here. The
     # platform only listens once Postgres answers and migrations have run,
     # hence the longer start period.
@@ -70,10 +82,81 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      docker-proxy-rw:
+        condition: service_started
     networks:
       - platform-db
+      - docker-rw
+      - caddy-admin
+      # The project's default network, which (unlike the internal ones) has
+      # internet access: the platform downloads app code from GitHub. It's
+      # also how the dashboard reaches the platform's API. Apps are never on
+      # it.
+      - default
     read_only: true
     cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+
+  # The platform's socket proxy. Unlike the dashboard's, it allows writes:
+  # building images and creating, starting, stopping and removing
+  # containers. With POST=1 the proxy allows every method on each enabled
+  # group, so the protection is enabling as few groups as possible (exec,
+  # volumes, swarm, secrets and the rest stay off) plus only the platform
+  # being able to reach it. Creating containers is still root-equivalent on
+  # the host; see docs/decisions/platform.md.
+  docker-proxy-rw:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: unless-stopped
+    environment:
+      POST: 1
+      CONTAINERS: 1
+      IMAGES: 1
+      BUILD: 1
+      NETWORKS: 1
+    volumes:
+      # :ro doesn't restrict the API (see docker-proxy); it only stops this
+      # container replacing the socket file itself.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-rw
+    security_opt: ["no-new-privileges:true"]
+
+  # Receives all traffic for deployed apps and routes it by hostname. The
+  # platform owns its routes and sets them through the admin API; this
+  # service only bootstraps an empty config (caddy/caddy.json). --resume
+  # restarts Caddy with its last config (autosaved in the config volume), so
+  # routes survive a Caddy restart; the platform also re-sends them whenever
+  # it starts.
+  caddy:
+    image: caddy:2.11.7
+    restart: unless-stopped
+    command: ["caddy", "run", "--config", "/etc/caddy/caddy.json", "--resume"]
+    ports:
+      # Apps are reached at http://<name>.<APPS_DOMAIN>, which resolves to
+      # this IP. On the server it's the Tailscale IP, so only tailnet devices
+      # can connect: that address exists only on the tailscale0 interface.
+      # Never 0.0.0.0, which would put every app on the LAN (Docker bypasses
+      # UFW). Port 80 inside is Caddy's proxy side only; the admin API is on
+      # 10.203.0.2:2019 and isn't published.
+      - "${APPS_LISTEN_IP:?set APPS_LISTEN_IP in .env}:80:80"
+    volumes:
+      - ./caddy/caddy.json:/etc/caddy/caddy.json:ro
+      - caddy-config:/config
+      - caddy-data:/data
+    networks:
+      # Its proxy side: the only network apps are on.
+      apps: {}
+      # Its admin side. The admin API has no authentication, so it listens
+      # only on this fixed address (see caddy/caddy.json), on a network only
+      # the platform shares. Caddy is also on the apps network, and binding
+      # the admin API to every interface would let any app reconfigure it.
+      caddy-admin:
+        ipv4_address: 10.203.0.2
+    cap_drop: [ALL]
+    # The image's caddy binary carries this file capability; with it outside
+    # the container's capability set, Linux refuses to run the binary at all.
+    cap_add: [NET_BIND_SERVICE]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 128m
 
@@ -117,8 +200,29 @@ networks:
     # Only the platform and Postgres are on it, so Postgres has no published
     # port and nothing else can reach it.
     internal: true
+  docker-rw:
+    # Only the platform and its write proxy: nothing else (in particular, no
+    # deployed app) can reach the proxy that creates containers.
+    internal: true
+  caddy-admin:
+    # Only the platform and Caddy. A fixed subnet so Caddy's admin API can
+    # bind to one known address. 10.203.0.0/29 is outside Docker's default
+    # address pools (172.17-31.x, 192.168.x), so it can't collide with
+    # networks Docker creates on its own.
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.203.0.0/29
+  apps:
+    # Every deployed app, and Caddy's proxy side; nothing else. The platform
+    # creates app containers on it by this fixed name. Not internal: apps
+    # may call out to the internet (APIs, package registries).
+    name: platform-apps
 
 volumes:
   # The platform's database. `docker compose down` keeps it; only
   # `docker compose down -v` (or `docker volume rm`) deletes it.
   platform-db:
+  # Caddy's autosaved config (for --resume) and its data directory.
+  caddy-config:
+  caddy-data:

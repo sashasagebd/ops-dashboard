@@ -5,8 +5,8 @@ import { defineConfig } from 'vitest/config'
 // has no Docker on a dev PC; point it at the deployed dashboard to work on the
 // UI with real data, e.g.
 //   API_TARGET=https://homelab.<tailnet>.ts.net npm run dev
-// That's safe: the API is read-only, and the URL is only reachable on the
-// tailnet.
+// The URL is only reachable on the tailnet. Careful on the Apps pages,
+// though: they act on the real platform (deploys, env vars) from there too.
 const apiTarget = process.env.API_TARGET ?? 'http://localhost:8080'
 
 // https://vite.dev/config/

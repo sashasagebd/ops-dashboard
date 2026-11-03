@@ -1,0 +1,118 @@
+package router
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestApplyReplacesRoutes(t *testing.T) {
+	var gotMethod, gotPath, gotType string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotType = r.Method, r.URL.Path, r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	err := c.Apply(t.Context(), []Route{
+		{Host: "hello.apps.test", Upstream: "app-hello-7:8080"},
+		{Host: "probe-8.platform.internal", Upstream: "app-hello-8:8080"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotMethod != http.MethodPatch || gotPath != serverPath || gotType != "application/json" {
+		t.Errorf("request = %s %s (%s), want PATCH %s (application/json)", gotMethod, gotPath, gotType, serverPath)
+	}
+	// Checked as Caddy will read it, not against our own structs.
+	var server struct {
+		Listen         []string        `json:"listen"`
+		Routes         json.RawMessage `json:"routes"`
+		AutomaticHTTPS struct {
+			Disable bool `json:"disable"`
+		} `json:"automatic_https"`
+	}
+	if err := json.Unmarshal(gotBody, &server); err != nil {
+		t.Fatalf("body %s: %v", gotBody, err)
+	}
+	if len(server.Listen) != 1 || server.Listen[0] != ":80" || !server.AutomaticHTTPS.Disable {
+		t.Errorf("server = %s, want listen [:80] and automatic HTTPS off", gotBody)
+	}
+	var routes []struct {
+		Match []struct {
+			Host []string `json:"host"`
+		} `json:"match"`
+		Handle []struct {
+			Handler   string `json:"handler"`
+			Upstreams []struct {
+				Dial string `json:"dial"`
+			} `json:"upstreams"`
+		} `json:"handle"`
+		Terminal bool `json:"terminal"`
+	}
+	if err := json.Unmarshal(server.Routes, &routes); err != nil {
+		t.Fatalf("routes %s: %v", server.Routes, err)
+	}
+	if len(routes) != 2 {
+		t.Fatalf("got %d routes, want 2: %s", len(routes), gotBody)
+	}
+	r := routes[0]
+	if r.Match[0].Host[0] != "hello.apps.test" || r.Handle[0].Handler != "reverse_proxy" ||
+		r.Handle[0].Upstreams[0].Dial != "app-hello-7:8080" || !r.Terminal {
+		t.Errorf("first route = %+v", r)
+	}
+}
+
+func TestApplyEmptyListIsAnEmptyArray(t *testing.T) {
+	// Caddy needs [] to clear the routes; null would be rejected.
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+	}))
+	defer srv.Close()
+
+	if err := New(srv.URL, "").Apply(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotBody, `"routes":[]`) {
+		t.Errorf("body = %q, want routes []", gotBody)
+	}
+}
+
+func TestApplyReportsCaddyErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"loading new config: bad dial address"}`, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	if err := New(srv.URL, "").Apply(t.Context(), []Route{{Host: "x", Upstream: "y"}}); err == nil {
+		t.Error("Apply succeeded although Caddy refused the config")
+	}
+}
+
+func TestProbeSendsHostAndDoesNotFollowRedirects(t *testing.T) {
+	var gotHost, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost, gotPath = r.Host, r.URL.Path
+		http.Redirect(w, r, "/login", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	status, err := New("", srv.URL).Probe(t.Context(), "probe-8.platform.internal", "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHost != "probe-8.platform.internal" || gotPath != "/healthz" {
+		t.Errorf("probe went to Host %q path %q", gotHost, gotPath)
+	}
+	if status != http.StatusFound {
+		t.Errorf("status = %d, want 302 (not followed)", status)
+	}
+}

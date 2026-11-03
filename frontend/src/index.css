@@ -12,6 +12,7 @@
   --bar-ok: #3b6fd8;
   --bar-warn: #d99a00;
   --bar-high: #c4320a;
+  --link: #2f5fc4;
 
   --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
   --mono: ui-monospace, Consolas, monospace;
@@ -37,6 +38,7 @@
     --bar-ok: #7aa2ff;
     --bar-warn: #ffc247;
     --bar-high: #ff8a80;
+    --link: #8fb0ff;
   }
 }
 
@@ -50,7 +52,7 @@ main {
   padding: 24px 16px;
 }
 
-/* Title on the left, trend period toggle on the right; wraps on phones. */
+/* Title on the left, page links on the right; wraps on phones. */
 .page-header {
   display: flex;
   flex-wrap: wrap;
@@ -276,4 +278,149 @@ th {
 
 .cell-trend > span {
   min-width: 4.5em;
+}
+
+/* Page links in the header. */
+.nav {
+  display: flex;
+  gap: 16px;
+}
+
+a {
+  color: var(--link);
+}
+
+.nav a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.nav a[aria-current='page'] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* The trend period toggle, above the containers page's first section. */
+.page-tools {
+  display: flex;
+  justify-content: flex-end;
+}
+
+h3 {
+  font-size: 1rem;
+  margin: 20px 0 8px;
+}
+
+.badge-neutral {
+  color: var(--muted);
+  background: var(--border);
+}
+
+/* Label/value pairs on an app's page. */
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0;
+}
+
+.facts dt {
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+input,
+button {
+  font: inherit;
+  color: inherit;
+}
+
+input {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+button {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--border);
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+/* The register form: one field per row. */
+.form {
+  display: grid;
+  gap: 12px;
+  max-width: 480px;
+}
+
+.field {
+  display: grid;
+  gap: 2px;
+}
+
+.field > span:first-child {
+  font-weight: 500;
+}
+
+.field-hint {
+  font-size: 0.8125rem;
+}
+
+/* A row of inputs and a button (deploy, env vars), wrapping on phones. */
+.form-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.env-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+}
+
+.env-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  max-width: 480px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.deploy-error,
+.action-error {
+  color: var(--down);
+  font-size: 0.875rem;
+}
+
+.action-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+/* Read by screen readers, not shown. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
