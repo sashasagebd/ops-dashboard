@@ -22,6 +22,7 @@ import (
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
 
@@ -57,7 +58,19 @@ func run(addr string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(databaseURL)
+	// Encrypts app env vars at rest. Required, and never defaulted: a
+	// generated key would be lost on restart, along with every value
+	// encrypted under it.
+	key, err := secrets.ParseKey(os.Getenv("PLATFORM_SECRET_KEY"))
+	if err != nil {
+		return fmt.Errorf("PLATFORM_SECRET_KEY: %w", err)
+	}
+	box, err := secrets.New(key)
+	if err != nil {
+		return err
+	}
+
+	st, err := store.Open(databaseURL, box)
 	if err != nil {
 		return err
 	}
@@ -88,6 +101,18 @@ func run(addr string) error {
 		return fmt.Errorf("migrating the database: %w", err)
 	}
 	slog.Info("database schema up to date", "applied", applied)
+
+	// Nothing is deploying yet at this point, so any deployment still marked
+	// in progress was cut off by the platform stopping. In P1 nothing can
+	// resume it, so it's failed (which also unblocks the app's next deploy).
+	// P2's job queue retries it instead.
+	interrupted, err := st.FailInterruptedDeployments(ctx, "interrupted: the platform restarted during this deploy")
+	if err != nil {
+		return fmt.Errorf("clearing interrupted deployments: %w", err)
+	}
+	if interrupted > 0 {
+		slog.Warn("marked interrupted deployments failed", "count", interrupted)
+	}
 
 	// Only listen once the database is ready, so /healthz passing means the
 	// platform started up fully.

@@ -53,6 +53,9 @@ services:
       # the connection never leaves the internal platform-db network.
       DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/platform?sslmode=disable
       DOCKER_HOST: tcp://docker-proxy-rw:2375
+      # Encrypts app env vars in the database. Losing it means losing every
+      # stored env var value (see .env.example).
+      PLATFORM_SECRET_KEY: ${PLATFORM_SECRET_KEY:?set PLATFORM_SECRET_KEY in .env}
     # The image's HEALTHCHECK is the dashboard's, so it's replaced here. The
     # platform only listens once Postgres answers and migrations have run,
     # hence the longer start period.

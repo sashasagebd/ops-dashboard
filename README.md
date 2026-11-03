@@ -87,6 +87,7 @@ cd frontend && npm run lint && npm test && npm run build
 | `DATABASE_URL` | required | platform: Postgres connection URL (compose builds it from `POSTGRES_PASSWORD`). Database tests in `internal/store` also use it, and skip without it. |
 | `DASHBOARD_PORT` | `8080` | compose: host port, always bound to `127.0.0.1` |
 | `POSTGRES_PASSWORD` | required | compose: password for the platform's Postgres; `openssl rand -hex 32`. Only read when the database volume is first created. |
+| `PLATFORM_SECRET_KEY` | required | platform: key that encrypts app env vars (AES-256-GCM); `openssl rand -hex 32`. Back it up: without it, stored env var values are unrecoverable. |
 | `API_TARGET` | `http://localhost:8080` | frontend dev server only: where `npm run dev` forwards `/api` |
 
 ## Deploying to the server
@@ -99,6 +100,8 @@ git clone https://github.com/sashasagebd/ops-dashboard.git ~/apps/dashboard
 cd ~/apps/dashboard
 cp .env.example .env        # adjust DASHBOARD_PORT if 8080 is taken
 sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 32)/" .env
+sed -i "s/^PLATFORM_SECRET_KEY=.*/PLATFORM_SECRET_KEY=$(openssl rand -hex 32)/" .env
+grep PLATFORM_SECRET_KEY .env   # copy this into a password manager
 docker compose up -d --build
 ```
 

@@ -16,7 +16,7 @@ _Last updated: 2026-11-02_
 | M5: Portfolio polish | ⏸️ Set aside (5.1–5.3 done and deployed, 5.4 dropped, 5.5–5.6 set aside for the platform) |
 | M6: History sparklines | ✅ Done, deployed (with P0, 2026-11-02) |
 | P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
-| P1: Manual deploy of one app | 🚧 In progress (plan approved 2026-11-02; 1.1–1.2 in review) |
+| P1: Manual deploy of one app | 🚧 In progress (1.1–1.2 committed `3763550`; 1.3 in review) |
 
 **Where we left off (2026-11-02):** Phase 0 of the platform is done and
 deployed (PR #1, merged as `93ccef8`): the `platform` service and its Postgres
@@ -236,8 +236,17 @@ Phase 1 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-02
 (owner: "get started", taking the recommended option for each choice below).
 
 **Goal (definition of done):** register a sample app in the dashboard, click
-Deploy, and reach it at `<app>.<domain>` over the public internet, with the
-dashboard still working as before and nothing new reachable from the LAN.
+Deploy, and reach it at its own hostname from any device on the tailnet, with
+the dashboard still working as before and nothing new reachable from the LAN
+or the internet.
+
+Changed 2026-11-02 (owner's call): no domain yet, so P1 apps get
+`<app>.<tailscale-ip-with-dashes>.sslip.io` hostnames. sslip.io is a free
+public DNS service that resolves any name containing an IP to that IP, so
+every app has its own hostname with no domain or DNS setup, reachable only
+over Tailscale. Caddy routes by hostname either way, so going public later
+(a domain on Cloudflare plus cloudflared, likely by P5 for pokewordle) is a
+config change, not a code change.
 
 **How it fits together:**
 
@@ -246,7 +255,8 @@ you ──tailscale──► dashboard ──/api/platform/*──► platform �
                                                      ├──► docker-proxy-rw ──► Docker
                                                      ├──► Caddy admin API (:2019, internal)
                                                      └──► GitHub (code tarball at a commit)
-public ──► Cloudflare ──tunnel──► cloudflared ──► Caddy :80 ──► app containers (apps network)
+tailnet ──► <app>.<ip>.sslip.io ──► Caddy :80 (bound to the Tailscale IP) ──► app containers (apps network)
+(later)  public ──► Cloudflare ──tunnel──► cloudflared ──► Caddy :80
 ```
 
 Deploy flow (one `deployments` row per attempt): `queued` → download the
@@ -258,15 +268,15 @@ error.
 
 | Step | What | Status |
 |---|---|---|
-| 1.1 | This plan; decision entries. No code. | 🚧 In review, not committed |
-| 1.2 | Docker access for the platform: `docker-proxy-rw` (its own internal network; `POST=1` with only `CONTAINERS`, `IMAGES`, `BUILD`, `NETWORKS`), the official SDK (`github.com/moby/moby/client`) behind `internal/engine`, `tcp://` only. The platform logs the Docker version at startup (best effort, non-fatal). No container operations yet. | 🚧 In review, not committed; CI not yet run. The SDK adds ~18 indirect modules (mostly OpenTelemetry and OCI types) but only ~0.5 MB to the binary. CI probes the proxy's rules from a container on its network (containers/images 200; exec, volumes, secrets 403). Also: `.gitattributes` keeps `.go` files LF, since Git for Windows' `autocrlf` checked P0's files out with CRLF and broke the local `gofmt` check. |
-| 1.3 | Migrations: `deployments` (status, commit, image, timestamps, error) and `app_env_vars` (AES-256-GCM encrypted values; key `PLATFORM_SECRET_KEY` from `.env`); `internal/secrets` for encryption, the app ID bound in as associated data so a value can't be moved to another app. Store methods for apps, env vars and deployments. | |
+| 1.1 | This plan; decision entries. No code. | ✅ `3763550`; amended 2026-11-02 for the no-domain approach |
+| 1.2 | Docker access for the platform: `docker-proxy-rw` (its own internal network; `POST=1` with only `CONTAINERS`, `IMAGES`, `BUILD`, `NETWORKS`), the official SDK (`github.com/moby/moby/client`) behind `internal/engine`, `tcp://` only. The platform logs the Docker version at startup (best effort, non-fatal). No container operations yet. | ✅ `3763550`; CI on the draft PR not yet confirmed by the owner. The SDK adds ~18 indirect modules (mostly OpenTelemetry and OCI types) but only ~0.5 MB to the binary. CI probes the proxy's rules from a container on its network (containers/images 200; exec, volumes, secrets 403). Also: `.gitattributes` keeps `.go` files LF, since Git for Windows' `autocrlf` checked P0's files out with CRLF and broke the local `gofmt` check. |
+| 1.3 | Migrations: `deployments` (status, commit, image, timestamps, error) and `app_env_vars` (AES-256-GCM encrypted values; key `PLATFORM_SECRET_KEY` from `.env`); `internal/secrets` for encryption, the app ID bound in as associated data so a value can't be moved to another app. Store methods for apps, env vars and deployments. | 🚧 In review; database tests not yet run (CI). The key name is bound in as well as the app ID. The two rules "one deploy in progress per app" and "one live deployment per app" are partial unique indexes; status changes are conditional `UPDATE`s, so they only move forward. `PLATFORM_SECRET_KEY` is required (the platform won't start without it). At startup the platform marks deployments left in progress as failed ("interrupted"), which stops a lost deploy from blocking the app forever. |
 | 1.4 | Getting code and building: download GitHub's tarball for a commit (size-capped, public repos only for now), re-pack it as a build context, build the image with output kept for the deployment's error/log. Behind interfaces; tested against fakes and `httptest`. | |
 | 1.5 | Running: create and start the app container (labels `ops.platform.app` / `ops.platform.deployment`, limits, env, `apps` network, Docker restart policy `unless-stopped` until P4's reconciler), wait for its health-check path, stop and remove the previous one. | |
 | 1.6 | Caddy: a pinned Caddy service, its admin API only on an internal network the apps can't reach, `internal/router` to add/replace/remove an app's route. Routes are re-applied when the platform starts (Caddy's admin config is in memory). | |
 | 1.7 | The deploy orchestration (one goroutine per deploy, one deploy per app at a time, status written at each stage) and the platform API: create/list/get apps, set/delete env vars (values never returned), trigger a deploy of a commit, list deployments. | |
 | 1.8 | Dashboard: forwards `/api/platform/*` to the platform; frontend routing; Apps list and App detail pages (current deployment and status, Deploy button, env var names). | |
-| 1.9 | cloudflared (tunnel token in `.env`, wildcard DNS), an `examples/hello` sample app, deploy, owner checks the definition of done on the server. | |
+| 1.9 | Caddy published on the server's Tailscale IP only (`APPS_DOMAIN` and the IP in `.env`), an `examples/hello` sample app, deploy, owner checks the definition of done from a tailnet device. cloudflared moves to when a domain is bought. | |
 
 Decisions (approved 2026-11-02), with entries in
 [decisions/platform.md](decisions/platform.md):
@@ -286,19 +296,29 @@ Decisions (approved 2026-11-02), with entries in
   pages; revisited in 1.8.
 
 Risks to check early:
-- **Building through the API.** BuildKit over the Engine API needs session
-  and gRPC endpoints that the socket proxy would also have to allow; the
-  legacy builder only needs `/build` but is deprecated. Decided in 1.4 after
-  checking the server's Docker version.
-- **Owner prerequisites before 1.9:** a domain on Cloudflare and a Cloudflare
-  Tunnel (exact steps given in 1.9).
+- **Building through the API** (resolved 2026-11-02, to confirm in 1.4).
+  The server runs Docker 29.8.1 (API 1.56). Docker's source (checked in
+  28.5.2) shows a BuildKit build (`version=2`) reads its context from the
+  request body when none is given otherwise, with no session, so it only
+  needs `/build`, which the proxy already allows. Plan: BuildKit, not the
+  deprecated legacy builder. Its progress arrives as encoded
+  `moby.buildkit.trace` messages rather than text; P1 only needs the error,
+  which is plain text, so decoding the full log waits for P2's live logs. 1.4
+  confirms this against CI's Docker before relying on it.
+- **Publishing Caddy on the Tailscale IP.** If Docker starts before
+  Tailscale has its IP after a reboot, binding to that IP fails and Caddy
+  won't start. 1.9 checks this with a real reboot and picks a fix if needed
+  (e.g. a systemd ordering override, or `tailscale serve` in front instead).
 
 ## Open questions
 
-- **Domain for platform apps** (needed by 1.9): which domain on Cloudflare
-  apps live under (`<app>.<domain>`), or whether one needs registering first.
-- **Docker version on the server** (needed by 1.4): `docker version` output,
-  to decide between BuildKit and the legacy builder.
+- **Domain for public apps** (deferred, not blocking P1). The owner will
+  probably buy one (Cloudflare Registrar, cost price) when something needs to
+  be public, likely pokewordle in P5. One domain covers every public site via
+  subdomains. `pokewordle.sashasagebd.workers.dev` is Cloudflare's free
+  Workers subdomain and can't carry a tunnel or per-app hostnames. Also worth
+  checking then: whether pokewordle's Worker could reach its backend through
+  a tunnel without a public hostname (Cloudflare "Workers VPC").
 
 Resolved:
 - **M2 plan** approved 2026-10-01.
@@ -307,6 +327,8 @@ Resolved:
 - **M6 plan** approved 2026-10-06.
 - **P0 plan** approved 2026-10-28.
 - **P1 plan** approved 2026-11-02.
+- **Docker version on the server** (2026-11-02): 29.8.1, API 1.56; see P1's
+  risks for what it means for building.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
   `Dockerfile` and `compose.yaml`). It wasn't started; it was brought up with
   `docker compose up -d` on 2026-10-01 and the dashboard shows it with no code

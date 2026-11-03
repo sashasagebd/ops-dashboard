@@ -26,7 +26,8 @@ over Tailscale.
 - `backend/`: Go module `github.com/sashasagebd/ops-dashboard/backend`
   - `cmd/dashboard/`: entrypoint, config from env vars; `-healthcheck` flag for the Dockerfile's `HEALTHCHECK` (GETs its own `/healthz`, exits 0/1, via `internal/healthcheck`)
   - `cmd/platform/`: the deploy platform's control plane, a separate service (`docs/decisions/platform.md`). Needs `DATABASE_URL`; waits for Postgres, migrates, then listens on `:8081`. Same `-healthcheck` flag.
-  - `internal/store/`: the platform's Postgres access (`pgx` pool). Schema in `migrations/NNNN_description.sql`, embedded and applied on startup under an advisory lock, one transaction per file. Migrations that have been deployed are never edited; changes go in a new file.
+  - `internal/store/`: the platform's Postgres access (`pgx` pool). Schema in `migrations/NNNN_description.sql`, embedded and applied on startup under an advisory lock, one transaction per file. Migrations that have been deployed are never edited; changes go in a new file. Apps, env vars (encrypted/decrypted only here) and deployments. Invariants (one deploy in progress and one live deployment per app, forward-only status) are enforced by the database: partial unique indexes and conditional `UPDATE`s, never check-then-write in Go.
+  - `internal/secrets/`: AES-256-GCM sealing for values stored encrypted (env vars), key from `PLATFORM_SECRET_KEY`; associated data binds each value to its row
   - `internal/healthcheck/`: the self-check both binaries use for `-healthcheck`
   - `internal/server/`: HTTP routes; reads snapshots through its `SnapshotSource` interface, never Docker directly
   - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %; feeds `internal/history` after each successful poll

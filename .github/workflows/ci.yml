@@ -103,6 +103,7 @@ jobs:
           docker network create ci
           docker run -d --name platform --network ci --entrypoint /platform \
             -e DATABASE_URL='postgres://platform:ci-only@db:5432/platform?sslmode=disable' \
+            -e PLATFORM_SECRET_KEY="$(openssl rand -hex 32)" \
             ops-dashboard:ci
           docker run -d --name db --network ci \
             -e POSTGRES_USER=platform -e POSTGRES_PASSWORD=ci-only -e POSTGRES_DB=platform \
@@ -141,6 +142,9 @@ jobs:
         env:
           POSTGRES_PASSWORD: ci-only
         run: |
+          # A fresh key per run rather than one committed to the repo. It
+          # must stay the same for the whole step, across the restart below.
+          export PLATFORM_SECRET_KEY="$(openssl rand -hex 32)"
           docker compose up -d --build --wait --wait-timeout 180 || { docker compose ps -a; docker compose logs; exit 1; }
           curl -fsS http://127.0.0.1:8080/healthz
           # The dashboard sees the new services (proxy -> Docker works). Plain

@@ -342,9 +342,11 @@ goroutine that runs the whole flow, allowing one deploy per app at a time.
 
 **Why:** it gets an end-to-end deploy working without the job queue, so
 Phase 2 can focus on the queue itself. The known gap is deliberate: if the
-platform restarts mid-deploy, the deployment stays stuck in `building` or
-`starting` forever. Phase 2 fixes this with jobs in Postgres that survive
-restarts. "Here's what broke, here's the queue that fixed it" is a better
+platform restarts mid-deploy, that deploy is lost. At startup the platform
+marks any deployment still in progress as failed ("interrupted"), since
+nothing can resume it and it would otherwise block the app's next deploy
+forever. Phase 2 fixes this properly with jobs in Postgres that survive
+restarts and are retried. "Here's what broke, here's the queue that fixed it" is a better
 story than starting with the queue.
 
 **Alternatives:** building the queue first (more correct from day one, but
@@ -375,3 +377,81 @@ app's encrypted secrets or the proxy that can create containers.
 
 **Alternatives:** one shared network (simpler, but every app could reach the
 control plane).
+
+### No domain yet: sslip.io hostnames over Tailscale (2026-11-02)
+
+**What:** until there's a domain, apps get hostnames like
+`hello.100-101-102-103.sslip.io`. Caddy is published on the server's
+Tailscale IP only, so apps are reachable from tailnet devices and nowhere
+else. cloudflared and public hostnames wait until a domain is bought.
+
+**Why:** sslip.io is a free public DNS service that resolves any name
+containing an IP address to that IP. It gives each app a real, distinct
+hostname with no domain and no DNS setup, so Caddy's hostname routing
+(the part that matters for the platform) is built and tested exactly as it
+will run publicly. Swapping in a real domain later is configuration: a
+different `APPS_DOMAIN` plus the cloudflared service. It also keeps the
+platform off the internet until it has proven itself. Traffic inside the
+tailnet is plain HTTP, which is acceptable because Tailscale already
+encrypts it.
+
+**Alternatives:** buying a domain now (about $10–12/year; the owner will
+likely do this later anyway); Cloudflare quick tunnels (free, but a random
+URL that changes on every restart, and meant for testing); Tailscale Funnel
+(free and public, but one hostname per machine, so apps would share it by
+path, which many apps don't handle); free registries such as `eu.org` (slow,
+uncertain approval).
+
+### Env vars are encrypted with AES-256-GCM, bound to their row
+
+**What:** `internal/secrets` seals each env var value with AES-256-GCM from
+Go's standard library, under `PLATFORM_SECRET_KEY` (32 random bytes, in
+`.env`, never in the database or repo). A stored value is a format byte,
+a random 12-byte nonce, then the ciphertext and tag. The app ID and key name
+are passed as associated data. Only the store encrypts and decrypts, and the
+API will only ever return key names.
+
+**Why:**
+- *GCM is authenticated:* a tampered value, or the wrong key, fails loudly
+  instead of decrypting to garbage that would be injected into an app.
+- *Associated data binds a value to its row:* someone who can write to the
+  database but doesn't have the key can't copy app A's secret into app B's
+  row and have app B receive it. A test does exactly that and checks it
+  fails.
+- *Random nonces:* the same value sealed twice gives different bytes, so
+  equal secrets aren't visible as such.
+- *The format byte:* lets the scheme (or key, for a rotation) change later
+  while old values stay readable.
+- *Encryption in the store, not the API:* nothing else can write a value
+  unencrypted by accident.
+- *A missing or malformed key stops the platform at startup:* a default or
+  generated key would silently lose every value on the next restart.
+
+The cost: lose the key and every stored value is gone, so `.env.example`
+and the README say to back it up.
+
+**Alternatives:** Postgres's `pgcrypto` (encryption inside the database
+means the key travels to it with every query, and may appear in its logs);
+a secrets manager such as Vault (the "right" answer at scale, but a large
+extra service for one person's server); envelope encryption with a key per
+app (only worth it once keys need rotating per app).
+
+### Invariants live in the database, not in Go checks
+
+**What:** "at most one deploy in progress per app" and "at most one live
+deployment per app" are partial unique indexes on `deployments`. Status
+changes are single `UPDATE ... WHERE id = $1 AND status = ANY(allowed)`
+statements, so a deployment only moves forward. Making a deployment live and
+superseding the old one happen in one transaction.
+
+**Why:** a "check, then write" in Go (e.g. "is a deploy running? if not,
+start one") has a gap between the check and the write, where two requests,
+or in Phase 2 two workers, can both pass the check. A unique index or a
+conditional `UPDATE` makes the database decide atomically: exactly one wins,
+and the other gets a clear error (`ErrDeployInProgress`, `ErrWrongStatus`).
+This holds no matter how many platform processes or goroutines there are,
+which is what Phase 2's queue will rely on.
+
+**Alternatives:** a Go mutex per app (only works within one process, and is
+lost on restart); `SELECT ... FOR UPDATE` then check then update (correct, but
+more code and round trips for the same guarantee).
