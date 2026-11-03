@@ -1,4 +1,5 @@
-// Types and fetchers for the dashboard's Go API.
+// Types and fetchers for the dashboard's Go API, and for the platform's API,
+// which the dashboard forwards.
 
 // Container matches containerResponse in backend/internal/server/server.go.
 export type Container = {
@@ -67,6 +68,61 @@ export type HistoryResponse = {
   containers: Record<string, ContainerHistory> // by container name
 }
 
+// Platform types match the response types in backend/internal/api/api.go,
+// which the dashboard forwards /api/platform/ to.
+
+// DeploymentStatus moves forward only: queued → building → starting →
+// healthy or failed; healthy → superseded when a newer one goes live.
+export type DeploymentStatus = 'queued' | 'building' | 'starting' | 'healthy' | 'failed' | 'superseded' | 'rolled_back'
+
+// Deployment matches deploymentResponse.
+export type Deployment = {
+  id: number
+  appId: number
+  commitSha: string
+  status: DeploymentStatus
+  imageTag: string | null // null until built
+  error: string | null // why it failed; null unless failed
+  createdAt: string // RFC 3339
+  startedAt: string | null
+  finishedAt: string | null
+}
+
+// PlatformApp matches appResponse.
+export type PlatformApp = {
+  id: number
+  name: string
+  repoUrl: string
+  branch: string
+  hostname: string // where it's served, <name>.<APPS_DOMAIN>
+  port: number // inside its container
+  healthCheckPath: string
+  memoryLimitBytes: number
+  cpuLimitMillicores: number // 1000 = one core
+  sourceDir: string // folder in the repo with the Dockerfile; '' is the root
+  createdAt: string
+  currentDeployment: Deployment | null // the live one; null if nothing is live
+}
+
+// AppDetail matches appDetailResponse.
+export type AppDetail = PlatformApp & {
+  envKeys: string[] // names only: values are write-only
+  deployments: Deployment[] // newest first, at most 20
+}
+
+// NewApp is the body of POST /api/platform/apps. Optional fields left out
+// get the platform's defaults.
+export type NewApp = {
+  name: string
+  repoUrl: string
+  port: number
+  branch?: string
+  healthCheckPath?: string
+  sourceDir?: string
+  memoryLimitBytes?: number
+  cpuLimitMillicores?: number
+}
+
 export function fetchContainers(signal?: AbortSignal): Promise<ContainersResponse> {
   return getJSON<ContainersResponse>('/api/containers', signal)
 }
@@ -75,15 +131,58 @@ export function fetchHistory(window: HistoryWindow, signal?: AbortSignal): Promi
   return getJSON<HistoryResponse>(`/api/history?window=${window}`, signal)
 }
 
+export function fetchApps(signal?: AbortSignal): Promise<PlatformApp[]> {
+  return getJSON<PlatformApp[]>('/api/platform/apps', signal)
+}
+
+export function fetchApp(id: number, signal?: AbortSignal): Promise<AppDetail> {
+  return getJSON<AppDetail>(`/api/platform/apps/${id}`, signal)
+}
+
+export function createApp(app: NewApp): Promise<PlatformApp> {
+  return sendJSON<PlatformApp>('POST', '/api/platform/apps', app)
+}
+
+// deployCommit starts a deploy; it runs in the background, so the returned
+// deployment is still queued.
+export function deployCommit(appId: number, commitSha: string): Promise<Deployment> {
+  return sendJSON<Deployment>('POST', `/api/platform/apps/${appId}/deployments`, { commitSha })
+}
+
+export async function setEnvVar(appId: number, key: string, value: string): Promise<void> {
+  await sendJSON('PUT', `/api/platform/apps/${appId}/env/${encodeURIComponent(key)}`, { value })
+}
+
+export async function deleteEnvVar(appId: number, key: string): Promise<void> {
+  await sendJSON('DELETE', `/api/platform/apps/${appId}/env/${encodeURIComponent(key)}`)
+}
+
 async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await fetch(url, { signal })
-  if (!res.ok) {
-    // The API sends {"error": "..."} on failure; fall back to the status line
-    // if the body is something else (e.g. a proxy error page).
-    const body: unknown = await res.json().catch(() => null)
-    throw new Error(errorMessage(body) ?? `Request failed: ${res.status} ${res.statusText}`)
-  }
+  if (!res.ok) throw await failure(res)
   return (await res.json()) as T
+}
+
+// sendJSON makes a request that changes something. Bodies are always sent as
+// JSON: the platform refuses anything else, which is part of its CSRF
+// protection. Resolves to the response's JSON, or undefined for 204.
+async function sendJSON<T = undefined>(method: 'POST' | 'PUT' | 'DELETE', url: string, body?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method,
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (!res.ok) throw await failure(res)
+  if (res.status === 204) return undefined as T
+  return (await res.json()) as T
+}
+
+// failure turns an error response into an Error. The APIs send
+// {"error": "..."}; fall back to the status line if the body is something
+// else (e.g. a proxy error page).
+async function failure(res: Response): Promise<Error> {
+  const body: unknown = await res.json().catch(() => null)
+  return new Error(errorMessage(body) ?? `Request failed: ${res.status} ${res.statusText}`)
 }
 
 function errorMessage(body: unknown): string | undefined {

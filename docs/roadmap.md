@@ -5,7 +5,7 @@ platform in [platform-plan.md](platform-plan.md) (P0 onwards, numbered after
 the plan's phases). Each numbered step is one small, reviewed commit. Design
 reasoning lives in [decisions/](decisions/).
 
-_Last updated: 2026-11-02_
+_Last updated: 2026-11-03_
 
 | Milestone | Status |
 |---|---|
@@ -16,16 +16,17 @@ _Last updated: 2026-11-02_
 | M5: Portfolio polish | ⏸️ Set aside (5.1–5.3 done and deployed, 5.4 dropped, 5.5–5.6 set aside for the platform) |
 | M6: History sparklines | ✅ Done, deployed (with P0, 2026-11-02) |
 | P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
-| P1: Manual deploy of one app | 🚧 In progress (1.1–1.4 green in CI; 1.5 in review) |
+| P1: Manual deploy of one app | 🚧 In progress (1.1–1.5 green in CI; 1.6 in review, then merge and deploy) |
 
 **Where we left off (2026-11-03):** P0 is done and deployed (PR #1). P1 is
-in progress on the `platform-p1` branch, with a draft PR that runs CI on each
-push. The owner commits and pushes after each step, and merges at the end of
-the phase. Steps 1.1–1.4 are green in CI. 1.5 (Caddy, the deploy flow, the
-platform API, and CI's end-to-end deploy of the commit itself) is written and
-passes locally, but the owner hasn't pushed it yet. **Next:** push 1.5. If
-CI fails, the "Compose stack" step prints the app state and the platform and
-Caddy logs; fix that first. Then 1.6, the last P1 step.
+on the `platform-p1` branch, with a draft PR that runs CI on each push. The
+owner commits and pushes after each step, and merges at the end of the
+phase. Steps 1.1–1.5 are green in CI. 1.6 (the Apps pages, the dashboard
+forwarding the platform API, Caddy published on the Tailscale IP,
+`sourceDir`, `examples/hello`) is written and passes locally; not pushed yet.
+**Next:** push 1.6 and get CI green. Then merge the PR, deploy on the server
+with the new `.env` values, run the owner's checks (step 1.6's row), and
+record the results here. That closes P1.
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -291,8 +292,8 @@ error.
 | 1.2 | Docker access for the platform: `docker-proxy-rw` (its own internal network; `POST=1` with only `CONTAINERS`, `IMAGES`, `BUILD`, `NETWORKS`), the official SDK (`github.com/moby/moby/client`) behind `internal/engine`, `tcp://` only. The platform logs the Docker version at startup (best effort, non-fatal). No container operations yet. | ✅ `3763550`, green in CI (incl. the proxy probes). The SDK adds ~18 indirect modules (mostly OpenTelemetry and OCI types) but only ~0.5 MB to the binary. CI probes the proxy's rules from a container on its network (containers/images 200; exec, volumes, secrets 403). Also: `.gitattributes` keeps `.go` files LF, since Git for Windows' `autocrlf` checked P0's files out with CRLF and broke the local `gofmt` check. |
 | 1.3 | Migrations: `deployments` (status, commit, image, timestamps, error) and `app_env_vars` (AES-256-GCM encrypted values; key `PLATFORM_SECRET_KEY` from `.env`); `internal/secrets` for encryption, the app ID bound in as associated data so a value can't be moved to another app. Store methods for apps, env vars and deployments. | ✅ Green in CI. The key name is bound in as well as the app ID. The two rules "one deploy in progress per app" and "one live deployment per app" are partial unique indexes; status changes are conditional `UPDATE`s, so they only move forward. `PLATFORM_SECRET_KEY` is required (the platform won't start without it). At startup the platform marks deployments left in progress as failed ("interrupted"), which stops a lost deploy from blocking the app forever. |
 | 1.4 | **Build and run** (was 1.4 + 1.5). `internal/source`: download GitHub's tarball for a commit (download and unpacked size caps, public repos only for now) and stream it, re-packed, as a build context. `internal/engine`: build with Docker's legacy builder through `/build` (`version=1`, context in the request body; BuildKit needs a session, see risks), image `<app>:<sha>`, the build's error kept as a `BuildError`; run an app container (platform labels, limits, decrypted env, one network, `unless-stopped` until P4) and stop/remove it; list the platform's containers by label. Health-checking moved to 1.5 (it goes through Caddy). Tested against fakes and `httptest`. | ✅ Green in CI, including a real build through the proxy. Every app container also gets fixed hardening the caller can't override: no privileged mode, mounts or published ports; `no-new-privileges`; a 512-process limit; rotated logs (3 × 10 MB). The platform joins the compose default network for internet access (GitHub). CI does a real build through the write proxy. The first CI run proved BuildKit can't build there without a session, so builds use the legacy builder (see risks). |
-| 1.5 | **Route and deploy** (was 1.6 + 1.7). Caddy: a pinned service, its admin API only on an internal network apps can't reach, `internal/router` to add/replace/remove an app's route, all routes re-applied at platform startup. Health checks go through Caddy: a temporary probe route per new deployment, so the platform never joins the apps network. The deploy orchestration (one goroutine per deploy, status written at each stage) and the platform API: create/list/get apps, set/delete env vars (values never returned), trigger a deploy of a commit, list deployments. | 🚧 In review; CI not yet run. Caddy's admin API binds a fixed IP on an internal network only the platform shares (apps can't reach it). `Apply` replaces Caddy's whole app server from the database each time (declarative). Caddy runs with `--resume`. Startup re-applies routes and removes orphaned app containers. API bodies must be JSON (blocks simple cross-site requests; the dashboard adds an origin check in 1.6). Optional `GITHUB_TOKEN`, sent to the API only (stripped on redirects, by an explicit check). CI now deploys this very commit end to end through the API and Caddy: redeploy, failed deploy (site stays up), isolation and restarts. |
-| 1.6 | **Dashboard and go live** (was 1.8 + 1.9). The dashboard forwards `/api/platform/*` to the platform; frontend routing; Apps list and App detail pages (current deployment and status, Deploy button, env var names). Caddy published on the server's Tailscale IP only (`APPS_DOMAIN` and the IP in `.env`), an `examples/hello` sample app. Merge, deploy, and the owner checks the definition of done from a tailnet device, including a reboot. cloudflared waits for a domain. | |
+| 1.5 | **Route and deploy** (was 1.6 + 1.7). Caddy: a pinned service, its admin API only on an internal network apps can't reach, `internal/router` to add/replace/remove an app's route, all routes re-applied at platform startup. Health checks go through Caddy: a temporary probe route per new deployment, so the platform never joins the apps network. The deploy orchestration (one goroutine per deploy, status written at each stage) and the platform API: create/list/get apps, set/delete env vars (values never returned), trigger a deploy of a commit, list deployments. | ✅ `047ed91`, `8542ca3` (CI fix), green in CI. Caddy's admin API binds a fixed IP on an internal network only the platform shares (apps can't reach it). `Apply` replaces Caddy's whole app server from the database each time (declarative). Caddy runs with `--resume`. Startup re-applies routes and removes orphaned app containers. API bodies must be JSON (blocks simple cross-site requests; the dashboard adds an origin check in 1.6). Optional `GITHUB_TOKEN`, sent to the API only (stripped on redirects, by an explicit check). CI now deploys this very commit end to end through the API and Caddy: redeploy, failed deploy (site stays up), isolation and restarts. |
+| 1.6 | **Dashboard and go live** (was 1.8 + 1.9). The dashboard forwards `/api/platform/*` to the platform; frontend routing; Apps list and App detail pages (current deployment and status, Deploy button, env var names). Caddy published on the server's Tailscale IP only (`APPS_DOMAIN` and the IP in `.env`), an `examples/hello` sample app. Merge, deploy, and the owner checks the definition of done from a tailnet device, including a reboot. cloudflared waits for a domain. || 🚧 In review; CI not yet run. The dashboard forwards with `httputil.ReverseProxy` behind `http.CrossOriginProtection`. Hash routing, no library. Apps can be built from a folder of their repo (`sourceDir`, migration 0004), which `examples/hello` needs. Caddy is published on `APPS_LISTEN_IP` (required, no default). A deploy reports the code stream's own error (missing folder, too large) rather than Docker's. CI adds: the published port, forwarding and the CSRF check through the dashboard, deploying `examples/hello` with an env var, and a missing `sourceDir`. Owner checks on the server still to do. |
 
 Decisions (approved 2026-11-02), with entries in
 [decisions/platform.md](decisions/platform.md):

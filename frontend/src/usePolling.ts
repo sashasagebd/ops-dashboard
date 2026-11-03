@@ -23,8 +23,14 @@ export type PollState<T> =
 //   with refreshError set, rather than being replaced by an error.
 //
 // fetcher must be stable (e.g. a module-level function); a new function on
-// every render would restart polling each time.
-export function usePolling<T>(fetcher: (signal: AbortSignal) => Promise<T>, intervalMs: number): PollState<T> {
+// every render would restart polling each time. Changing refreshKey fetches
+// again straight away (e.g. after the user changed something), keeping the
+// current data on screen meanwhile.
+export function usePolling<T>(
+  fetcher: (signal: AbortSignal) => Promise<T>,
+  intervalMs: number,
+  refreshKey = 0,
+): PollState<T> {
   const [state, setState] = useState<PollState<T>>({ status: 'loading' })
 
   useEffect(() => {
@@ -70,7 +76,7 @@ export function usePolling<T>(fetcher: (signal: AbortSignal) => Promise<T>, inte
       document.removeEventListener('visibilitychange', onVisibilityChange)
       stop()
     }
-  }, [fetcher, intervalMs])
+  }, [fetcher, intervalMs, refreshKey])
 
   return state
 }

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -61,6 +62,15 @@ func run(addr string) error {
 		return fmt.Errorf("POLL_INTERVAL %s: must be at least 1s", pollInterval)
 	}
 
+	// The platform's API, which the dashboard forwards /api/platform/ to. The
+	// default is its service name in compose.yaml. If the platform isn't
+	// running (e.g. `go run` on a dev PC), those requests get a 502 and the
+	// monitoring pages work as before.
+	platformURL, err := url.Parse(envOr("PLATFORM_URL", "http://platform:8081"))
+	if err != nil || (platformURL.Scheme != "http" && platformURL.Scheme != "https") || platformURL.Host == "" {
+		return fmt.Errorf("PLATFORM_URL %q: want e.g. http://platform:8081", os.Getenv("PLATFORM_URL"))
+	}
+
 	// The built frontend. Unset in development, where Vite serves it instead.
 	var static fs.FS
 	if dir := os.Getenv("STATIC_DIR"); dir != "" {
@@ -80,7 +90,7 @@ func run(addr string) error {
 
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: server.New(mon, mon, static),
+		Handler: server.New(mon, mon, server.NewPlatformProxy(platformURL), static),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,

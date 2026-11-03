@@ -621,3 +621,95 @@ real build. The cost is a few minutes of CI per run.
 
 **Alternatives:** a separate sample repo (another repo to keep in step);
 testing only on the server (a slow, manual feedback loop).
+
+### The dashboard forwards the platform's API (2026-11-03)
+
+**What:** the dashboard serves `/api/platform/*` by forwarding each request
+to the platform (`httputil.ReverseProxy`, `PLATFORM_URL`), and wraps all its
+routes in Go's `http.CrossOriginProtection`. The platform keeps no published
+port.
+
+**Why:** the browser only ever talks to one origin, the dashboard at its
+`tailscale serve` URL. So there's no CORS to configure, and the platform needs
+no address of its own on the tailnet. The cross-origin check is the second
+CSRF layer promised in 1.5. Go 1.25+ has it built in: it refuses
+state-changing requests (not GET/HEAD/OPTIONS) that the browser marks
+cross-origin through `Sec-Fetch-Site` (or `Origin` vs `Host` on older
+browsers), and passes requests with neither header (curl, scripts), which
+CSRF can't involve. The proxy uses `Rewrite`, which drops any
+`X-Forwarded-*` headers the client sent. If the platform is down, the
+monitoring pages keep working and only `/api/platform/` answers 502.
+
+**Alternatives:** publishing the platform behind its own `tailscale serve`
+port (a second origin needs CORS, plus a second thing to keep tailnet-only);
+merging the two binaries (rejected in P0, because monitoring should survive
+a broken platform).
+
+### Hash routing in the frontend (2026-11-03)
+
+**What:** pages live in the URL hash (`#/`, `#/apps`, `#/apps/3`), parsed by
+a 20-line `route.ts`, with no router library.
+
+**Why:** the hash never reaches the server, so Go's file server needs no
+"serve index.html for unknown paths" fallback, and reloads and bookmarks work
+on every page. With three pages, a library would be more code to depend on
+than the code it replaces.
+
+**Alternatives:** path routing with a fallback in Go (nicer URLs, but every
+unknown path would then answer 200 with the app instead of 404); React
+Router (a dependency for three routes). Worth revisiting if the frontend
+grows many pages.
+
+### Apps can be built from a folder of their repo (2026-11-03)
+
+**What:** apps have a `sourceDir` (migration 0004, default `''`, the repo's
+root). The code fetcher keeps only that folder, re-rooted, as the build
+context, so its Dockerfile is the one built.
+
+**Why:** `examples/hello` lives in this repo, and a repo often holds more
+than one deployable thing (pokewordle's backend is likely to be one folder of
+its repo). The path is checked three times, because it selects files: the API
+gives a clear 400, the database's CHECK refuses `.`/`..` parts, absolute
+paths and trailing slashes, and the fetcher refuses anything that isn't a
+clean relative path. A folder missing at that commit is only discovered
+while the archive streams into Docker's build. So the deploy keeps the
+stream's own error and reports it ("source directory not found…") rather
+than whatever Docker's client made of the cut-off upload. The same applies
+to a repo over the size limit. CI deploys `examples/hello` this way, and
+checks the reason for a missing folder.
+
+**Alternatives:** a separate repo for each example (more to keep in step, and
+it doesn't help monorepos); a Dockerfile path option instead of a folder
+(the build context would still be the whole repo, which is larger and
+leaks more into each image's build).
+
+### Caddy is published on the Tailscale IP (2026-11-03)
+
+**What:** Caddy's port 80 is published on `APPS_LISTEN_IP:80` (required, no
+default). On the server that's its Tailscale IP, the same one sslip.io
+resolves app hostnames to.
+
+**Why:** that address exists only on the `tailscale0` interface, so tailnet
+devices can reach the apps and the LAN and internet can't. Docker bypasses
+UFW, so a mistaken `0.0.0.0` would expose every app; making the variable
+required, with no default, means it can't happen by omission. Apps go
+public later through cloudflared, not by widening this.
+
+**Known limits:**
+- **Boot order.** Binding to the Tailscale IP fails if Docker starts the
+  container before `tailscaled` has brought the address up. 1.6's reboot
+  test checks this. The fix, if needed, is `net.ipv4.ip_nonlocal_bind=1`
+  (lets a socket bind an address that isn't up yet), or ordering Docker
+  after Tailscale in systemd.
+- **Spoofed destinations.** A device on the same LAN segment could, in
+  principle, send packets addressed to the Tailscale IP straight to the
+  server's LAN interface, and Docker's forwarding rule matches on the
+  destination address alone. That needs someone on the home LAN, and app
+  sites aren't admin surfaces (the dashboard and platform stay on
+  127.0.0.1 and internal networks). Not mitigated now; a firewall rule
+  limiting the published port to `tailscale0` would close it.
+
+**Alternatives:** `tailscale serve` in front of Caddy (it serves one name per
+machine, not a wildcard, so it can't route `<app>.<domain>`); publishing on
+127.0.0.1 and relaying (an extra moving part for no gain).
+

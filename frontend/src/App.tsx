@@ -9,7 +9,9 @@ import {
   type HistoryWindow,
 } from './api'
 import { formatBytes, formatCPU, formatDuration, uptimeText } from './format'
+import { AppPage, AppsPage } from './Apps'
 import { HostSummary } from './HostSummary'
+import { useRoute, type Route } from './route'
 import { seriesMax } from './series'
 import { Sparkline } from './Sparkline'
 import { usePolling, type PollState } from './usePolling'
@@ -36,6 +38,41 @@ const WINDOW_LABEL: Record<HistoryWindow, string> = { '1h': 'last hour', '24h': 
 const HEALTH_BADGE = { healthy: 'up', starting: 'warn', unhealthy: 'down' } as const
 
 function App() {
+  const route = useRoute()
+  return (
+    <main>
+      <header className="page-header">
+        <h1>Ops Dashboard</h1>
+        <nav className="nav" aria-label="Pages">
+          <a href="#/" aria-current={route.page === 'containers' ? 'page' : undefined}>
+            Containers
+          </a>
+          <a href="#/apps" aria-current={route.page === 'apps' || route.page === 'app' ? 'page' : undefined}>
+            Apps
+          </a>
+        </nav>
+      </header>
+      <Page route={route} />
+    </main>
+  )
+}
+
+function Page({ route }: { route: Route }) {
+  switch (route.page) {
+    case 'containers':
+      return <ContainersPage />
+    case 'apps':
+      return <AppsPage />
+    case 'app':
+      // Keyed by id, so moving to another app starts from a clean state.
+      return <AppPage key={route.id} id={route.id} />
+    case 'not-found':
+      return <p>No such page.</p>
+  }
+}
+
+// ContainersPage is the monitoring view: the server and every container.
+function ContainersPage() {
   const state = usePolling(fetchContainers, REFRESH_MS)
 
   // Changing the period gives usePolling a new fetcher, which restarts its
@@ -49,13 +86,12 @@ function App() {
   const history = historyState.status === 'ok' ? historyState.data : null
 
   return (
-    <main>
-      <header className="page-header">
-        <h1>Ops Dashboard</h1>
+    <>
+      <div className="page-tools">
         <WindowToggle value={period} onChange={setPeriod} />
-      </header>
+      </div>
       <Dashboard state={state} history={history} windowLabel={WINDOW_LABEL[period]} />
-    </main>
+    </>
   )
 }
 

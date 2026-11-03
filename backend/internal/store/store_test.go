@@ -55,20 +55,21 @@ func TestCreateAppDefaultsAndOverrides(t *testing.T) {
 		t.Errorf("app missing ID or CreatedAt: %+v", app)
 	}
 	if app.Branch != "main" || app.HealthCheckPath != "/" ||
-		app.MemoryLimitBytes != 256<<20 || app.CPULimitMillicores != 500 {
-		t.Errorf("defaults = branch %q, path %q, memory %d, cpu %d; want main, /, 268435456, 500",
-			app.Branch, app.HealthCheckPath, app.MemoryLimitBytes, app.CPULimitMillicores)
+		app.MemoryLimitBytes != 256<<20 || app.CPULimitMillicores != 500 || app.SourceDir != "" {
+		t.Errorf("defaults = branch %q, path %q, memory %d, cpu %d, dir %q; want main, /, 268435456, 500, \"\"",
+			app.Branch, app.HealthCheckPath, app.MemoryLimitBytes, app.CPULimitMillicores, app.SourceDir)
 	}
 
 	custom, err := s.CreateApp(t.Context(), NewApp{
 		Name: "custom", RepoURL: "https://github.com/example/custom", Hostname: "custom.example.test", Port: 3000,
 		Branch: "release", HealthCheckPath: "/healthz", MemoryLimitBytes: 64 << 20, CPULimitMillicores: 250,
+		SourceDir: "services/web",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if custom.Branch != "release" || custom.HealthCheckPath != "/healthz" ||
-		custom.MemoryLimitBytes != 64<<20 || custom.CPULimitMillicores != 250 {
+		custom.MemoryLimitBytes != 64<<20 || custom.CPULimitMillicores != 250 || custom.SourceDir != "services/web" {
 		t.Errorf("overrides not kept: %+v", custom)
 	}
 
@@ -105,6 +106,11 @@ func TestAppErrors(t *testing.T) {
 		{"hostname taken", NewApp{Name: "other", RepoURL: "r", Hostname: "hello.example.test", Port: 1}, ErrConflict},
 		{"bad name", NewApp{Name: "Hello", RepoURL: "r", Hostname: "x.example.test", Port: 1}, ErrInvalid},
 		{"bad port", NewApp{Name: "x", RepoURL: "r", Hostname: "x.example.test", Port: 70000}, ErrInvalid},
+		// The source directory can only select a folder inside the repo.
+		{"dir with ..", NewApp{Name: "x", RepoURL: "r", Hostname: "x.example.test", Port: 1, SourceDir: "a/../.."}, ErrInvalid},
+		{"dir is ..", NewApp{Name: "x", RepoURL: "r", Hostname: "x.example.test", Port: 1, SourceDir: ".."}, ErrInvalid},
+		{"absolute dir", NewApp{Name: "x", RepoURL: "r", Hostname: "x.example.test", Port: 1, SourceDir: "/etc"}, ErrInvalid},
+		{"dir with trailing slash", NewApp{Name: "x", RepoURL: "r", Hostname: "x.example.test", Port: 1, SourceDir: "web/"}, ErrInvalid},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

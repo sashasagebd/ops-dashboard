@@ -37,6 +37,10 @@ var ErrNotFound = errors.New("repository or commit not found (private repos aren
 // ErrTooLarge means the code exceeded a size limit.
 var ErrTooLarge = errors.New("repository is larger than the platform's limit")
 
+// ErrDirNotFound means the app's source directory doesn't exist in the repo
+// at that commit.
+var ErrDirNotFound = errors.New("source directory not found in the repository at this commit")
+
 // GitHub fetches code from GitHub's API.
 type GitHub struct {
 	HTTPClient       *http.Client
@@ -61,10 +65,11 @@ func NewGitHub() *GitHub {
 var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // BuildContext returns the code of repoURL at commitSHA as an uncompressed tar
-// stream, ready to send to Docker as a build context. The caller must close
-// it. Errors that happen mid-stream (a size limit, a broken download) arrive
+// stream, ready to send to Docker as a build context. dir selects a folder
+// inside the repo to use as the context's root ("" for the whole repo); its
+// Dockerfile is the one built. The caller must close the stream. Errors that happen mid-stream (a size limit, a broken download) arrive
 // from Read, so the build fails rather than seeing truncated code.
-func (g *GitHub) BuildContext(ctx context.Context, repoURL, commitSHA string) (io.ReadCloser, error) {
+func (g *GitHub) BuildContext(ctx context.Context, repoURL, commitSHA, dir string) (io.ReadCloser, error) {
 	owner, repo, err := ParseRepoURL(repoURL)
 	if err != nil {
 		return nil, err
@@ -72,6 +77,11 @@ func (g *GitHub) BuildContext(ctx context.Context, repoURL, commitSHA string) (i
 	// Checked here as well as by the database, because it goes into a URL.
 	if !shaPattern.MatchString(commitSHA) {
 		return nil, fmt.Errorf("commit %q: want a full 40-character SHA", commitSHA)
+	}
+	// The database only accepts clean relative paths; checked again here
+	// because a path that isn't clean would never match an archive entry.
+	if dir != "" && (path.Clean(dir) != dir || path.IsAbs(dir) || dir == "." || dir == ".." || strings.HasPrefix(dir, "../")) {
+		return nil, fmt.Errorf("source directory %q: want a relative path inside the repo", dir)
 	}
 
 	u := fmt.Sprintf("%s/repos/%s/%s/tarball/%s", g.APIBase, url.PathEscape(owner), url.PathEscape(repo), commitSHA)
@@ -120,15 +130,16 @@ func (g *GitHub) BuildContext(ctx context.Context, repoURL, commitSHA string) (i
 	go func() {
 		defer resp.Body.Close()
 		download := &limitedReader{r: resp.Body, remaining: g.MaxDownloadBytes}
-		pw.CloseWithError(repack(download, pw, g.MaxUnpackedBytes))
+		pw.CloseWithError(repack(download, pw, g.MaxUnpackedBytes, dir))
 	}()
 	return pr, nil
 }
 
 // repack copies GitHub's .tar.gz to an uncompressed tar, removing the
 // top-level folder GitHub wraps everything in ("owner-repo-sha/"), so the
-// repo's root (and its Dockerfile) is the root of the build context.
-func repack(gz io.Reader, out io.Writer, maxUnpacked int64) error {
+// repo's root (and its Dockerfile) is the root of the build context. With a
+// dir, only that folder's contents are kept, re-rooted the same way.
+func repack(gz io.Reader, out io.Writer, maxUnpacked int64, dir string) error {
 	zr, err := gzip.NewReader(gz)
 	if err != nil {
 		return fmt.Errorf("reading code archive: %w", err)
@@ -136,6 +147,7 @@ func repack(gz io.Reader, out io.Writer, maxUnpacked int64) error {
 	tr := tar.NewReader(zr)
 	tw := tar.NewWriter(out)
 	var unpacked int64
+	found := dir == ""
 
 	for {
 		hdr, err := tr.Next()
@@ -163,9 +175,20 @@ func repack(gz io.Reader, out io.Writer, maxUnpacked int64) error {
 			continue // the top-level folder itself
 		}
 
+		// Counted before the dir filter, so the limit means the same for
+		// every app: the unpacked size of the whole repo.
 		unpacked += hdr.Size
 		if unpacked > maxUnpacked {
 			return ErrTooLarge
+		}
+
+		name, ok = inDir(name, dir)
+		if !ok {
+			continue
+		}
+		found = true
+		if name == "" {
+			continue // dir itself
 		}
 
 		// A fresh header with only what a build needs: no owner names or
@@ -187,7 +210,23 @@ func repack(gz io.Reader, out io.Writer, maxUnpacked int64) error {
 			}
 		}
 	}
+	if !found {
+		return ErrDirNotFound
+	}
 	return tw.Close()
+}
+
+// inDir re-roots name at dir: "" for dir itself, the rest of the path for
+// anything inside it, and ok false for anything outside it. dir "" keeps
+// everything.
+func inDir(name, dir string) (rest string, ok bool) {
+	if dir == "" {
+		return name, true
+	}
+	if name == dir {
+		return "", true
+	}
+	return strings.CutPrefix(name, dir+"/")
 }
 
 // stripTopFolder removes the first path element. ok is false for a path that

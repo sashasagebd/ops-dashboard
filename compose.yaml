@@ -12,10 +12,12 @@ services:
     environment:
       DOCKER_HOST: tcp://docker-proxy:2375
       POLL_INTERVAL: ${POLL_INTERVAL:-5s}
+      # The dashboard forwards /api/platform/ here (the Apps pages).
+      PLATFORM_URL: http://platform:8081
     depends_on:
       - docker-proxy
     networks:
-      - default # for the published port
+      - default # for the published port, and to reach the platform
       - docker-api # to reach the socket proxy
     # Hardening: the app writes nothing to disk and needs no Linux capabilities.
     read_only: true
@@ -87,9 +89,9 @@ services:
       - docker-rw
       - caddy-admin
       # The project's default network, which (unlike the internal ones) has
-      # internet access: the platform downloads app code from GitHub. In
-      # 1.6 it's also how the dashboard reaches the platform. Apps are never
-      # on it.
+      # internet access: the platform downloads app code from GitHub. It's
+      # also how the dashboard reaches the platform's API. Apps are never on
+      # it.
       - default
     read_only: true
     cap_drop: [ALL]
@@ -125,12 +127,19 @@ services:
   # service only bootstraps an empty config (caddy/caddy.json). --resume
   # restarts Caddy with its last config (autosaved in the config volume), so
   # routes survive a Caddy restart; the platform also re-sends them whenever
-  # it starts. No published port yet: step 1.6 publishes it on the
-  # server's Tailscale IP.
+  # it starts.
   caddy:
     image: caddy:2.11.7
     restart: unless-stopped
     command: ["caddy", "run", "--config", "/etc/caddy/caddy.json", "--resume"]
+    ports:
+      # Apps are reached at http://<name>.<APPS_DOMAIN>, which resolves to
+      # this IP. On the server it's the Tailscale IP, so only tailnet devices
+      # can connect: that address exists only on the tailscale0 interface.
+      # Never 0.0.0.0, which would put every app on the LAN (Docker bypasses
+      # UFW). Port 80 inside is Caddy's proxy side only; the admin API is on
+      # 10.203.0.2:2019 and isn't published.
+      - "${APPS_LISTEN_IP:?set APPS_LISTEN_IP in .env}:80:80"
     volumes:
       - ./caddy/caddy.json:/etc/caddy/caddy.json:ro
       - caddy-config:/config

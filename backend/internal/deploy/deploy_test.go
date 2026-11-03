@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
@@ -31,6 +32,7 @@ type fakes struct {
 	nextID      int64
 	createErr   error
 	sourceErr   error
+	streamErr   error // the build context fails mid-stream
 	buildErr    error
 	probeStatus func(n int) int // status for the nth probe
 	probes      int
@@ -47,6 +49,7 @@ func newFakes() *fakes {
 		app: store.App{
 			ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Port: 8080,
 			HealthCheckPath: "/healthz", MemoryLimitBytes: 256 << 20, CPULimitMillicores: 500,
+			SourceDir: "web",
 		},
 		statuses:    map[int64]store.DeploymentStatus{6: store.StatusHealthy},
 		nextID:      7,
@@ -136,18 +139,26 @@ func (f *fakes) LiveApps(context.Context) ([]store.LiveApp, error) {
 
 // Source
 
-func (f *fakes) BuildContext(_ context.Context, repo, commit string) (io.ReadCloser, error) {
-	f.event("download %s", commit)
+func (f *fakes) BuildContext(_ context.Context, repo, commit, dir string) (io.ReadCloser, error) {
+	f.event("download %s /%s", commit, dir)
 	if f.sourceErr != nil {
 		return nil, f.sourceErr
+	}
+	if f.streamErr != nil {
+		return io.NopCloser(io.MultiReader(strings.NewReader("tar"), iotest.ErrReader(f.streamErr))), nil
 	}
 	return io.NopCloser(strings.NewReader("tar")), nil
 }
 
 // Engine
 
-func (f *fakes) Build(_ context.Context, _ io.Reader, tag string, _ map[string]string) error {
+func (f *fakes) Build(_ context.Context, buildContext io.Reader, tag string, _ map[string]string) error {
 	f.event("build %s", tag)
+	// Like Docker's client: a broken upload comes back as an error of its
+	// own, which may or may not wrap the reader's.
+	if _, err := io.ReadAll(buildContext); err != nil {
+		return errors.New("error during connect: unexpected EOF")
+	}
 	return f.buildErr
 }
 
@@ -240,7 +251,7 @@ func TestDeploySuccess(t *testing.T) {
 	}
 	want := []string{
 		"building",
-		"download " + sha,
+		"download " + sha + " /web",
 		"build ops-platform/hello:" + sha,
 		"starting ops-platform/hello:" + sha,
 		"run app-hello-7",
@@ -280,6 +291,11 @@ func TestDeployFailures(t *testing.T) {
 			name:       "repo not found",
 			setup:      func(f *fakes) { f.sourceErr = fmt.Errorf("fetching: %w", source.ErrNotFound) },
 			wantReason: source.ErrNotFound.Error(),
+		},
+		{
+			name:       "source directory missing",
+			setup:      func(f *fakes) { f.streamErr = source.ErrDirNotFound },
+			wantReason: source.ErrDirNotFound.Error(),
 		},
 		{
 			name:       "never healthy",

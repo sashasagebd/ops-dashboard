@@ -52,6 +52,14 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # The sample app is its own module, outside backend/. CI's compose
+      # step builds and deploys it; this checks the code itself.
+      - name: Example app
+        working-directory: examples/hello
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+          go vet ./...
+
   frontend:
     name: Frontend (React/Vite)
     runs-on: ubuntu-latest
@@ -143,6 +151,8 @@ jobs:
         env:
           POSTGRES_PASSWORD: ci-only
           APPS_DOMAIN: apps.test
+          # The server uses its Tailscale IP; here, the runner's loopback.
+          APPS_LISTEN_IP: 127.0.0.1
           # Raises the platform's GitHub rate limit; CI runners share IPs,
           # so the anonymous 60 requests an hour can run out.
           GITHUB_TOKEN: ${{ github.token }}
@@ -247,6 +257,37 @@ jobs:
           [ "$(deploy 0000000000000000000000000000000000000000)" = failed ] || on_failure
           api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].error' | grep 'not found'
           visit selftest.apps.test /healthz | grep '"ok"' || on_failure
+
+          # The published port, as a tailnet device reaches it (here on
+          # 127.0.0.1 rather than the Tailscale IP).
+          curl -fsS --max-time 10 -H 'Host: selftest.apps.test' http://127.0.0.1/healthz | grep '"ok"' || on_failure
+
+          # The dashboard forwards the platform's API (the Apps pages use
+          # it), and refuses changes a browser marks as cross-site (CSRF).
+          dash() {
+            curl -sS -X "$1" -H 'Content-Type: application/json' ${3:+--data "$3"} "http://127.0.0.1:8080$2"
+          }
+          dash GET /api/platform/apps | jq -e '.[] | select(.name == "selftest")' > /dev/null || on_failure
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Sec-Fetch-Site: cross-site' \
+            -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:8080/api/platform/apps)" = 403
+
+          # examples/hello, registered through the dashboard as the Apps page
+          # does it: built from a folder of the repo, with an env var.
+          APP=$(dash POST /api/platform/apps \
+            "{\"name\":\"hello\",\"repoUrl\":\"$REPO_URL\",\"sourceDir\":\"examples/hello\",\"port\":8080,\"healthCheckPath\":\"/healthz\"}" | jq -r .id)
+          [ "$APP" != null ] || on_failure
+          dash PUT "/api/platform/apps/$APP/env/GREETING" '{"value":"Howdy"}'
+          [ "$(deploy "$DEPLOY_SHA")" = healthy ] || on_failure
+          visit hello.apps.test / | grep 'Howdy from the platform' || on_failure
+
+          # A source directory that doesn't exist fails with a clear reason
+          # (found mid-stream, so this also checks the reason survives
+          # Docker's client).
+          APP=$(api POST /api/platform/apps \
+            "{\"name\":\"nodir\",\"repoUrl\":\"$REPO_URL\",\"sourceDir\":\"no/such/dir\",\"port\":8080}" | jq -r .id)
+          [ "$APP" != null ] || on_failure
+          [ "$(deploy "$DEPLOY_SHA")" = failed ] || on_failure
+          api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].error' | grep 'source directory not found' || on_failure
 
           # Isolation: an app can reach neither Caddy's admin API nor the
           # platform.

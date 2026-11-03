@@ -114,7 +114,7 @@ func TestBuildContextStripsGitHubsFolder(t *testing.T) {
 		entry{name: "owner-repo-0123456/current", typeflag: tar.TypeSymlink, linkname: "src"},
 	))
 
-	rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha)
+	rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,6 +135,58 @@ func TestBuildContextStripsGitHubsFolder(t *testing.T) {
 	for name, body := range want {
 		if files[name] != body {
 			t.Errorf("%s = %q, want %q", name, files[name], body)
+		}
+	}
+}
+
+func TestBuildContextFromADirectory(t *testing.T) {
+	g := fakeGitHub(t, githubTarball(t,
+		entry{name: "owner-repo-0123456/Dockerfile", typeflag: tar.TypeReg, body: "root\n"},
+		entry{name: "owner-repo-0123456/examples/", typeflag: tar.TypeDir},
+		entry{name: "owner-repo-0123456/examples/hello/", typeflag: tar.TypeDir},
+		entry{name: "owner-repo-0123456/examples/hello/Dockerfile", typeflag: tar.TypeReg, body: "hello\n"},
+		entry{name: "owner-repo-0123456/examples/hello/cmd/main.go", typeflag: tar.TypeReg, body: "package main\n"},
+		// A sibling whose name starts the same: not part of examples/hello.
+		entry{name: "owner-repo-0123456/examples/hello-two/Dockerfile", typeflag: tar.TypeReg, body: "two\n"},
+	))
+
+	rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha, "examples/hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := readContext(t, rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"Dockerfile": "hello\n", "cmd/main.go": "package main\n"}
+	if len(files) != len(want) {
+		t.Errorf("build context has %v, want %v", keys(files), keys(want))
+	}
+	for name, body := range want {
+		if files[name] != body {
+			t.Errorf("%s = %q, want %q", name, files[name], body)
+		}
+	}
+}
+
+func TestBuildContextDirectoryErrors(t *testing.T) {
+	g := fakeGitHub(t, githubTarball(t,
+		entry{name: "owner-repo-0123456/Dockerfile", typeflag: tar.TypeReg, body: "root\n"},
+	))
+
+	// Missing: found only by reading the whole archive, so it arrives from Read.
+	rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha, "nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readContext(t, rc); !errors.Is(err, ErrDirNotFound) {
+		t.Errorf("missing dir: error = %v, want ErrDirNotFound", err)
+	}
+
+	// Paths that aren't clean and relative are refused before downloading.
+	for _, dir := range []string{"..", "../x", "/etc", "a/../b", "a/", "."} {
+		if _, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha, dir); err == nil {
+			t.Errorf("dir %q: accepted", dir)
 		}
 	}
 }
@@ -191,7 +243,7 @@ func TestBuildContextErrors(t *testing.T) {
 				g.MaxUnpackedBytes = tt.maxUnpacked
 			}
 
-			rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha)
+			rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha, "")
 			if err == nil {
 				// Archive problems surface while reading the stream.
 				_, err = readContext(t, rc)
@@ -225,7 +277,7 @@ func TestTokenGoesToTheAPIOnly(t *testing.T) {
 	g := NewGitHub()
 	g.APIBase = api.URL
 	g.Token = "ghp_secret"
-	rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha)
+	rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,10 +296,10 @@ func TestBuildContextNotFound(t *testing.T) {
 	g := fakeGitHub(t, nil)
 	other := "fedcba9876543210fedcba9876543210fedcba98" // not served
 
-	if _, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", other); !errors.Is(err, ErrNotFound) {
+	if _, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", other, ""); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown commit: error = %v, want ErrNotFound", err)
 	}
-	if _, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", "main"); err == nil {
+	if _, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", "main", ""); err == nil {
 		t.Error("a branch name instead of a SHA was accepted")
 	}
 }

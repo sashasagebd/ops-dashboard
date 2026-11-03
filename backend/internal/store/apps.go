@@ -20,11 +20,12 @@ type App struct {
 	HealthCheckPath    string    `db:"health_check_path"`
 	MemoryLimitBytes   int64     `db:"memory_limit_bytes"`
 	CPULimitMillicores int       `db:"cpu_limit_millicores"`
+	SourceDir          string    `db:"source_dir"` // "" is the repo's root
 	CreatedAt          time.Time `db:"created_at"`
 }
 
 const appColumns = `id, name, repo_url, branch, hostname, port, health_check_path,
-	memory_limit_bytes, cpu_limit_millicores, created_at`
+	memory_limit_bytes, cpu_limit_millicores, source_dir, created_at`
 
 // NewApp is what CreateApp needs. Name, RepoURL, Hostname and Port are
 // required; for the rest, the zero value means "use the database's default",
@@ -40,6 +41,7 @@ type NewApp struct {
 	HealthCheckPath    string
 	MemoryLimitBytes   int64
 	CPULimitMillicores int
+	SourceDir          string
 }
 
 // CreateApp registers an app. A taken name or hostname is ErrConflict.
@@ -56,6 +58,7 @@ func (s *Store) CreateApp(ctx context.Context, a NewApp) (App, error) {
 	optional("health_check_path", a.HealthCheckPath, a.HealthCheckPath != "")
 	optional("memory_limit_bytes", a.MemoryLimitBytes, a.MemoryLimitBytes != 0)
 	optional("cpu_limit_millicores", a.CPULimitMillicores, a.CPULimitMillicores != 0)
+	optional("source_dir", a.SourceDir, a.SourceDir != "")
 
 	placeholders := make([]string, len(cols))
 	for i := range cols {

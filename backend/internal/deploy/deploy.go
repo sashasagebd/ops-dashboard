@@ -42,7 +42,7 @@ type Store interface {
 }
 
 type Source interface {
-	BuildContext(ctx context.Context, repoURL, commitSHA string) (io.ReadCloser, error)
+	BuildContext(ctx context.Context, repoURL, commitSHA, dir string) (io.ReadCloser, error)
 }
 
 type Engine interface {
@@ -156,7 +156,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, dep store.Deplo
 
 	// Download and build. The code streams from GitHub straight into
 	// Docker's build.
-	src, err := d.source.BuildContext(ctx, app.RepoURL, dep.CommitSHA)
+	src, err := d.source.BuildContext(ctx, app.RepoURL, dep.CommitSHA, app.SourceDir)
 	if err != nil {
 		return err
 	}
@@ -166,9 +166,17 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, dep store.Deplo
 		engine.LabelAppID:      strconv.FormatInt(app.ID, 10),
 		engine.LabelDeployment: strconv.FormatInt(dep.ID, 10),
 	}
-	err = d.engine.Build(ctx, src, tag, labels)
+	stream := &streamReader{r: src}
+	err = d.engine.Build(ctx, stream, tag, labels)
 	src.Close()
 	if err != nil {
+		// Problems with the code itself (too large, source directory
+		// missing) are found while Docker reads the stream, so Build fails
+		// with whatever Docker made of the cut-off upload. The stream's own
+		// error is the real cause, and its message is one users can act on.
+		if streamErr := stream.Err(); streamErr != nil {
+			return streamErr
+		}
 		return err
 	}
 	if err := d.store.MarkStarting(ctx, dep.ID, tag); err != nil {
@@ -390,10 +398,38 @@ func publicReason(err error, deployTimeout time.Duration) string {
 		return source.ErrNotFound.Error()
 	case errors.Is(err, source.ErrTooLarge):
 		return source.ErrTooLarge.Error()
+	case errors.Is(err, source.ErrDirNotFound):
+		return source.ErrDirNotFound.Error()
 	case errors.Is(err, context.DeadlineExceeded):
 		return fmt.Sprintf("deploy timed out after %s", deployTimeout)
 	case errors.Is(err, context.Canceled):
 		return "interrupted: the platform shut down during this deploy"
 	}
 	return "internal error; see the platform's logs"
+}
+
+// streamReader passes reads through and remembers the first error other than
+// EOF. Docker's client reads it on another goroutine, hence the lock.
+type streamReader struct {
+	r   io.Reader
+	mu  sync.Mutex
+	err error
+}
+
+func (s *streamReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		s.mu.Lock()
+		if s.err == nil {
+			s.err = err
+		}
+		s.mu.Unlock()
+	}
+	return n, err
+}
+
+func (s *streamReader) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
 }

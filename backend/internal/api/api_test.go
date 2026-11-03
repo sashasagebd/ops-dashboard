@@ -45,7 +45,8 @@ func (f *fakeStore) CreateApp(_ context.Context, n store.NewApp) (store.App, err
 		}
 	}
 	a := store.App{ID: int64(len(f.apps) + 1), Name: n.Name, RepoURL: n.RepoURL, Hostname: n.Hostname,
-		Port: n.Port, Branch: "main", HealthCheckPath: "/", MemoryLimitBytes: 256 << 20, CPULimitMillicores: 500}
+		Port: n.Port, Branch: "main", HealthCheckPath: "/", MemoryLimitBytes: 256 << 20, CPULimitMillicores: 500,
+		SourceDir: n.SourceDir}
 	f.apps = append(f.apps, a)
 	return a, nil
 }
@@ -134,13 +135,16 @@ func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 func TestCreateApp(t *testing.T) {
 	h, _, _ := newTestAPI()
 
-	rec := do(t, h, "POST", "/api/platform/apps", `{"name":"pokewordle-api","repoUrl":"https://github.com/o/pw","port":3000}`)
+	rec := do(t, h, "POST", "/api/platform/apps", `{"name":"pokewordle-api","repoUrl":"https://github.com/o/pw","port":3000,"sourceDir":"backend"}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
 	}
 	got := decode[map[string]any](t, rec)
 	if got["hostname"] != "pokewordle-api.apps.test" {
 		t.Errorf("hostname = %v, want <name>.<apps domain>", got["hostname"])
+	}
+	if got["sourceDir"] != "backend" {
+		t.Errorf("sourceDir = %v, want backend", got["sourceDir"])
 	}
 	if got["currentDeployment"] != nil {
 		t.Errorf("currentDeployment = %v, want null", got["currentDeployment"])
@@ -158,6 +162,9 @@ func TestCreateAppRejects(t *testing.T) {
 		{"not github", `{"name":"x","repoUrl":"https://gitlab.com/o/r","port":80}`, "application/json", 400},
 		{"bad health path", `{"name":"x","repoUrl":"https://github.com/o/r","port":80,"healthCheckPath":"healthz"}`, "application/json", 400},
 		{"too much memory", `{"name":"x","repoUrl":"https://github.com/o/r","port":80,"memoryLimitBytes":17179869184}`, "application/json", 400},
+		{"source dir with ..", `{"name":"x","repoUrl":"https://github.com/o/r","port":80,"sourceDir":"web/../.."}`, "application/json", 400},
+		{"absolute source dir", `{"name":"x","repoUrl":"https://github.com/o/r","port":80,"sourceDir":"/web"}`, "application/json", 400},
+		{"source dir trailing slash", `{"name":"x","repoUrl":"https://github.com/o/r","port":80,"sourceDir":"web/"}`, "application/json", 400},
 		{"unknown field", `{"name":"x","repoUrl":"https://github.com/o/r","port":80,"privileged":true}`, "application/json", 400},
 		{"name taken", `{"name":"hello","repoUrl":"https://github.com/o/r","port":80}`, "application/json", 409},
 		// A cross-site form or text/plain fetch can't set JSON without a

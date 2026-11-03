@@ -53,7 +53,7 @@ func TestHealthz(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/healthz", nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeSource{}, nil, nil).ServeHTTP(rec, req)
+			New(&fakeSource{}, nil, nil, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -174,7 +174,7 @@ func TestListContainers(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/containers", nil)
 			rec := httptest.NewRecorder()
 
-			New(tt.source, nil, nil).ServeHTTP(rec, req)
+			New(tt.source, nil, nil, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -217,7 +217,7 @@ func TestStaticFiles(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeSource{ok: true}, nil, tt.static).ServeHTTP(rec, req)
+			New(&fakeSource{ok: true}, nil, nil, tt.static).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -254,7 +254,7 @@ func TestHistoryWindow(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/history"+tt.query, nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeSource{}, hist, nil).ServeHTTP(rec, req)
+			New(&fakeSource{}, hist, nil, nil).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
@@ -317,7 +317,7 @@ func TestHistoryBody(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/api/history", nil)
 			rec := httptest.NewRecorder()
 
-			New(&fakeSource{}, &fakeHistory{view: tt.view}, nil).ServeHTTP(rec, req)
+			New(&fakeSource{}, &fakeHistory{view: tt.view}, nil, nil).ServeHTTP(rec, req)
 
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200", rec.Code)

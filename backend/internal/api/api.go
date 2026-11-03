@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
@@ -76,6 +77,7 @@ type appResponse struct {
 	HealthCheckPath    string              `json:"healthCheckPath"`
 	MemoryLimitBytes   int64               `json:"memoryLimitBytes"`
 	CPULimitMillicores int                 `json:"cpuLimitMillicores"`
+	SourceDir          string              `json:"sourceDir"` // "" is the repo's root
 	CreatedAt          time.Time           `json:"createdAt"`
 	CurrentDeployment  *deploymentResponse `json:"currentDeployment"` // null if nothing is live
 }
@@ -106,7 +108,7 @@ func newAppResponse(a store.App, current *store.Deployment) appResponse {
 	r := appResponse{
 		ID: a.ID, Name: a.Name, RepoURL: a.RepoURL, Branch: a.Branch, Hostname: a.Hostname,
 		Port: a.Port, HealthCheckPath: a.HealthCheckPath, MemoryLimitBytes: a.MemoryLimitBytes,
-		CPULimitMillicores: a.CPULimitMillicores, CreatedAt: a.CreatedAt,
+		CPULimitMillicores: a.CPULimitMillicores, SourceDir: a.SourceDir, CreatedAt: a.CreatedAt,
 	}
 	if current != nil {
 		d := newDeploymentResponse(*current)
@@ -165,6 +167,7 @@ type createAppRequest struct {
 	HealthCheckPath    string `json:"healthCheckPath"`    // optional, default /
 	MemoryLimitBytes   int64  `json:"memoryLimitBytes"`   // optional, default 256 MiB
 	CPULimitMillicores int    `json:"cpuLimitMillicores"` // optional, default 500
+	SourceDir          string `json:"sourceDir"`          // optional, default the repo's root
 }
 
 // Mirrors the database's checks, so users get a clear 400 rather than a
@@ -173,6 +176,9 @@ var (
 	appNamePattern = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$`)
 	envKeyPattern  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,255}$`)
 	shaPattern     = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	// Path segments of a source directory; "." and ".." are refused
+	// separately.
+	dirPartPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 )
 
 const (
@@ -202,6 +208,9 @@ func (a *api) createApp(w http.ResponseWriter, r *http.Request) {
 	case req.CPULimitMillicores != 0 && (req.CPULimitMillicores < 1 || req.CPULimitMillicores > maxCPUMillicores):
 		badRequest(w, "cpuLimitMillicores: between 1 and 4000 (4 cores)")
 		return
+	case !validSourceDir(req.SourceDir):
+		badRequest(w, "sourceDir: a folder in the repo, e.g. services/web (no leading or trailing slash, no . or ..)")
+		return
 	}
 	if _, _, err := source.ParseRepoURL(req.RepoURL); err != nil {
 		badRequest(w, "repoUrl: want https://github.com/owner/repo")
@@ -212,6 +221,7 @@ func (a *api) createApp(w http.ResponseWriter, r *http.Request) {
 		Name: req.Name, RepoURL: req.RepoURL, Hostname: req.Name + "." + a.appsDomain, Port: req.Port,
 		Branch: req.Branch, HealthCheckPath: req.HealthCheckPath,
 		MemoryLimitBytes: req.MemoryLimitBytes, CPULimitMillicores: req.CPULimitMillicores,
+		SourceDir: req.SourceDir,
 	})
 	if err != nil {
 		writeError(w, r, err)
@@ -355,6 +365,20 @@ func (a *api) current(ctx context.Context, appID int64) (*store.Deployment, erro
 }
 
 // Helpers
+
+// validSourceDir matches the database's apps_source_dir_check: "" (the repo's
+// root) or a relative path without ".", ".." or empty parts.
+func validSourceDir(dir string) bool {
+	if dir == "" {
+		return true
+	}
+	for part := range strings.SplitSeq(dir, "/") {
+		if part == "." || part == ".." || !dirPartPattern.MatchString(part) {
+			return false
+		}
+	}
+	return true
+}
 
 func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
