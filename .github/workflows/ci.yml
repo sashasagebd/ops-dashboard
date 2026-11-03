@@ -315,6 +315,16 @@ jobs:
           visit selftest.apps.test /healthz | grep '"ok"' || on_failure
           test "$(docker ps -q --filter label=ops.platform.app=selftest | wc -l)" = 1 || on_failure
 
+          # A reboot starts containers in any order. With the platform up
+          # first, it must not take Caddy's fixed admin address (this broke
+          # Caddy on the server's first reboot). Stopping releases each
+          # container's addresses; starting assigns them afresh.
+          docker compose stop caddy platform
+          docker compose start platform
+          docker compose start caddy
+          docker compose up -d --wait --wait-timeout 60 caddy platform || on_failure
+          visit selftest.apps.test /healthz | grep '"ok"' || on_failure
+
           # App containers aren't Compose's, so remove them first, or the
           # apps network can't be deleted.
           docker rm -f $(docker ps -aq --filter label=ops.platform.managed=true)
