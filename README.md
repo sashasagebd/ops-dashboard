@@ -24,13 +24,21 @@ deploy anything yet.
 ## How it reaches Docker
 
 ```
-browser ──tailscale serve──▶ 127.0.0.1:8080 ──▶ dashboard ──docker-api network──▶ docker-proxy ──▶ /var/run/docker.sock
+browser ──tailscale serve──▶ 127.0.0.1:8080 ──▶ dashboard ──docker-api network──▶ docker-proxy ────▶ /var/run/docker.sock
+                                                 platform ──docker-rw network───▶ docker-proxy-rw ─▶ /var/run/docker.sock
 ```
 
 The dashboard container never mounts the Docker socket. It talks HTTP to
 [tecnativa/docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy),
 which only allows read requests to the container endpoints. The proxy has no
 published port and sits on an internal network only the dashboard can reach.
+
+The platform needs to build images and run containers, so it has a second
+proxy of its own that allows writes, limited to the container, image, build
+and network endpoints (no exec, volumes, secrets and so on). It's on a
+separate internal network that only the platform joins. See
+[docs/decisions/platform.md](docs/decisions/platform.md) for why the two are
+kept apart.
 
 ## Local development
 
@@ -73,7 +81,7 @@ cd frontend && npm run lint && npm test && npm run build
 | Variable | Default | Used by |
 |---|---|---|
 | `LISTEN_ADDR` | `:8080` (dashboard), `:8081` (platform) | backend: address to listen on |
-| `DOCKER_HOST` | `tcp://docker-proxy:2375` | dashboard: socket proxy address (`tcp://` only) |
+| `DOCKER_HOST` | `tcp://docker-proxy:2375` (dashboard), `tcp://docker-proxy-rw:2375` (platform) | backend: socket proxy address (`tcp://` only) |
 | `POLL_INTERVAL` | `5s` | dashboard: how often to poll Docker (Go duration, minimum `1s`) |
 | `STATIC_DIR` | unset | dashboard: built frontend to serve (set to `/static` in the image) |
 | `DATABASE_URL` | required | platform: Postgres connection URL (compose builds it from `POSTGRES_PASSWORD`). Database tests in `internal/store` also use it, and skip without it. |

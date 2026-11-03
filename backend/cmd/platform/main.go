@@ -1,6 +1,7 @@
 // Command platform runs the deploy platform's control plane: for now, its
-// database and a health endpoint; the API, job workers and reconciler come in
-// later phases (see docs/platform-plan.md). It's a separate service from the
+// database, its Docker client and a health endpoint; deploys, the API, job
+// workers and the reconciler come in later steps (see docs/platform-plan.md
+// and docs/roadmap.md). It's a separate service from the
 // dashboard so that monitoring keeps working when the platform doesn't, and
 // so the dashboard never needs write access to Docker (see
 // docs/decisions/platform.md).
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
@@ -60,6 +62,19 @@ func run(addr string) error {
 		return err
 	}
 	defer st.Close()
+
+	// The platform's own proxy, which allows writes; never the dashboard's
+	// read-only one. The default matches the service name in compose.yaml.
+	dockerClient, err := engine.New(envOr("DOCKER_HOST", "tcp://docker-proxy-rw:2375"))
+	if err != nil {
+		return err
+	}
+	defer dockerClient.Close()
+	// Best effort, in the background: a log line confirming Docker is
+	// reachable (and which version), without delaying startup or failing it.
+	// Docker being down shouldn't stop the API from serving what's in the
+	// database.
+	go logDockerVersion(ctx, dockerClient)
 
 	if err := waitForDatabase(ctx, st.Ping, time.Second, 30*time.Second); err != nil {
 		return err
@@ -131,6 +146,17 @@ func waitForDatabase(ctx context.Context, ping func(context.Context) error, firs
 		}
 		delay = min(delay*2, maxDelay)
 	}
+}
+
+func logDockerVersion(ctx context.Context, c *engine.Client) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	daemon, api, err := c.Version(ctx)
+	if err != nil {
+		slog.Warn("docker not reachable", "err", err)
+		return
+	}
+	slog.Info("docker reachable", "version", daemon, "apiVersion", api)
 }
 
 // newHandler returns the platform's HTTP routes. P1 adds the API; it will

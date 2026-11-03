@@ -42,9 +42,8 @@ services:
 
   # The deploy platform's control plane (docs/platform-plan.md). Same image
   # as the dashboard, different binary. A separate service so monitoring
-  # keeps working when the platform doesn't (docs/decisions/platform.md).
-  # No Docker access and no published port yet: P1 adds both its own socket
-  # proxy and the dashboard's route to it.
+  # keeps working when the platform doesn't, and so only the platform can
+  # write to Docker (docs/decisions/platform.md). No published port.
   platform:
     build: .
     entrypoint: ["/platform"]
@@ -53,6 +52,7 @@ services:
       # Hex passwords (see .env.example) need no escaping in a URL. No TLS:
       # the connection never leaves the internal platform-db network.
       DATABASE_URL: postgres://platform:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/platform?sslmode=disable
+      DOCKER_HOST: tcp://docker-proxy-rw:2375
     # The image's HEALTHCHECK is the dashboard's, so it's replaced here. The
     # platform only listens once Postgres answers and migrations have run,
     # hence the longer start period.
@@ -70,12 +70,39 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      docker-proxy-rw:
+        condition: service_started
     networks:
       - platform-db
+      - docker-rw
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 128m
+
+  # The platform's socket proxy. Unlike the dashboard's, it allows writes:
+  # building images and creating, starting, stopping and removing
+  # containers. With POST=1 the proxy allows every method on each enabled
+  # group, so the protection is enabling as few groups as possible (exec,
+  # volumes, swarm, secrets and the rest stay off) plus only the platform
+  # being able to reach it. Creating containers is still root-equivalent on
+  # the host; see docs/decisions/platform.md.
+  docker-proxy-rw:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: unless-stopped
+    environment:
+      POST: 1
+      CONTAINERS: 1
+      IMAGES: 1
+      BUILD: 1
+      NETWORKS: 1
+    volumes:
+      # :ro doesn't restrict the API (see docker-proxy); it only stops this
+      # container replacing the socket file itself.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-rw
+    security_opt: ["no-new-privileges:true"]
 
   postgres:
     image: postgres:18.6
@@ -116,6 +143,10 @@ networks:
   platform-db:
     # Only the platform and Postgres are on it, so Postgres has no published
     # port and nothing else can reach it.
+    internal: true
+  docker-rw:
+    # Only the platform and its write proxy: nothing else (in particular, no
+    # deployed app) can reach the proxy that creates containers.
     internal: true
 
 volumes:

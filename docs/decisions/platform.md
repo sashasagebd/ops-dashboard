@@ -269,3 +269,109 @@ but goes against "everything in Docker" and is harder to pin and reproduce);
 the `-alpine` image (smaller download, but musl's locale behaviour differs
 from the glibc that most Postgres guides assume, and disk space isn't the
 constraint here).
+
+## Phase 1 (approved 2026-11-02)
+
+### The platform's write proxy: few endpoint groups, nothing finer
+
+**What:** a second `tecnativa/docker-socket-proxy` for the platform only, on
+its own internal network, with `POST=1` and only the `CONTAINERS`, `IMAGES`,
+`BUILD` and `NETWORKS` groups enabled. The dashboard keeps its read-only
+proxy.
+
+**Why:** the proxy's rules are per endpoint group, and with `POST=1` every
+write method in an enabled group is allowed (its config is one
+`deny unless GET or POST=1` line, then an allow line per group). So the only
+control is which groups are on. These four are what building and running
+apps need. Exec, volumes, swarm, secrets, plugins and the rest stay off,
+which blocks e.g. running commands inside the game servers' containers.
+Being able to create containers is still root-equivalent, as the Phase 0
+entry says. The proxy narrows the API surface; it doesn't make that safe.
+The real guarantees are that the platform builds every container config
+itself, and that the proxy is reachable only from the platform.
+
+**Alternatives:** the proxy's `ALLOW_START`/`ALLOW_STOP` switches (they allow
+start and stop without `POST=1`, but not create, build or remove, which
+deploys need); a proxy that filters request bodies (e.g. refusing privileged
+containers), which would be stronger but is a custom component to write and
+maintain; mounting the socket into the platform (no narrowing at all).
+
+### Code comes from GitHub's tarball API
+
+**What:** to deploy commit `abc123`, the platform downloads
+`/repos/{owner}/{repo}/tarball/abc123`, strips GitHub's top-level folder,
+and streams the result to Docker as the build context, with a size cap.
+Public repos only in Phase 1.
+
+**Why:** a Docker build context is a tar file anyway, so this is one
+streaming download and one streaming upload, with no git anywhere. It's
+pinned to an exact commit, and private repos later only need a token header.
+Because the platform handles the bytes, it can cap the size and record
+exactly what was built.
+
+**Alternatives:** cloning with `go-git` (works with any git host, but a large
+dependency, and a full clone where a snapshot is enough); passing the repo
+URL to Docker and letting the daemon clone it (least code, but the platform
+can't limit or inspect what's fetched, and Docker's daemon would need to be
+able to reach GitHub on the platform's behalf).
+
+### Caddy, configured through its admin API
+
+**What:** a Caddy container receives all app traffic. The platform adds,
+replaces and removes one route per app through Caddy's admin API, which is
+only reachable on an internal network that apps aren't on. Because routes
+set this way live in Caddy's memory, the platform re-applies them all when it
+starts.
+
+**Why:** routing is part of the deploy. Phase 3's zero-downtime switch is
+"start the new container, then repoint the route", and that's easiest to
+reason about when the platform does it explicitly. Caddy's admin API takes
+small JSON changes with no reload. The admin API has no authentication, so
+keeping it off any network an app can reach is what protects it.
+
+**Alternatives:** Traefik with Docker label discovery (very little code, but
+Traefik would need Docker access of its own, and the routing logic would
+live in Traefik rather than in code you can show and test); generating a
+Caddyfile and reloading (simpler to inspect, but rewrites everything for one
+route, and is file-based state to keep in sync).
+
+### Deploys run in a goroutine (Phase 1 only)
+
+**What:** the "deploy" API call records a `queued` deployment and starts a
+goroutine that runs the whole flow, allowing one deploy per app at a time.
+
+**Why:** it gets an end-to-end deploy working without the job queue, so
+Phase 2 can focus on the queue itself. The known gap is deliberate: if the
+platform restarts mid-deploy, the deployment stays stuck in `building` or
+`starting` forever. Phase 2 fixes this with jobs in Postgres that survive
+restarts. "Here's what broke, here's the queue that fixed it" is a better
+story than starting with the queue.
+
+**Alternatives:** building the queue first (more correct from day one, but
+two hard things at once in the same phase).
+
+### Docker's restart policy keeps apps up until the reconciler exists
+
+**What:** app containers get `restart: unless-stopped`.
+
+**Why:** without a restart policy, a crashed app would stay down until
+Phase 4. Docker's policy restarts a container that exits, which covers the
+common case. Phase 4 decides whether the reconciler takes this over
+completely or works alongside it.
+
+**Alternatives:** no restart policy until Phase 4 (crashes stay down for
+weeks of development).
+
+### Apps can only reach Caddy
+
+**What:** app containers are on one network, `apps`, shared with Caddy's
+proxy side and nothing else. The platform, Postgres, both socket proxies and
+Caddy's admin API are on other internal networks.
+
+**Why:** an app is someone's code (even if that someone is you) exposed to
+the internet. If it's compromised, the attacker should land in a container
+that can talk to Caddy and the internet, not to the database holding every
+app's encrypted secrets or the proxy that can create containers.
+
+**Alternatives:** one shared network (simpler, but every app could reach the
+control plane).

@@ -5,7 +5,7 @@ platform in [platform-plan.md](platform-plan.md) (P0 onwards, numbered after
 the plan's phases). Each numbered step is one small, reviewed commit. Design
 reasoning lives in [decisions/](decisions/).
 
-_Last updated: 2026-10-28_
+_Last updated: 2026-11-02_
 
 | Milestone | Status |
 |---|---|
@@ -13,18 +13,19 @@ _Last updated: 2026-10-28_
 | M2: Full container status | ✅ Done, deployed |
 | M3: Host stats | ✅ Done, deployed |
 | M4: Discord alerts | ⏸️ Deferred (not in v1; plan kept below) |
-| M5: Portfolio polish | 🚧 In progress (5.1–5.3 done, 5.4 dropped) |
-| M6: History sparklines | 🚧 Committed (`17f6f1e`); deploy not confirmed |
-| P0: Platform foundations | 🚧 In progress (0.1–0.3 green in CI on the `platform-p0` draft PR; 0.4 in review) |
+| M5: Portfolio polish | ⏸️ Set aside (5.1–5.3 done and deployed, 5.4 dropped, 5.5–5.6 set aside for the platform) |
+| M6: History sparklines | ✅ Done, deployed (with P0, 2026-11-02) |
+| P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
+| P1: Manual deploy of one app | 🚧 In progress (plan approved 2026-11-02; 1.1–1.2 in review) |
 
-**Where we left off (2026-10-28):** platform work has started. M5's 5.5
-(README) and 5.6 (`v1.0.0` tag) are set aside for now (owner's call); the
-README gets rewritten for the platform later anyway. 5.1–5.3 and M6 are
-committed, but it isn't confirmed that they're deployed. P0's deploy step
-(0.4) ships them too, so its checks include theirs. The owner commits P0 as
-a whole at the end of the phase (squash-merging the `platform-p0` PR). Next:
-push 0.4 to the PR, check CI is green, squash-merge, deploy and run 0.4's
-server checks.
+**Where we left off (2026-11-02):** Phase 0 of the platform is done and
+deployed (PR #1, merged as `93ccef8`): the `platform` service and its Postgres
+run on the server next to the dashboard, and the owner confirmed it's all
+working. That deploy also shipped 5.1–5.3 and M6. M5's 5.5 (README) and 5.6
+(`v1.0.0` tag) are set aside; the README gets rewritten for the platform
+later anyway. The Phase 1 plan is approved (2026-11-02) and work has
+started on the `platform-p1` branch; the owner commits and merges at the end
+of the phase, with CI run through a draft PR along the way.
 
 ## M1: Thinnest end-to-end slice ✅
 
@@ -139,7 +140,7 @@ Draft decisions (not approved):
   dropped. No persistence: a restart forgets pending alerts, which is fine for
   a home server.
 
-## M5: Portfolio polish 🚧
+## M5: Portfolio polish ⏸️
 
 **Goal:** someone landing on the GitHub repo understands what it is, how it's
 built and why, in a couple of minutes, and the deploy is a bit more robust.
@@ -166,7 +167,7 @@ Decisions (approved 2026-10-01):
 - **No image publishing** (e.g. to GHCR) for now: the server builds from
   source, so a registry would add moving parts for no gain.
 
-## M6: History sparklines 🚧
+## M6: History sparklines ✅
 
 Post-v1 scope (see [spec.md](spec.md)), but started before `v1.0.0` was
 tagged, at the owner's request. Plan approved 2026-10-06.
@@ -205,7 +206,7 @@ Decisions (approved 2026-10-06):
 - **No chart library.** A sparkline is ~40 lines of SVG; Recharts or similar
   would add far more bundle than it saves.
 
-## P0: Platform foundations 🚧
+## P0: Platform foundations ✅
 
 Phase 0 of [platform-plan.md](platform-plan.md). Plan approved 2026-10-28;
 decisions in [decisions/platform.md](decisions/platform.md).
@@ -217,10 +218,10 @@ now, so database tests skip locally and run in CI.
 
 | Step | What | Status |
 |---|---|---|
-| 0.1 | Docs: decision log ([decisions/platform.md](decisions/platform.md)), this milestone, spec note. No code. | ✅ Not committed |
-| 0.2 | `cmd/platform` skeleton (`/healthz`, `-healthcheck`, `DATABASE_URL` config) and `internal/store`: `pgx` pool and the embedded migration runner (advisory lock, one transaction per file, `schema_migrations`). First migration creates `apps`. Unit tests for anything that doesn't need a database; database tests skip without `DATABASE_URL`. Dockerfile builds both binaries. | ✅ Reviewed, not committed. Also: the healthcheck moved to `internal/healthcheck` for both binaries; the platform waits for Postgres with backoff before migrating and listening; a database newer than the binary is refused. Database tests written but not yet run (they need 0.3's CI). |
+| 0.1 | Docs: decision log ([decisions/platform.md](decisions/platform.md)), this milestone, spec note. No code. | ✅ `8595b2a` |
+| 0.2 | `cmd/platform` skeleton (`/healthz`, `-healthcheck`, `DATABASE_URL` config) and `internal/store`: `pgx` pool and the embedded migration runner (advisory lock, one transaction per file, `schema_migrations`). First migration creates `apps`. Unit tests for anything that doesn't need a database; database tests skip without `DATABASE_URL`. Dockerfile builds both binaries. | ✅ `8595b2a`. Also: the healthcheck moved to `internal/healthcheck` for both binaries; the platform waits for Postgres with backoff before migrating and listening; a database newer than the binary is refused. Database tests first ran in 0.3's CI, green. |
 | 0.3 | CI: a Postgres service container so the database tests run (migrations apply, re-running does nothing, concurrent runs are serialized by the lock). The image job also checks the platform binary is in the image. | ✅ Green in CI (draft PR, `8595b2a`). `postgres:18.6` (newest; there's no 19 image yet), the same tag 0.4's compose will pin. Database tests fail instead of skipping if `CI` is set without `DATABASE_URL`. `cache-dependency-path` is now `go.sum`. The image job goes beyond checking the binary exists: it starts `/platform` before its Postgres, so the smoke test also covers waiting for the database, then migrating and passing its healthcheck. |
-| 0.4 | Compose: `postgres` (pinned, named volume, memory limit, internal `platform-db` network, no published port) and `platform` services; `.env.example` and README config table. The platform has no Docker access yet (that arrives with its write proxy in P1). Deploy; owner checks the platform is healthy, migrations ran, and the dashboard is unchanged. | 🚧 In review; CI not yet run. Memory limits 128 MB (platform) and 512 MB (Postgres); volume at `/var/lib/postgresql` (Postgres 18's layout); `start_interval` so services report healthy within seconds; a 1-minute stop grace period for Postgres. CI gains a "Compose stack" step: `docker compose up --wait` of the real file, checks the dashboard lists the new containers, restarts the platform and checks it finds nothing left to migrate. |
+| 0.4 | Compose: `postgres` (pinned, named volume, memory limit, internal `platform-db` network, no published port) and `platform` services; `.env.example` and README config table. The platform has no Docker access yet (that arrives with its write proxy in P1). Deploy; owner checks the platform is healthy, migrations ran, and the dashboard is unchanged. | ✅ `2666fae`, deployed 2026-11-02; owner confirmed the server checks. Memory limits 128 MB (platform) and 512 MB (Postgres); volume at `/var/lib/postgresql` (Postgres 18's layout); `start_interval` so services report healthy within seconds; a 1-minute stop grace period for Postgres. CI gains a "Compose stack" step: `docker compose up --wait` of the real file, checks the dashboard lists the new containers, restarts the platform and checks it finds nothing left to migrate. |
 
 Decisions (approved 2026-10-28): see
 [decisions/platform.md](decisions/platform.md). In short: a separate service
@@ -229,15 +230,83 @@ in the same module and image; the dashboard stays read-only and forwards
 Docker SDK for the platform only; Postgres reachable only from the platform;
 `pgx`; an embedded migration runner; real-Postgres tests in CI.
 
+## P1: Manual deploy of one app 🚧
+
+Phase 1 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-02
+(owner: "get started", taking the recommended option for each choice below).
+
+**Goal (definition of done):** register a sample app in the dashboard, click
+Deploy, and reach it at `<app>.<domain>` over the public internet, with the
+dashboard still working as before and nothing new reachable from the LAN.
+
+**How it fits together:**
+
+```
+you ──tailscale──► dashboard ──/api/platform/*──► platform ──► Postgres
+                                                     ├──► docker-proxy-rw ──► Docker
+                                                     ├──► Caddy admin API (:2019, internal)
+                                                     └──► GitHub (code tarball at a commit)
+public ──► Cloudflare ──tunnel──► cloudflared ──► Caddy :80 ──► app containers (apps network)
+```
+
+Deploy flow (one `deployments` row per attempt): `queued` → download the
+repo at the exact commit → build its Dockerfile, tagged `<app>:<sha>`
+(`building`) → start a container with platform labels, decrypted env vars and
+the app's limits, on the `apps` network only (`starting`) → point the app's
+Caddy route at it and stop the previous one (`healthy`), or `failed` with an
+error.
+
+| Step | What | Status |
+|---|---|---|
+| 1.1 | This plan; decision entries. No code. | 🚧 In review, not committed |
+| 1.2 | Docker access for the platform: `docker-proxy-rw` (its own internal network; `POST=1` with only `CONTAINERS`, `IMAGES`, `BUILD`, `NETWORKS`), the official SDK (`github.com/moby/moby/client`) behind `internal/engine`, `tcp://` only. The platform logs the Docker version at startup (best effort, non-fatal). No container operations yet. | 🚧 In review, not committed; CI not yet run. The SDK adds ~18 indirect modules (mostly OpenTelemetry and OCI types) but only ~0.5 MB to the binary. CI probes the proxy's rules from a container on its network (containers/images 200; exec, volumes, secrets 403). Also: `.gitattributes` keeps `.go` files LF, since Git for Windows' `autocrlf` checked P0's files out with CRLF and broke the local `gofmt` check. |
+| 1.3 | Migrations: `deployments` (status, commit, image, timestamps, error) and `app_env_vars` (AES-256-GCM encrypted values; key `PLATFORM_SECRET_KEY` from `.env`); `internal/secrets` for encryption, the app ID bound in as associated data so a value can't be moved to another app. Store methods for apps, env vars and deployments. | |
+| 1.4 | Getting code and building: download GitHub's tarball for a commit (size-capped, public repos only for now), re-pack it as a build context, build the image with output kept for the deployment's error/log. Behind interfaces; tested against fakes and `httptest`. | |
+| 1.5 | Running: create and start the app container (labels `ops.platform.app` / `ops.platform.deployment`, limits, env, `apps` network, Docker restart policy `unless-stopped` until P4's reconciler), wait for its health-check path, stop and remove the previous one. | |
+| 1.6 | Caddy: a pinned Caddy service, its admin API only on an internal network the apps can't reach, `internal/router` to add/replace/remove an app's route. Routes are re-applied when the platform starts (Caddy's admin config is in memory). | |
+| 1.7 | The deploy orchestration (one goroutine per deploy, one deploy per app at a time, status written at each stage) and the platform API: create/list/get apps, set/delete env vars (values never returned), trigger a deploy of a commit, list deployments. | |
+| 1.8 | Dashboard: forwards `/api/platform/*` to the platform; frontend routing; Apps list and App detail pages (current deployment and status, Deploy button, env var names). | |
+| 1.9 | cloudflared (tunnel token in `.env`, wildcard DNS), an `examples/hello` sample app, deploy, owner checks the definition of done on the server. | |
+
+Decisions (approved 2026-11-02), with entries in
+[decisions/platform.md](decisions/platform.md):
+- **Code via GitHub's tarball API**, not `go-git` or letting Docker clone:
+  no git dependency, pinned to an exact SHA, and the platform controls the
+  build context (size limit).
+- **Caddy via its admin API**, not Traefik's label discovery: the platform
+  owns routing as code, and Traefik would need Docker access of its own.
+- **Deploys run in a goroutine in P1.** Known gap: a platform restart
+  mid-deploy leaves the deployment stuck in `building`/`starting`. P2's
+  Postgres job queue fixes it; the before/after is part of the story.
+- **Docker's `unless-stopped` restarts crashed apps until P4.** Without it a
+  crashed app would stay down until the reconciler exists.
+- **Network isolation:** apps are only on `apps` (shared with Caddy). They
+  can't reach the platform, Postgres, the proxies or Caddy's admin API.
+- **Frontend routing:** small and dependency-free if it stays at two or three
+  pages; revisited in 1.8.
+
+Risks to check early:
+- **Building through the API.** BuildKit over the Engine API needs session
+  and gRPC endpoints that the socket proxy would also have to allow; the
+  legacy builder only needs `/build` but is deprecated. Decided in 1.4 after
+  checking the server's Docker version.
+- **Owner prerequisites before 1.9:** a domain on Cloudflare and a Cloudflare
+  Tunnel (exact steps given in 1.9).
+
 ## Open questions
 
-None right now.
+- **Domain for platform apps** (needed by 1.9): which domain on Cloudflare
+  apps live under (`<app>.<domain>`), or whether one needs registering first.
+- **Docker version on the server** (needed by 1.4): `docker version` output,
+  to decide between BuildKit and the legacy builder.
 
 Resolved:
 - **M2 plan** approved 2026-10-01.
 - **M3 plan** approved 2026-10-01.
 - **M5 plan** approved 2026-10-01; 5.4 (demo mode) dropped 2026-10-06.
 - **M6 plan** approved 2026-10-06.
+- **P0 plan** approved 2026-10-28.
+- **P1 plan** approved 2026-11-02.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a
   `Dockerfile` and `compose.yaml`). It wasn't started; it was brought up with
   `docker compose up -d` on 2026-10-01 and the dashboard shows it with no code

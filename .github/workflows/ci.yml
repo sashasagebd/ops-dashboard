@@ -153,6 +153,24 @@ jobs:
             [ "$i" = 10 ] && { docker compose logs dashboard; exit 1; }
             sleep 1
           done
+          # The platform reaches Docker through its write proxy (logged in the
+          # background at startup, so allow it a few seconds).
+          for i in $(seq 1 10); do
+            docker compose logs --no-log-prefix platform | grep 'docker reachable' && break
+            [ "$i" = 10 ] && { docker compose logs platform; exit 1; }
+            sleep 1
+          done
+          # The write proxy allows what deploys need and refuses the rest,
+          # probed from a throwaway container on its network.
+          probe() {
+            docker run --rm --network dashboard_docker-rw curlimages/curl:8.11.1 \
+              -s -o /dev/null -w '%{http_code}' -X "$1" "http://docker-proxy-rw:2375$2"
+          }
+          test "$(probe GET /containers/json)" = 200
+          test "$(probe GET /images/json)" = 200
+          test "$(probe POST /exec/none/start)" = 403
+          test "$(probe GET /volumes)" = 403
+          test "$(probe GET /secrets)" = 403
           # A restart (like a redeploy) keeps the volume and finds nothing
           # left to migrate.
           docker compose restart platform

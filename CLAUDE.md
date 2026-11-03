@@ -31,7 +31,8 @@ over Tailscale.
   - `internal/server/`: HTTP routes; reads snapshots through its `SnapshotSource` interface, never Docker directly
   - `internal/monitor/`: background poller (`Run` on a ticker, `Poll` for one round, called directly in tests); holds the latest snapshot and the previous stats samples for CPU %; feeds `internal/history` after each successful poll
   - `internal/history/`: in-memory trend data (1-minute buckets of avg/max, 24h ring per series, keyed by container name; gaps are `OK: false`, never 0). Not persisted.
-  - `internal/docker/`: Docker Engine API client (plain `net/http`, no SDK)
+  - `internal/docker/`: the dashboard's read-only Docker Engine API client (plain `net/http`, no SDK)
+  - `internal/engine/`: the platform's Docker client (official SDK, `github.com/moby/moby/client`), through `docker-proxy-rw`; `tcp://` only. Methods are added only as the deploy flow needs them.
   - `internal/host/`: host CPU (`/proc/stat`), memory (`/proc/meminfo`) and disk (`statfs`, Linux-only via build tag; stub elsewhere so Windows dev still builds)
 - `frontend/`: Vite + React + TypeScript, Oxlint, Vitest + Testing Library
 - `Dockerfile`, `compose.yaml`: one image with both binaries (Go serves the built frontend from `STATIC_DIR`); compose runs the dashboard and its socket proxy, and the platform (entrypoint `/platform`) and its `postgres` (volume `platform-db`, internal `platform-db` network)
@@ -64,7 +65,7 @@ Deploying is done by the owner on the server (`homelab`), which only pulls: `cd 
 
 ## Constraints (do not break)
 
-- Never mount `/var/run/docker.sock` into the dashboard container. Docker is reached only through `tecnativa/docker-socket-proxy` (`POST=0`, only needed endpoints enabled) on the internal `docker-api` network. The Go client accepts only `tcp://` hosts.
+- Never mount `/var/run/docker.sock` into the dashboard or platform containers. The dashboard reaches Docker only through `docker-proxy` (`POST=0`, `CONTAINERS` only) on the internal `docker-api` network. The platform reaches it only through `docker-proxy-rw` (`POST=1` with only `CONTAINERS`, `IMAGES`, `BUILD`, `NETWORKS`) on the internal `docker-rw` network, which nothing else joins. Enable another proxy group only with a decision entry. Both Go clients accept only `tcp://` hosts.
 - Publish the dashboard only on `127.0.0.1` (Docker bypasses UFW); remote access is via `tailscale serve`.
 - The platform and Postgres publish no ports. Postgres is only on the internal `platform-db` network; nothing but the platform can reach it.
 - Keep Docker access behind Go interfaces so logic is tested against fakes; tests use `httptest`, never a real Docker daemon.
