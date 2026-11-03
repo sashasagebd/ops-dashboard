@@ -18,14 +18,33 @@ _Last updated: 2026-11-02_
 | P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
 | P1: Manual deploy of one app | 🚧 In progress (1.1–1.4 green in CI; 1.5 in review) |
 
-**Where we left off (2026-11-02):** Phase 0 of the platform is done and
-deployed (PR #1, merged as `93ccef8`): the `platform` service and its Postgres
-run on the server next to the dashboard, and the owner confirmed it's all
-working. That deploy also shipped 5.1–5.3 and M6. M5's 5.5 (README) and 5.6
-(`v1.0.0` tag) are set aside; the README gets rewritten for the platform
-later anyway. The Phase 1 plan is approved (2026-11-02) and work has
-started on the `platform-p1` branch; the owner commits and merges at the end
-of the phase, with CI run through a draft PR along the way.
+**Where we left off (2026-11-03):** P0 is done and deployed (PR #1). P1 is
+in progress on the `platform-p1` branch, with a draft PR that runs CI on each
+push. The owner commits and pushes after each step, and merges at the end of
+the phase. Steps 1.1–1.4 are green in CI. 1.5 (Caddy, the deploy flow, the
+platform API, and CI's end-to-end deploy of the commit itself) is written and
+passes locally, but the owner hasn't pushed it yet. **Next:** push 1.5. If
+CI fails, the "Compose stack" step prints the app state and the platform and
+Caddy logs; fix that first. Then 1.6, the last P1 step.
+
+Notes for resuming:
+- **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
+  to 6 steps). Within a step, keep going without stopping unless owner
+  action is needed. Only the owner commits.
+- **Undecided:** whether to let Claude commit and push to feature branches
+  (never `main`), with GitHub branch protection on `main` requiring a PR
+  and green CI. Suggested, not decided; leave commits to the owner until
+  they say so.
+- **CI vs the server:** CI's Docker is 28.0.4 and the server's is 29.8.1, so
+  the server deploy in 1.6 is the final check (the legacy builder exists in
+  both).
+- **Not yet done from P0:** the platform's baseline memory footprint
+  (`docker stats --no-stream dashboard-platform-1 dashboard-postgres-1` on
+  the server; a measured number the plan asks for), and a reboot test of the
+  P0 services. Both fit naturally into 1.6's server checks, which include a
+  reboot anyway.
+- M5's 5.5 (README) and 5.6 (`v1.0.0` tag) are set aside; the README gets
+  rewritten for the platform later.
 
 ## M1: Thinnest end-to-end slice ✅
 

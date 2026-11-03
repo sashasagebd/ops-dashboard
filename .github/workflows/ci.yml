@@ -104,6 +104,7 @@ jobs:
           docker run -d --name platform --network ci --entrypoint /platform \
             -e DATABASE_URL='postgres://platform:ci-only@db:5432/platform?sslmode=disable' \
             -e PLATFORM_SECRET_KEY="$(openssl rand -hex 32)" \
+            -e APPS_DOMAIN=apps.test \
             ops-dashboard:ci
           docker run -d --name db --network ci \
             -e POSTGRES_USER=platform -e POSTGRES_PASSWORD=ci-only -e POSTGRES_DB=platform \
