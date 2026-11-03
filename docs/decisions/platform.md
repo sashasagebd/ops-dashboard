@@ -526,3 +526,98 @@ contained in one function, so it's cheap to change.
 **Lesson:** reading the source got the first half right and missed the
 second. The CI check that does a real build is what caught it, before any
 deploy depended on it.
+
+### Caddy's admin API on a fixed IP, on a network apps aren't on (2026-11-03)
+
+**What:** Caddy's admin API listens only on `10.203.0.2:2019`, its address on
+an internal `caddy-admin` network (fixed subnet `10.203.0.0/29`) that only
+the platform shares. Caddy's proxy side is on `platform-apps`, the network
+apps are on.
+
+**Why:** the admin API has no authentication: anything that can reach it can
+rewrite routing. Caddy has to be on the apps network to proxy to them, so
+listening on all interfaces would hand every deployed app that power.
+Binding to one known address on a separate network keeps it reachable from
+the platform only, and CI checks an app can't connect. The subnet is outside
+Docker's default address pools, so it can't clash with networks Docker
+creates on its own.
+
+**Alternatives:** a Unix socket shared through a volume (no network at all,
+but Caddy runs as root and the platform as a non-root user, so socket
+permissions get fiddly); Caddy's admin API with authentication (only
+available through an extra module and remote-admin certificates).
+
+### Routes are applied declaratively, from the database (2026-11-03)
+
+**What:** every routing change sends Caddy the complete table, built from
+the database (each app's live deployment) plus probe routes for deployments
+being checked, replacing Caddy's whole app server in one PATCH. Caddy runs
+with `--resume`, so it restarts with its last config, and the platform
+re-sends the table whenever it starts.
+
+**Why:** incremental add/remove calls can drift from reality (a request
+fails halfway, Caddy restarts, the platform crashes between steps), and then
+need their own bookkeeping to repair. Sending the whole desired state makes
+every update self-correcting and safe to repeat. This is the reconciliation
+idea of Phase 4 in miniature, for routes. At a handful of apps the table is
+tiny. PATCHing the whole server object, rather than only its routes array,
+means it doesn't depend on Caddy keeping an empty array in its saved config.
+
+**Alternatives:** per-route `@id`s with `PUT`/`DELETE` (less data per
+request, but state to keep in step); regenerating a Caddyfile and reloading
+(file-based state, and a reload per change).
+
+### Startup cleanup of orphaned app containers (2026-11-03)
+
+**What:** when the platform starts (no deploys in flight yet), it removes
+every platform-labelled container that isn't an app's live deployment.
+
+**Why:** a deploy cut off by a crash leaves its container behind. With the
+`unless-stopped` restart policy it would run forever, unrouted, using
+memory. Only containers carrying the platform's label are considered, so
+nothing else on the host is touched. Phase 4's reconciler does this
+continuously; this covers the restart case until then.
+
+**Alternatives:** leaving cleanup to Phase 4 (orphans pile up for weeks of
+development).
+
+### Simple cross-site protection for an API without a login (2026-11-03)
+
+**What:** the platform API only accepts request bodies with
+`Content-Type: application/json` (otherwise 415), and rejects unknown JSON
+fields.
+
+**Why:** the API has no login, because only tailnet devices can reach it. But
+a web page on any site, opened in a browser on one of those devices, could
+still send requests to it (cross-site request forgery). A cross-site request
+can only carry a JSON content type after a CORS preflight, which this API
+never approves, so such a page can't trigger a deploy or change env vars.
+Step 1.6 adds Go's `http.CrossOriginProtection` in the dashboard, which
+forwards to the API, as a second check based on the browser's
+`Sec-Fetch-Site`/`Origin` headers.
+
+**Alternatives:** CSRF tokens (needs sessions, which a single-user API with
+no login doesn't have); a login (worth adding if the API is ever reachable
+from outside the tailnet).
+
+### CI deploys this very commit end to end (2026-11-03)
+
+**What:** CI's compose step uses the platform's API to register an app
+pointing at this repo, then deploys the commit being tested. The root
+Dockerfile builds the dashboard image, which serves `/healthz` without
+needing anything else. CI then checks:
+- a visitor reaches it through Caddy by hostname;
+- a redeploy replaces the container;
+- a failing deploy (a commit that doesn't exist) leaves the site up and
+  says why;
+- apps can reach neither Caddy's admin API nor the platform;
+- routes survive restarts of Caddy and of the platform.
+
+**Why:** unit tests use fakes, and the dev PC has no Docker, so this is the
+first place the real pieces (GitHub, the proxy, the legacy builder, Docker
+networks, Caddy) meet before anything goes to the server. It already earned
+its keep at the build step: BuildKit's need for a session only showed up in a
+real build. The cost is a few minutes of CI per run.
+
+**Alternatives:** a separate sample repo (another repo to keep in step);
+testing only on the server (a slow, manual feedback loop).

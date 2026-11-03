@@ -19,7 +19,8 @@ deploy anything yet.
 | `backend/` | Go: `cmd/dashboard` (API server; also serves the built frontend in production) and `cmd/platform` (the deploy platform). |
 | `frontend/` | React + TypeScript + Vite single-page app. |
 | `Dockerfile` | Builds the frontend and both Go binaries into one small image. |
-| `compose.yaml` | The dashboard and its read-only Docker socket proxy; the platform and its Postgres. |
+| `compose.yaml` | The dashboard and its read-only Docker socket proxy; the platform, its Postgres, its write proxy, and Caddy. |
+| `caddy/caddy.json` | Caddy's bootstrap config: its admin address and an empty app server, whose routes the platform manages. |
 
 ## How it reaches Docker
 
@@ -88,6 +89,9 @@ cd frontend && npm run lint && npm test && npm run build
 | `DASHBOARD_PORT` | `8080` | compose: host port, always bound to `127.0.0.1` |
 | `POSTGRES_PASSWORD` | required | compose: password for the platform's Postgres; `openssl rand -hex 32`. Only read when the database volume is first created. |
 | `PLATFORM_SECRET_KEY` | required | platform: key that encrypts app env vars (AES-256-GCM); `openssl rand -hex 32`. Back it up: without it, stored env var values are unrecoverable. |
+| `APPS_DOMAIN` | required | platform: apps are served at `<name>.<APPS_DOMAIN>`; for now `<tailscale-ip-with-dashes>.sslip.io` |
+| `GITHUB_TOKEN` | unset | platform: optional token for downloading app code (higher rate limit, private repos); read-only Contents access is enough |
+| `APPS_NETWORK`, `CADDY_ADMIN_URL`, `CADDY_PROXY_URL` | `platform-apps`, `http://10.203.0.2:2019`, `http://10.203.0.2:80` | platform: set in `compose.yaml`; only change them together with it |
 | `API_TARGET` | `http://localhost:8080` | frontend dev server only: where `npm run dev` forwards `/api` |
 
 ## Deploying to the server

@@ -208,6 +208,38 @@ func TestBuildContextErrors(t *testing.T) {
 	}
 }
 
+func TestTokenGoesToTheAPIOnly(t *testing.T) {
+	var apiAuth, downloadAuth string
+	download := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloadAuth = r.Header.Get("Authorization")
+		_, _ = w.Write(githubTarball(t))
+	}))
+	defer download.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiAuth = r.Header.Get("Authorization")
+		// A different host, like GitHub's API redirecting to codeload.
+		http.Redirect(w, r, download.URL+"/archive.tar.gz", http.StatusFound)
+	}))
+	defer api.Close()
+
+	g := NewGitHub()
+	g.APIBase = api.URL
+	g.Token = "ghp_secret"
+	rc, err := g.BuildContext(t.Context(), "https://github.com/owner/repo", sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readContext(t, rc); err != nil {
+		t.Fatal(err)
+	}
+	if apiAuth != "Bearer ghp_secret" {
+		t.Errorf("API request Authorization = %q, want the token", apiAuth)
+	}
+	if downloadAuth != "" {
+		t.Errorf("download host received Authorization %q; the token must not follow the redirect", downloadAuth)
+	}
+}
+
 func TestBuildContextNotFound(t *testing.T) {
 	g := fakeGitHub(t, nil)
 	other := "fedcba9876543210fedcba9876543210fedcba98" // not served

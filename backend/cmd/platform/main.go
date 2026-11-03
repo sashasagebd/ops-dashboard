@@ -1,7 +1,7 @@
-// Command platform runs the deploy platform's control plane: for now, its
-// database, its Docker client and a health endpoint; deploys, the API, job
-// workers and the reconciler come in later steps (see docs/platform-plan.md
-// and docs/roadmap.md). It's a separate service from the
+// Command platform runs the deploy platform's control plane: the API for
+// registering and deploying apps, the deploys themselves, and Caddy's routes.
+// Job workers and the reconciler come in later phases (see
+// docs/platform-plan.md and docs/roadmap.md). It's a separate service from the
 // dashboard so that monitoring keeps working when the platform doesn't, and
 // so the dashboard never needs write access to Docker (see
 // docs/decisions/platform.md).
@@ -20,9 +20,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/api"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/deploy"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/router"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
 
@@ -52,6 +56,12 @@ func run(addr string) error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		return errors.New("DATABASE_URL is required")
+	}
+	// Apps get the hostname <name>.<APPS_DOMAIN>: for now a sslip.io name
+	// for the server's Tailscale IP, later a real domain.
+	appsDomain := os.Getenv("APPS_DOMAIN")
+	if appsDomain == "" {
+		return errors.New("APPS_DOMAIN is required (e.g. 100-101-102-103.sslip.io)")
 	}
 
 	// docker stop sends SIGTERM; Ctrl+C sends SIGINT.
@@ -114,11 +124,33 @@ func run(addr string) error {
 		slog.Warn("marked interrupted deployments failed", "count", interrupted)
 	}
 
+	github := source.NewGitHub()
+	github.Token = os.Getenv("GITHUB_TOKEN") // optional
+	// Caddy's admin API and proxy port, on the internal network only the
+	// platform shares with it (see compose.yaml).
+	caddy := router.New(
+		envOr("CADDY_ADMIN_URL", "http://10.203.0.2:2019"),
+		envOr("CADDY_PROXY_URL", "http://10.203.0.2:80"),
+	)
+	deployer := deploy.New(ctx, deploy.Config{
+		AppsNetwork:    envOr("APPS_NETWORK", "platform-apps"),
+		DeployTimeout:  20 * time.Minute,
+		HealthTimeout:  time.Minute,
+		HealthInterval: time.Second,
+	}, st, github, dockerClient, caddy)
+
+	// Caddy keeps routes in memory (plus its autosave), so it may have
+	// restarted or missed an update while the platform was down. Re-send the
+	// full table from the database, and clear away containers left by
+	// deploys that were cut off. In the background, retrying until Caddy
+	// and Docker answer: neither should stop the API from starting.
+	go startupSync(ctx, deployer)
+
 	// Only listen once the database is ready, so /healthz passing means the
 	// platform started up fully.
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: newHandler(),
+		Handler: newHandler(api.New(st, deployer, appsDomain)),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,
@@ -139,10 +171,35 @@ func run(addr string) error {
 	slog.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	err = srv.Shutdown(shutdownCtx)
+	// ctx is cancelled, so deploys in flight are stopping; wait for them to
+	// record that before the database closes.
+	deployer.Wait()
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
+}
+
+// startupSync re-applies Caddy's routes and removes orphaned app containers,
+// retrying every 5s until both succeed or the platform shuts down.
+func startupSync(ctx context.Context, d *deploy.Deployer) {
+	for {
+		err := d.ApplyRoutes(ctx)
+		if err == nil {
+			err = d.RemoveOrphans(ctx)
+		}
+		if err == nil {
+			slog.Info("routes applied and orphaned containers cleaned up")
+			return
+		}
+		slog.Warn("startup sync failed; retrying in 5s", "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
 }
 
 // waitForDatabase calls ping until it succeeds, waiting first, then twice as
@@ -184,11 +241,12 @@ func logDockerVersion(ctx context.Context, c *engine.Client) {
 	slog.Info("docker reachable", "version", daemon, "apiVersion", api)
 }
 
-// newHandler returns the platform's HTTP routes. P1 adds the API; it will
-// move to its own package then.
-func newHandler() http.Handler {
+// newHandler returns the platform's HTTP routes: its health check, and the
+// API (internal/api) under /api/platform/.
+func newHandler(apiHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.Handle("/api/platform/", apiHandler)
 	return mux
 }
 

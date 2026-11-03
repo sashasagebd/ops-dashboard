@@ -3,7 +3,9 @@
 // and a build context is a tar stream too, so the code is streamed from one
 // to the other without being written to disk.
 //
-// Public repos only for now; private ones need just a token header later.
+// Public repos work without a token. With one (GITHUB_TOKEN), GitHub's rate
+// limit rises from 60 to 5,000 requests an hour, and private repos the token
+// can read work too.
 package source
 
 import (
@@ -39,6 +41,7 @@ var ErrTooLarge = errors.New("repository is larger than the platform's limit")
 type GitHub struct {
 	HTTPClient       *http.Client
 	APIBase          string // https://api.github.com, or a test server
+	Token            string // optional
 	MaxDownloadBytes int64
 	MaxUnpackedBytes int64
 }
@@ -78,10 +81,26 @@ func (g *GitHub) BuildContext(ctx context.Context, repoURL, commitSHA string) (i
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if g.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+g.Token)
+	}
 
 	// GitHub answers with a redirect to its download host, which the client
-	// follows.
-	resp, err := g.HTTPClient.Do(req)
+	// follows. The token must only ever go to the API: Go's client drops
+	// Authorization on a redirect to a different domain, but compares
+	// hostnames only (not ports) and treats subdomains as the same, so the
+	// rule is made explicit here: any change of host:port drops it.
+	client := *g.HTTPClient
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("too many redirects")
+		}
+		if next.URL.Host != via[0].URL.Host {
+			next.Header.Del("Authorization")
+		}
+		return nil
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("downloading code: %w", err)
 	}

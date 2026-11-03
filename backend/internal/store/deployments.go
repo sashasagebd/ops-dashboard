@@ -80,6 +80,25 @@ func (s *Store) CurrentDeployment(ctx context.Context, appID int64) (Deployment,
 	return d, translate(err)
 }
 
+// LiveApp is an app with a healthy deployment: one entry in what Caddy
+// should route.
+type LiveApp struct {
+	AppName      string `db:"name"`
+	Hostname     string `db:"hostname"`
+	Port         int    `db:"port"`
+	DeploymentID int64  `db:"deployment_id"`
+}
+
+// LiveApps returns every app that has a healthy deployment, by name.
+func (s *Store) LiveApps(ctx context.Context) ([]LiveApp, error) {
+	rows, _ := s.pool.Query(ctx, `
+		SELECT a.name, a.hostname, a.port, d.id AS deployment_id
+		FROM apps a JOIN deployments d ON d.app_id = a.id AND d.status = 'healthy'
+		ORDER BY a.name`)
+	live, err := pgx.CollectRows(rows, pgx.RowToStructByName[LiveApp])
+	return live, translate(err)
+}
+
 // Each change below is one UPDATE that names the statuses it may start from,
 // so it's atomic: if the deployment has moved on in the meantime (or never
 // got there), nothing changes and the caller gets ErrWrongStatus.

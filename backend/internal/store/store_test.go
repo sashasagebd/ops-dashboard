@@ -234,6 +234,17 @@ func TestDeploymentLifecycle(t *testing.T) {
 	assertStatus(t, s, first.ID, StatusSuperseded)
 	assertStatus(t, s, second.ID, StatusHealthy)
 
+	// Only the live deployment is routed; an app with none isn't listed.
+	createTestApp(t, s, "never-deployed")
+	live, err := s.LiveApps(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(live) != 1 || live[0].AppName != "hello" || live[0].DeploymentID != second.ID ||
+		live[0].Hostname != "hello.example.test" || live[0].Port != 8080 {
+		t.Errorf("LiveApps = %+v, want only hello's second deployment", live)
+	}
+
 	// A failed third leaves the second live, and frees the app for a fourth.
 	third, err := s.CreateDeployment(ctx, app.ID, sha3)
 	if err != nil {
