@@ -50,6 +50,12 @@ services:
     build: .
     entrypoint: ["/platform"]
     restart: unless-stopped
+    ports:
+      # The GitHub webhook's listener, and nothing else: the API on 8081
+      # stays unpublished. 127.0.0.1 only (Docker bypasses UFW); Tailscale
+      # Funnel forwards the public webhook URL here. Nothing listens on it
+      # unless GITHUB_WEBHOOK_SECRET is set.
+      - "127.0.0.1:${WEBHOOK_PORT:-8082}:8082"
     environment:
       # Hex passwords (see .env.example) need no escaping in a URL. No TLS:
       # the connection never leaves the internal platform-db network.
@@ -62,6 +68,8 @@ services:
       APPS_DOMAIN: ${APPS_DOMAIN:?set APPS_DOMAIN in .env}
       # Optional: raises GitHub's rate limit and allows private repos.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Optional: turns on push-to-deploy (see .env.example).
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       APPS_NETWORK: platform-apps
       CADDY_ADMIN_URL: http://10.203.0.2:2019
       CADDY_PROXY_URL: http://10.203.0.2:80

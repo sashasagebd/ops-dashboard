@@ -912,3 +912,42 @@ moving parts for one viewer, and the writer batches every 500ms anyway); log
 files on disk with a pointer in the database (another volume, and retention
 done by hand); ending the deploy log on the deployment's status (would cut
 off its last lines).
+
+### How push-to-deploy works (2.3, 2026-11-03)
+
+**What:** the details behind the Funnel and separate-listener entries above.
+- **The signature is checked before anything else**, in constant time
+  (`hmac.Equal`), on a body capped at 1 MiB. Until it checks out, the
+  request touches nothing: no database, no logging of its contents. The
+  secret must be at least 32 characters, and with none set the listener
+  doesn't run at all.
+- **Deliveries are deduped by GitHub's delivery ID** (kept 30 days), so a
+  redelivery doesn't deploy again. If the platform fails before doing
+  anything (it can't list apps), it forgets the delivery, so "Redeliver" on
+  GitHub works.
+- **A push that arrives mid-deploy waits as the app's next commit.** Only
+  one deploy per app can be in progress (a database rule), so the push
+  can't simply start one, and dropping it would break "a push deploys".
+  It's stored on the app (`next_commit_sha`), and the newest push replaces
+  an older waiting one, since deploying the one in between would only be
+  replaced straight away. Every deploy that finishes, whether healthy or
+  given up, starts the waiting commit. Both sides lock the app's row first,
+  so a push can't see a deploy in progress, miss it finishing, and leave
+  its commit with nothing to start it. A deploy that's still to be retried
+  hasn't finished, so the push keeps waiting.
+- **One webhook per repo deploys every matching app:** the same repo (owner
+  and name compared case-insensitively, as GitHub does) and branch, with
+  auto-deploy on. Tags and branch deletions are ignored. The response lists
+  what happened to each app, which GitHub shows on the webhook's "Recent
+  deliveries" page: the place to look when a push didn't deploy.
+- **Auto-deploy is per app, on by default**; turning it off also drops a
+  waiting push. "Deploy latest" looks up the branch's head with GitHub's
+  commits API (a few bytes, not the whole commit) and deploys it like any
+  commit.
+
+**Alternatives:** a queue of every pushed commit per app (deploys commits
+that are already out of date); refusing a mid-deploy push with a 409 (GitHub
+doesn't retry, so the push is lost); a `jobs` row per push to serialize
+deploys (the jobs table runs deploys, it doesn't decide which commit; and a
+push isn't a deployment until it starts); checking the signature after
+parsing (does work for unauthenticated requests).

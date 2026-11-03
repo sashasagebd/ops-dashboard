@@ -614,3 +614,121 @@ func TestPruneDeploymentLogsKeepsTheMostRecent(t *testing.T) {
 		t.Error("pruning one app deleted another app's logs")
 	}
 }
+
+func TestRequestDeploymentWaitsForTheOneInProgress(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	if !app.AutoDeploy || app.NextCommitSHA != "" {
+		t.Errorf("new app: auto-deploy %v, next %q; want on, none", app.AutoDeploy, app.NextCommitSHA)
+	}
+
+	// Nothing in progress: it deploys straight away.
+	first, started, err := s.RequestDeployment(ctx, app.ID, sha1)
+	if err != nil || !started || first.CommitSHA != sha1 {
+		t.Fatalf("RequestDeployment = %+v, %v, %v; want started", first, started, err)
+	}
+	// Busy: the next pushes wait, and the newest wins.
+	for _, sha := range []string{sha2, sha3} {
+		if _, started, err := s.RequestDeployment(ctx, app.ID, sha); err != nil || started {
+			t.Fatalf("RequestDeployment(%s) while busy: started %v, %v; want it to wait", sha[:4], started, err)
+		}
+	}
+	got, _ := s.App(ctx, app.ID)
+	if got.NextCommitSHA != sha3 {
+		t.Errorf("next = %q, want the newest push %q", got.NextCommitSHA, sha3)
+	}
+	// Still busy: nothing to start yet, and it stays next.
+	if _, ok, err := s.StartNextDeployment(ctx, app.ID); err != nil || ok {
+		t.Errorf("StartNextDeployment while busy = %v, %v; want nothing", ok, err)
+	}
+
+	mustDo(t, s.MarkFailed(ctx, first.ID, "build failed"))
+	next, ok, err := s.StartNextDeployment(ctx, app.ID)
+	if err != nil || !ok || next.CommitSHA != sha3 {
+		t.Fatalf("StartNextDeployment after it finished = %+v, %v, %v; want %s started", next, ok, err, sha3[:4])
+	}
+	got, _ = s.App(ctx, app.ID)
+	if got.NextCommitSHA != "" {
+		t.Errorf("next = %q after starting it, want cleared", got.NextCommitSHA)
+	}
+	if _, ok, _ := s.StartNextDeployment(ctx, app.ID); ok {
+		t.Error("started the same next commit twice")
+	}
+	if _, _, err := s.RequestDeployment(ctx, 999999, sha1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("RequestDeployment(missing app) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestConcurrentPushesStartOneDeploy(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+
+	var mu sync.Mutex
+	starts := 0
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			_, started, err := s.RequestDeployment(ctx, app.ID, sha1)
+			if err != nil {
+				t.Error(err)
+			}
+			if started {
+				mu.Lock()
+				starts++
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if starts != 1 {
+		t.Errorf("%d pushes started a deploy, want exactly 1 (the rest wait)", starts)
+	}
+	got, _ := s.App(ctx, app.ID)
+	if got.NextCommitSHA != sha1 {
+		t.Errorf("next = %q, want the waiting push", got.NextCommitSHA)
+	}
+}
+
+func TestSetAutoDeploy(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	s.RequestDeployment(ctx, app.ID, sha1)
+	s.RequestDeployment(ctx, app.ID, sha2) // waits
+
+	off, err := s.SetAutoDeploy(ctx, app.ID, false)
+	if err != nil || off.AutoDeploy || off.NextCommitSHA != "" {
+		t.Errorf("turned off: %+v, %v; want off, and the waiting push dropped", off, err)
+	}
+	if on, _ := s.SetAutoDeploy(ctx, app.ID, true); !on.AutoDeploy {
+		t.Error("turned back on: still off")
+	}
+	if _, err := s.SetAutoDeploy(ctx, 999999, true); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing app: error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecordDelivery(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	if isNew, err := s.RecordDelivery(ctx, "72d3162e-cc78-11e3-81ab-4c9367dc0958"); err != nil || !isNew {
+		t.Fatalf("first delivery: new %v, %v; want new", isNew, err)
+	}
+	if isNew, _ := s.RecordDelivery(ctx, "72d3162e-cc78-11e3-81ab-4c9367dc0958"); isNew {
+		t.Error("a redelivery counted as new")
+	}
+	// Old ones are forgotten.
+	if _, err := s.pool.Exec(ctx, "UPDATE webhook_deliveries SET received_at = now() - interval '31 days'"); err != nil {
+		t.Fatal(err)
+	}
+	if isNew, _ := s.RecordDelivery(ctx, "another"); !isNew {
+		t.Error("a different delivery wasn't new")
+	}
+	var n int
+	_ = s.pool.QueryRow(ctx, "SELECT count(*) FROM webhook_deliveries").Scan(&n)
+	if n != 1 {
+		t.Errorf("%d deliveries kept, want 1 (the old one pruned)", n)
+	}
+}

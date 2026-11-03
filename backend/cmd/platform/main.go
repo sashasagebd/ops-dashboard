@@ -30,6 +30,7 @@ import (
 	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/webhook"
 )
 
 func main() {
@@ -64,6 +65,14 @@ func run(addr string) error {
 	appsDomain := os.Getenv("APPS_DOMAIN")
 	if appsDomain == "" {
 		return errors.New("APPS_DOMAIN is required (e.g. 100-101-102-103.sslip.io)")
+	}
+	// Push-to-deploy is off unless the GitHub webhook's secret is set: then
+	// a second listener serves the webhook (see below). The secret is all
+	// that stands between that public endpoint and deploying, so a short
+	// one is refused rather than used.
+	webhookSecret := os.Getenv("GITHUB_WEBHOOK_SECRET")
+	if webhookSecret != "" && len(webhookSecret) < 32 {
+		return errors.New("GITHUB_WEBHOOK_SECRET: use at least 32 characters (e.g. openssl rand -hex 32)")
 	}
 
 	// docker stop sends SIGTERM; Ctrl+C sends SIGINT.
@@ -170,12 +179,34 @@ func run(addr string) error {
 		// hold up every restart until the shutdown timeout.
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
+	servers := []*http.Server{srv}
 
-	errCh := make(chan error, 1)
-	go func() {
-		slog.Info("listening", "addr", addr)
-		errCh <- srv.ListenAndServe()
-	}()
+	// The GitHub webhook, on a listener of its own: it's the one endpoint
+	// reachable from the internet (compose publishes this port on 127.0.0.1
+	// for Tailscale Funnel), so nothing else is served on it, and it gets
+	// tighter limits than the API: a whole delivery must arrive within 15s.
+	if webhookSecret != "" {
+		servers = append(servers, &http.Server{
+			Addr:              envOr("WEBHOOK_LISTEN_ADDR", ":8082"),
+			Handler:           webhook.New(webhookSecret, st, deployer),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    16 << 10,
+			BaseContext:       func(net.Listener) context.Context { return ctx },
+		})
+	} else {
+		slog.Info("push-to-deploy is off: GITHUB_WEBHOOK_SECRET isn't set")
+	}
+
+	errCh := make(chan error, len(servers))
+	for _, s := range servers {
+		go func() {
+			slog.Info("listening", "addr", s.Addr)
+			errCh <- s.ListenAndServe()
+		}()
+	}
 
 	select {
 	case err := <-errCh:
@@ -186,7 +217,11 @@ func run(addr string) error {
 	slog.Info("shutting down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err = srv.Shutdown(shutdownCtx)
+	for _, s := range servers {
+		if serr := s.Shutdown(shutdownCtx); serr != nil && err == nil {
+			err = serr
+		}
+	}
 	// ctx is cancelled, so deploys in flight are stopping; wait for their
 	// jobs to be handed back before the database closes.
 	<-workersDone

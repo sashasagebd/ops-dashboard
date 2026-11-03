@@ -347,3 +347,48 @@ func keys(m map[string]string) []string {
 	slices.Sort(ks)
 	return ks
 }
+
+func TestLatestCommit(t *testing.T) {
+	const head = "89abcdef0123456789abcdef0123456789abcdef"
+	var gotPath, gotAccept, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAccept, gotAuth = r.URL.EscapedPath(), r.Header.Get("Accept"), r.Header.Get("Authorization")
+		switch r.URL.EscapedPath() {
+		case "/repos/o/r/commits/main", "/repos/o/r/commits/feature/x%3Fy":
+			_, _ = io.WriteString(w, head)
+		case "/repos/o/r/commits/weird":
+			_, _ = io.WriteString(w, "<html>not a sha</html>")
+		case "/repos/o/r/commits/broken":
+			w.WriteHeader(http.StatusBadGateway)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	g := NewGitHub()
+	g.APIBase = srv.URL
+	g.Token = "tok"
+
+	sha, err := g.LatestCommit(t.Context(), "https://github.com/o/r", "main")
+	if err != nil || sha != head {
+		t.Fatalf("LatestCommit(main) = %q, %v; want %s", sha, err, head)
+	}
+	if gotAccept != "application/vnd.github.sha" || gotAuth != "Bearer tok" {
+		t.Errorf("Accept %q, Authorization %q", gotAccept, gotAuth)
+	}
+	// Slashes in a branch name are kept; anything else odd is escaped.
+	if _, err := g.LatestCommit(t.Context(), "https://github.com/o/r", "feature/x?y"); err != nil {
+		t.Errorf("branch with a slash: %v (path %s)", err, gotPath)
+	}
+
+	for branch, want := range map[string]error{"gone": ErrBranchNotFound, "": ErrBranchNotFound} {
+		if _, err := g.LatestCommit(t.Context(), "https://github.com/o/r", branch); !errors.Is(err, want) {
+			t.Errorf("LatestCommit(%q) error = %v, want %v", branch, err, want)
+		}
+	}
+	for _, branch := range []string{"weird", "broken"} {
+		if _, err := g.LatestCommit(t.Context(), "https://github.com/o/r", branch); err == nil || errors.Is(err, ErrBranchNotFound) {
+			t.Errorf("LatestCommit(%q) error = %v, want a plain error", branch, err)
+		}
+	}
+}

@@ -33,6 +33,8 @@ function app(overrides: Partial<PlatformApp> = {}): PlatformApp {
     memoryLimitBytes: 256 * 1024 * 1024,
     cpuLimitMillicores: 500,
     sourceDir: 'examples/hello',
+    autoDeploy: true,
+    nextCommitSha: null,
     createdAt: '2026-11-01T00:00:00Z',
     currentDeployment: null,
     ...overrides,
@@ -242,6 +244,43 @@ describe('App page', () => {
     output.open()
     output.send({ stream: 'stdout', line: 'listening on :8080' })
     expect(await screen.findByLabelText('App output')).toHaveTextContent('listening on :8080')
+  })
+
+  it("deploys the latest commit on the app's branch", async () => {
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [200, detail()],
+      'POST /api/platform/apps/1/deployments/latest': () => [202, deployment({ id: 9, status: 'queued' })],
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Deploy latest from main' }))
+    await vi.waitFor(() => expect(FakeEventSource.latest().url).toBe('/api/platform/apps/1/deployments/9/logs'))
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/deployments/latest')).toHaveLength(1)
+  })
+
+  it('turns push-to-deploy off and on, and shows a push waiting to deploy', async () => {
+    let auto = true
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [200, detail({ autoDeploy: auto, nextCommitSha: auto ? SHA : null })],
+      'PATCH /api/platform/apps/1': (init) => {
+        auto = (JSON.parse(init?.body as string) as { autoDeploy: boolean }).autoDeploy
+        return [200, app({ autoDeploy: auto })]
+      },
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    const box = await screen.findByRole('checkbox', { name: 'Deploy automatically on every push to main' })
+    expect(box).toBeChecked()
+    expect(screen.getByText('0123456')).toBeInTheDocument() // the waiting push, short
+
+    fireEvent.click(box)
+    await vi.waitFor(() => expect(screen.getByRole('checkbox')).not.toBeChecked())
+    expect(JSON.parse(sent(fetchMock, 'PATCH', '/api/platform/apps/1')[0][1]?.body as string)).toEqual({
+      autoDeploy: false,
+    })
+    expect(screen.queryByText('0123456')).not.toBeInTheDocument()
   })
 
   it('has no app output to show when nothing is live', async () => {

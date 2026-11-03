@@ -33,6 +33,7 @@ type Store interface {
 	Apps(ctx context.Context) ([]store.App, error)
 	App(ctx context.Context, id int64) (store.App, error)
 	CreateApp(ctx context.Context, a store.NewApp) (store.App, error)
+	SetAutoDeploy(ctx context.Context, id int64, on bool) (store.App, error)
 	EnvVarKeys(ctx context.Context, appID int64) ([]string, error)
 	SetEnvVar(ctx context.Context, appID int64, key, value string) error
 	DeleteEnvVar(ctx context.Context, appID int64, key string) error
@@ -46,6 +47,7 @@ type Store interface {
 // Deployer starts deploys; in production it's a *deploy.Deployer.
 type Deployer interface {
 	Start(ctx context.Context, appID int64, commitSHA string) (store.Deployment, error)
+	StartLatest(ctx context.Context, appID int64) (store.Deployment, error)
 }
 
 // Engine reads app containers' output; in production it's an *engine.Client.
@@ -62,10 +64,12 @@ func New(st Store, dep Deployer, eng Engine, appsDomain string) http.Handler {
 	mux.HandleFunc("GET /api/platform/apps", a.listApps)
 	mux.HandleFunc("POST /api/platform/apps", a.createApp)
 	mux.HandleFunc("GET /api/platform/apps/{id}", a.getApp)
+	mux.HandleFunc("PATCH /api/platform/apps/{id}", a.updateApp)
 	mux.HandleFunc("PUT /api/platform/apps/{id}/env/{key}", a.setEnvVar)
 	mux.HandleFunc("DELETE /api/platform/apps/{id}/env/{key}", a.deleteEnvVar)
 	mux.HandleFunc("GET /api/platform/apps/{id}/deployments", a.listDeployments)
 	mux.HandleFunc("POST /api/platform/apps/{id}/deployments", a.createDeployment)
+	mux.HandleFunc("POST /api/platform/apps/{id}/deployments/latest", a.deployLatest)
 	mux.HandleFunc("GET /api/platform/apps/{id}/deployments/{deploymentId}/logs", a.deploymentLogs)
 	mux.HandleFunc("GET /api/platform/apps/{id}/logs", a.appLogs)
 	return mux
@@ -91,7 +95,9 @@ type appResponse struct {
 	HealthCheckPath    string              `json:"healthCheckPath"`
 	MemoryLimitBytes   int64               `json:"memoryLimitBytes"`
 	CPULimitMillicores int                 `json:"cpuLimitMillicores"`
-	SourceDir          string              `json:"sourceDir"` // "" is the repo's root
+	SourceDir          string              `json:"sourceDir"`     // "" is the repo's root
+	AutoDeploy         bool                `json:"autoDeploy"`    // pushes to Branch deploy it
+	NextCommitSHA      *string             `json:"nextCommitSha"` // a pushed commit waiting for the deploy in progress
 	CreatedAt          time.Time           `json:"createdAt"`
 	CurrentDeployment  *deploymentResponse `json:"currentDeployment"` // null if nothing is live
 }
@@ -122,7 +128,11 @@ func newAppResponse(a store.App, current *store.Deployment) appResponse {
 	r := appResponse{
 		ID: a.ID, Name: a.Name, RepoURL: a.RepoURL, Branch: a.Branch, Hostname: a.Hostname,
 		Port: a.Port, HealthCheckPath: a.HealthCheckPath, MemoryLimitBytes: a.MemoryLimitBytes,
-		CPULimitMillicores: a.CPULimitMillicores, SourceDir: a.SourceDir, CreatedAt: a.CreatedAt,
+		CPULimitMillicores: a.CPULimitMillicores, SourceDir: a.SourceDir, AutoDeploy: a.AutoDeploy,
+		CreatedAt: a.CreatedAt,
+	}
+	if a.NextCommitSHA != "" {
+		r.NextCommitSHA = &a.NextCommitSHA
 	}
 	if current != nil {
 		d := newDeploymentResponse(*current)
@@ -280,6 +290,36 @@ func (a *api) getApp(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type updateAppRequest struct {
+	AutoDeploy *bool `json:"autoDeploy"` // the only setting that can change, for now
+}
+
+func (a *api) updateApp(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var req updateAppRequest
+	if !readJSON(w, r, &req) {
+		return
+	}
+	if req.AutoDeploy == nil {
+		badRequest(w, "autoDeploy: true or false")
+		return
+	}
+	app, err := a.store.SetAutoDeploy(r.Context(), id, *req.AutoDeploy)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	current, err := a.current(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, newAppResponse(app, current))
+}
+
 type setEnvVarRequest struct {
 	Value string `json:"value"`
 }
@@ -366,6 +406,20 @@ func (a *api) createDeployment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, newDeploymentResponse(d))
 }
 
+// deployLatest deploys the newest commit on the app's branch. No body.
+func (a *api) deployLatest(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	d, err := a.deployer.StartLatest(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, newDeploymentResponse(d))
+}
+
 // current returns an app's live deployment, or nil if it has none.
 func (a *api) current(ctx context.Context, appID int64) (*store.Deployment, error) {
 	d, err := a.store.CurrentDeployment(ctx, appID)
@@ -433,6 +487,8 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeJSON(w, http.StatusConflict, errorResponse{err.Error()})
 	case errors.Is(err, store.ErrInvalid):
 		writeJSON(w, http.StatusBadRequest, errorResponse{err.Error()})
+	case errors.Is(err, source.ErrBranchNotFound):
+		writeJSON(w, http.StatusBadRequest, errorResponse{"the app's branch wasn't found on GitHub"})
 	default:
 		slog.Error("platform API request failed", "method", r.Method, "path", r.URL.Path, "err", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{"internal error"})

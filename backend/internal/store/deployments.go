@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -48,7 +49,13 @@ const deploymentColumns = `id, app_id, commit_sha, status,
 // there's never a deployment that nothing will run. ErrDeployInProgress if
 // the app already has one in progress; ErrNotFound if the app doesn't exist.
 func (s *Store) CreateDeployment(ctx context.Context, appID int64, commitSHA string) (Deployment, error) {
-	rows, _ := s.pool.Query(ctx, `
+	return createDeployment(ctx, s.pool, appID, commitSHA)
+}
+
+func createDeployment(ctx context.Context, db interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}, appID int64, commitSHA string) (Deployment, error) {
+	rows, _ := db.Query(ctx, `
 		WITH d AS (
 			INSERT INTO deployments (app_id, commit_sha) VALUES ($1, $2) RETURNING *
 		), j AS (
@@ -58,6 +65,78 @@ func (s *Store) CreateDeployment(ctx context.Context, appID int64, commitSHA str
 		appID, commitSHA)
 	d, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[Deployment])
 	return d, translate(err)
+}
+
+// Push-to-deploy can't simply call CreateDeployment: a push that arrives
+// while the app is deploying would be refused and lost. So a pushed commit
+// either starts a deploy or waits as the app's next commit, and finishing a
+// deploy starts the waiting one. Both sides lock the app's row first, so they
+// take turns: a push can't see a deploy in progress, then miss it finishing
+// and leave its commit waiting with nothing to start it.
+
+// RequestDeployment queues a deploy of commitSHA for an app if it has none in
+// progress (started is true), and otherwise makes commitSHA the app's next
+// commit, replacing any older one, for StartNextDeployment to deploy once the
+// one in progress has finished.
+func (s *Store) RequestDeployment(ctx context.Context, appID int64, commitSHA string) (d Deployment, started bool, err error) {
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockApp(ctx, tx, appID); err != nil {
+			return err
+		}
+		// In a savepoint (a nested transaction), because a refused insert
+		// would otherwise abort the whole transaction.
+		err := pgx.BeginFunc(ctx, tx, func(sp pgx.Tx) error {
+			var err error
+			d, err = createDeployment(ctx, sp, appID, commitSHA)
+			return err
+		})
+		switch {
+		case err == nil:
+			started = true
+			return nil
+		case errors.Is(err, ErrDeployInProgress):
+			_, err := tx.Exec(ctx, "UPDATE apps SET next_commit_sha = $2 WHERE id = $1", appID, commitSHA)
+			return err
+		default:
+			return err
+		}
+	})
+	return d, started, translate(err)
+}
+
+// StartNextDeployment queues a deploy of the app's next commit, if it has one
+// and no deploy is in progress, and clears it. ok reports whether it queued
+// one. The deployer calls it whenever a deploy finishes.
+func (s *Store) StartNextDeployment(ctx context.Context, appID int64) (d Deployment, ok bool, err error) {
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var next *string
+		err := tx.QueryRow(ctx, "SELECT next_commit_sha FROM apps WHERE id = $1 FOR UPDATE", appID).Scan(&next)
+		if err != nil || next == nil {
+			return err
+		}
+		err = pgx.BeginFunc(ctx, tx, func(sp pgx.Tx) error {
+			var err error
+			d, err = createDeployment(ctx, sp, appID, *next)
+			return err
+		})
+		if errors.Is(err, ErrDeployInProgress) {
+			return nil // still busy: it stays next, for when that one finishes
+		}
+		if err != nil {
+			return err
+		}
+		ok = true
+		_, err = tx.Exec(ctx, "UPDATE apps SET next_commit_sha = NULL WHERE id = $1", appID)
+		return err
+	})
+	return d, ok, translate(err)
+}
+
+// lockApp locks an app's row until the transaction ends (ErrNotFound if
+// there's no such app).
+func lockApp(ctx context.Context, tx pgx.Tx, appID int64) error {
+	var one int
+	return translate(tx.QueryRow(ctx, "SELECT 1 FROM apps WHERE id = $1 FOR UPDATE", appID).Scan(&one))
 }
 
 // Deployment returns one deployment, or ErrNotFound.

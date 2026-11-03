@@ -48,6 +48,11 @@ type fakes struct {
 	priorBuild  int      // build lines stored by earlier attempts
 	logLines    []string // the deploy log, as "stream: line"
 	pruned      int      // PruneDeploymentLogs' keep, once called
+
+	busy        bool    // RequestDeployment finds a deploy in progress
+	nextCommit  string  // the commit waiting to deploy next
+	startedNext []int64 // apps StartNextDeployment started a deploy for
+	latest      string  // LatestCommit's answer
 }
 
 func newFakes() *fakes {
@@ -194,6 +199,32 @@ func (f *fakes) AppendDeploymentLogs(_ context.Context, _ int64, lines []store.N
 
 func (f *fakes) CountDeploymentLogs(context.Context, int64, string) (int, error) {
 	return f.priorBuild, nil
+}
+
+func (f *fakes) RequestDeployment(ctx context.Context, appID int64, commit string) (store.Deployment, bool, error) {
+	if f.busy {
+		f.nextCommit = commit
+		return store.Deployment{}, false, nil
+	}
+	d, err := f.CreateDeployment(ctx, appID, commit)
+	return d, err == nil, err
+}
+
+func (f *fakes) StartNextDeployment(ctx context.Context, appID int64) (store.Deployment, bool, error) {
+	if f.nextCommit == "" {
+		return store.Deployment{}, false, nil
+	}
+	f.startedNext = append(f.startedNext, appID)
+	f.nextCommit = ""
+	return store.Deployment{ID: 8, AppID: appID}, true, nil
+}
+
+func (f *fakes) LatestCommit(_ context.Context, repo, branch string) (string, error) {
+	f.event("latest %s %s", repo, branch)
+	if f.latest == "" {
+		return "", source.ErrBranchNotFound
+	}
+	return f.latest, nil
 }
 
 func (f *fakes) PruneDeploymentLogs(_ context.Context, _ int64, keep int) (int64, error) {
@@ -668,5 +699,83 @@ func TestBuildOutputIsCapped(t *testing.T) {
 	want := []string{"build: one more", "platform: Build output cut off after 5000 lines; the build carries on."}
 	if !slices.Equal(build, want) {
 		t.Errorf("build lines = %q, want %q", build, want)
+	}
+}
+
+func TestPushDeploysNowOrNext(t *testing.T) {
+	f := newFakes()
+	d := f.deployer()
+	notified := 0
+	d.Notify = func() { notified++ }
+
+	if dep, started, err := d.Push(t.Context(), 1, sha); err != nil || !started || dep.ID != 7 || notified != 1 {
+		t.Errorf("Push when idle: %+v, started %v, %v, notified %d; want deployment 7 started", dep, started, err, notified)
+	}
+	f.busy = true
+	if _, started, err := d.Push(t.Context(), 1, sha); err != nil || started || notified != 1 {
+		t.Errorf("Push while busy: started %v, %v, notified %d; want it to wait, no wake", started, err, notified)
+	}
+	if f.nextCommit != sha {
+		t.Errorf("next commit = %q, want the push", f.nextCommit)
+	}
+}
+
+func TestFinishingADeployStartsTheNextPush(t *testing.T) {
+	t.Run("after success", func(t *testing.T) {
+		f := newFakes()
+		f.nextCommit = sha // pushed while 7 was deploying
+		d := f.deployer()
+		woken := 0
+		d.Notify = func() { woken++ }
+		dep, err := d.Start(t.Context(), 1, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d.Run(t.Context(), store.Job{DeploymentID: dep.ID, Attempts: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(f.startedNext, []int64{1}) || woken != 2 {
+			t.Errorf("started next for %v, woken %d times; want app 1, and a wake for each deploy", f.startedNext, woken)
+		}
+	})
+	t.Run("after giving up", func(t *testing.T) {
+		f := newFakes()
+		f.nextCommit = sha
+		f.statuses[7] = store.StatusBuilding
+		f.deployer().GiveUp(t.Context(), store.Job{DeploymentID: 7, Attempts: 1}, &engine.BuildError{Message: "x"})
+		if !slices.Equal(f.startedNext, []int64{1}) {
+			t.Errorf("started next for %v, want app 1: a failed deploy mustn't strand the push", f.startedNext)
+		}
+	})
+	t.Run("not after a retry is scheduled", func(t *testing.T) {
+		f := newFakes()
+		f.nextCommit = sha
+		f.sourceErr = errors.New("dial tcp: i/o timeout")
+		d := f.deployer()
+		dep, _ := d.Start(t.Context(), 1, sha)
+		if err := d.Run(t.Context(), store.Job{DeploymentID: dep.ID, Attempts: 1}); err == nil {
+			t.Fatal("want the transient error")
+		}
+		if len(f.startedNext) != 0 {
+			t.Error("started the next push while this deploy is still to be retried")
+		}
+	})
+}
+
+func TestStartLatest(t *testing.T) {
+	f := newFakes()
+	f.app.Branch = "main"
+	f.latest = sha
+	dep, err := f.deployer().StartLatest(t.Context(), 1)
+	if err != nil || dep.CommitSHA != sha {
+		t.Errorf("StartLatest = %+v, %v; want a deploy of the branch's head", dep, err)
+	}
+	if !slices.Contains(f.events, "latest https://github.com/o/hello main") {
+		t.Errorf("events %q: didn't look up the app's branch", f.events)
+	}
+
+	f.latest = ""
+	if _, err := f.deployer().StartLatest(t.Context(), 1); !errors.Is(err, source.ErrBranchNotFound) {
+		t.Errorf("unknown branch: error = %v, want ErrBranchNotFound", err)
 	}
 }

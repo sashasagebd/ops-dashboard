@@ -94,6 +94,9 @@ cd frontend && npm run lint && npm test && npm run build
 | `APPS_LISTEN_IP` | required | compose: the IP Caddy serves apps on (port 80); the server's Tailscale IP. Never `0.0.0.0`: Docker bypasses UFW. |
 | `PLATFORM_URL` | `http://platform:8081` | dashboard: where it forwards `/api/platform/` (set in `compose.yaml`) |
 | `GITHUB_TOKEN` | unset | platform: optional token for downloading app code (higher rate limit, private repos); read-only Contents access is enough |
+| `GITHUB_WEBHOOK_SECRET` | unset | platform: turns on push-to-deploy; the GitHub webhook's secret, at least 32 characters (`openssl rand -hex 32`). Unset, the webhook listener doesn't run. |
+| `WEBHOOK_LISTEN_ADDR` | `:8082` | platform: the webhook listener's address (only `POST /webhooks/github` is served there) |
+| `WEBHOOK_PORT` | `8082` | compose: host port for the webhook listener, always bound to `127.0.0.1` (Tailscale Funnel forwards to it) |
 | `APPS_NETWORK`, `CADDY_ADMIN_URL`, `CADDY_PROXY_URL` | `platform-apps`, `http://10.203.0.2:2019`, `http://10.203.0.2:80` | platform: set in `compose.yaml`; only change them together with it |
 | `API_TARGET` | `http://localhost:8080` | frontend dev server only: where `npm run dev` forwards `/api` |
 
@@ -130,6 +133,43 @@ tailscale serve status
 ```
 
 The dashboard is then at `https://<server-name>.<tailnet>.ts.net/`.
+
+### Push-to-deploy
+
+A push to an app's branch deploys it (apps can turn this off on their page).
+GitHub sends the push to a webhook listener the platform runs on its own
+port, published on `127.0.0.1:8082` only, and Tailscale Funnel gives that
+one port a public HTTPS address. The dashboard on 443 stays tailnet-only.
+Every delivery is signed with a shared secret, and the platform refuses any
+that isn't.
+
+1. Set the secret in `.env` and restart the platform:
+   ```sh
+   cd ~/apps/dashboard
+   sed -i "s/^GITHUB_WEBHOOK_SECRET=.*/GITHUB_WEBHOOK_SECRET=$(openssl rand -hex 32)/" .env
+   grep GITHUB_WEBHOOK_SECRET .env   # you'll paste this into GitHub
+   docker compose up -d
+   docker compose logs platform | grep 'listening addr=:8082'
+   ```
+2. Allow Funnel for the server in the Tailscale admin console (Access
+   controls: the `funnel` node attribute), then publish the webhook port.
+   This keeps running across reboots:
+   ```sh
+   sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8082
+   tailscale funnel status
+   ```
+3. In each app's GitHub repo: Settings → Webhooks → Add webhook.
+   - Payload URL: `https://<server-name>.<tailnet>.ts.net:8443/webhooks/github`
+   - Content type: `application/json`
+   - Secret: the value from step 1
+   - Events: just the push event
+
+   GitHub sends a ping straight away; the webhook's "Recent deliveries"
+   should show it answered 200 with `{"result":"pong"}`. After a push, the
+   delivery's response lists what happened to each app.
+
+One webhook per repo is enough: a push deploys every app registered with
+that repo and branch.
 
 ### Updating
 

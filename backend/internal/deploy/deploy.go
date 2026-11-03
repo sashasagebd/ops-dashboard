@@ -46,10 +46,13 @@ type Store interface {
 	AppendDeploymentLogs(ctx context.Context, deploymentID int64, lines []store.NewLogLine) error
 	CountDeploymentLogs(ctx context.Context, deploymentID int64, stream string) (int, error)
 	PruneDeploymentLogs(ctx context.Context, appID int64, keep int) (int64, error)
+	RequestDeployment(ctx context.Context, appID int64, commitSHA string) (store.Deployment, bool, error)
+	StartNextDeployment(ctx context.Context, appID int64) (store.Deployment, bool, error)
 }
 
 type Source interface {
 	BuildContext(ctx context.Context, repoURL, commitSHA, dir string) (io.ReadCloser, error)
+	LatestCommit(ctx context.Context, repoURL, branch string) (string, error)
 }
 
 type Engine interface {
@@ -108,10 +111,60 @@ func (d *Deployer) Start(ctx context.Context, appID int64, commitSHA string) (st
 	if err != nil {
 		return store.Deployment{}, err
 	}
+	d.notify()
+	return dep, nil
+}
+
+// StartLatest deploys the newest commit on the app's branch, looked up on
+// GitHub, like Start.
+func (d *Deployer) StartLatest(ctx context.Context, appID int64) (store.Deployment, error) {
+	app, err := d.store.App(ctx, appID)
+	if err != nil {
+		return store.Deployment{}, err
+	}
+	sha, err := d.source.LatestCommit(ctx, app.RepoURL, app.Branch)
+	if err != nil {
+		return store.Deployment{}, err
+	}
+	return d.Start(ctx, appID, sha)
+}
+
+// Push deploys a pushed commit: straight away if the app has no deploy in
+// progress (started), otherwise once that one finishes, as the app's next
+// commit (replacing an older push waiting there). See
+// store.RequestDeployment.
+func (d *Deployer) Push(ctx context.Context, appID int64, commitSHA string) (dep store.Deployment, started bool, err error) {
+	dep, started, err = d.store.RequestDeployment(ctx, appID, commitSHA)
+	if started {
+		d.notify()
+	}
+	return dep, started, err
+}
+
+// startNext starts the deploy of a pushed commit that was waiting for
+// deployment's deploy to finish, if there is one. Called whenever a deploy
+// finishes, whichever way. Best effort: if it fails, the commit stays
+// waiting, and the app's next deploy to finish starts it.
+func (d *Deployer) startNext(ctx context.Context, deploymentID int64) {
+	finished, err := d.store.Deployment(ctx, deploymentID)
+	if err == nil {
+		var next store.Deployment
+		var ok bool
+		next, ok, err = d.store.StartNextDeployment(ctx, finished.AppID)
+		if ok {
+			slog.Info("deploying the next pushed commit", "app", finished.AppID, "deployment", next.ID, "commit", next.CommitSHA)
+			d.notify()
+		}
+	}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		slog.Error("starting the next pushed commit", "after", deploymentID, "err", err)
+	}
+}
+
+func (d *Deployer) notify() {
 	if d.Notify != nil {
 		d.Notify()
 	}
-	return dep, nil
 }
 
 // Names the platform gives things, derived so they never need storing.
@@ -157,6 +210,7 @@ func (d *Deployer) Run(ctx context.Context, job store.Job) error {
 	}
 	switch {
 	case err == nil:
+		d.startNext(ctx, job.DeploymentID)
 	case permanent(err):
 		// GiveUp writes the reason to the log.
 		err = jobs.Permanent(err)
@@ -178,7 +232,9 @@ func (d *Deployer) GiveUp(ctx context.Context, job store.Job, err error) {
 	// just after), or deleted with its app: nothing left to record.
 	if err != nil && !errors.Is(err, store.ErrWrongStatus) && !errors.Is(err, store.ErrNotFound) {
 		slog.Error("recording a failed deploy", "deployment", job.DeploymentID, "err", err)
+		return
 	}
+	d.startNext(ctx, job.DeploymentID)
 }
 
 // permanent reports whether err is one that trying the deploy again won't

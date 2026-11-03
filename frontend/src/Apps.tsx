@@ -4,9 +4,11 @@ import {
   createApp,
   deleteEnvVar,
   deployCommit,
+  deployLatest,
   deploymentLogURL,
   fetchApp,
   fetchApps,
+  setAutoDeploy,
   setEnvVar,
   type AppDetail,
   type Deployment,
@@ -164,6 +166,7 @@ export function AppPage({ id }: { id: number }) {
             <AppSummary app={app} />
             <h3>Deploy</h3>
             <DeployForm app={app} onDeployed={onDeployed} />
+            <AutoDeploy app={app} onDone={refresh} />
             <h3>Logs</h3>
             <Logs app={app} choice={log} onChoose={setLog} />
             <h3>Deployments</h3>
@@ -226,9 +229,16 @@ function DeployForm({ app, onDeployed }: { app: AppDetail; onDeployed: (d: Deplo
       onDeployed(d)
     })
   }
+  const onLatest = () => {
+    void run(async () => onDeployed(await deployLatest(app.id)))
+  }
 
   return (
     <form className="form-inline" onSubmit={onSubmit}>
+      <button type="button" onClick={onLatest} disabled={deploying || action.status === 'busy'}>
+        Deploy latest from <span className="mono">{app.branch}</span>
+      </button>
+      <span className="muted">or a commit:</span>
       <label>
         <span className="visually-hidden">Commit SHA</span>
         <input
@@ -246,6 +256,38 @@ function DeployForm({ app, onDeployed }: { app: AppDetail; onDeployed: (d: Deplo
       {deploying && <span className="muted">A deploy is in progress.</span>}
       <ActionError state={action} />
     </form>
+  )
+}
+
+// AutoDeploy is the push-to-deploy switch, and the pushed commit waiting for
+// the deploy in progress, if there is one.
+function AutoDeploy({ app, onDone }: { app: AppDetail; onDone: () => void }) {
+  const [action, run] = useAction()
+  const onChange = (on: boolean) => {
+    void run(async () => {
+      await setAutoDeploy(app.id, on)
+      onDone()
+    })
+  }
+  return (
+    <div className="auto-deploy">
+      <label>
+        <input
+          type="checkbox"
+          checked={app.autoDeploy}
+          disabled={action.status === 'busy'}
+          onChange={(e) => onChange(e.target.checked)}
+        />{' '}
+        Deploy automatically on every push to <span className="mono">{app.branch}</span>
+      </label>
+      {app.nextCommitSha !== null && (
+        <p className="muted">
+          Pushed while a deploy was running: <span className="mono">{shortSHA(app.nextCommitSha)}</span> deploys
+          next.
+        </p>
+      )}
+      <ActionError state={action} />
+    </div>
   )
 }
 
