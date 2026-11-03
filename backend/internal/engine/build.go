@@ -23,12 +23,17 @@ func (e *BuildError) Error() string { return "build failed: " + e.Message }
 // Build builds the Dockerfile at the root of buildContext (a tar stream) and
 // tags the image tag.
 //
-// It uses BuildKit, Docker's current builder, rather than the deprecated
-// legacy one. Sent this way, with the context in the request body, BuildKit
-// needs no session, so only the proxy's /build endpoint is used.
+// It uses Docker's legacy builder, deliberately. BuildKit through the API
+// needs a client-side session to look up base images (CI showed "no active
+// sessions" even for a public image), which would mean the large
+// moby/buildkit library plus another proxy permission. The legacy builder
+// pulls base images itself, through /build alone. It's deprecated (since
+// Docker 23, no removal date) and lacks newer Dockerfile features such as
+// RUN --mount; switching to BuildKit with a session later only changes this
+// function. See docs/decisions/platform.md.
 func (c *Client) Build(ctx context.Context, buildContext io.Reader, tag string, labels map[string]string) error {
 	res, err := c.api.ImageBuild(ctx, buildContext, client.ImageBuildOptions{
-		Version: build.BuilderBuildKit,
+		Version: build.BuilderV1,
 		Tags:    []string{tag},
 		Labels:  labels,
 		// Clean up intermediate containers, even when the build fails.
@@ -43,10 +48,9 @@ func (c *Client) Build(ctx context.Context, buildContext io.Reader, tag string, 
 }
 
 // buildMessage is the part of Docker's build output this package reads. The
-// output is a stream of JSON objects; with BuildKit, progress arrives as
-// encoded "aux" trace messages (decoded for live logs in P2), and a failure
-// as "error"/"errorDetail". The HTTP status is 200 either way, since it's
-// sent before the build starts.
+// output is a stream of JSON objects: progress as plain-text "stream" lines
+// (kept for live logs in P2), and a failure as "error"/"errorDetail". The
+// HTTP status is 200 either way, since it's sent before the build starts.
 type buildMessage struct {
 	Error       string `json:"error"`
 	ErrorDetail *struct {

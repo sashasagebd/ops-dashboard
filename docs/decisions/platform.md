@@ -494,3 +494,35 @@ disk: Docker's default log file grows forever.
 **Alternatives:** a read-only root filesystem and `cap_drop: ALL` as well
 (stronger, but breaks many ordinary images that write temp files or switch
 users; could become an opt-in per app later).
+
+### Builds use Docker's legacy builder, for now (2026-11-03)
+
+**What:** `engine.Build` asks Docker for its legacy builder (`version=1`),
+sending the code as the request body.
+
+**Why:** the first plan was BuildKit, Docker's current builder. Its source
+showed it accepts the build context in the request body without a session,
+which is true. But CI's real build through the proxy failed with
+`no active sessions`: BuildKit also uses a client-side session to look up
+`FROM` images in the registry, even public ones. The legacy builder pulls
+base images itself, so it works through `/build` alone, with no extra
+dependency or proxy permission. It's deprecated (since Docker 23, with no
+removal date) and lacks newer features such as `RUN --mount=type=cache` and
+heredocs, which apps deployed here must avoid. A side benefit: its progress
+is plain text, which makes Phase 2's live build logs simpler. The choice is
+contained in one function, so it's cheap to change.
+
+**Alternatives:**
+- *BuildKit with a session implemented in Go* (what the `docker` CLI does).
+  It's the upgrade path if an app needs BuildKit features. Cost: the large
+  `moby/buildkit` library, the proxy's `SESSION` group, and a long-lived
+  hijacked connection through a proxy with a 10-minute idle timeout.
+- *BuildKit after pre-pulling every base image:* fragile, since `# syntax=`
+  lines, `ARG`s in `FROM` and `COPY --from=<image>` all still need the
+  registry.
+- *A separate build service:* a standalone BuildKit daemon, or a builder
+  container per build. More moving parts than this phase needs.
+
+**Lesson:** reading the source got the first half right and missed the
+second. The CI check that does a real build is what caught it, before any
+deploy depended on it.

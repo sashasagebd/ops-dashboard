@@ -175,19 +175,19 @@ jobs:
           test "$(probe POST /exec/none/start)" = 403
           test "$(probe GET /volumes)" = 403
           test "$(probe GET /secrets)" = 403
-          # A BuildKit build through the write proxy, sent the way
-          # engine.Build sends it: the context as the request body, no
-          # session. This is what proves BuildKit needs only /build (unit
-          # tests use a fake daemon). The trace messages show BuildKit, not
-          # the legacy builder, did the build.
-          mkdir -p /tmp/bk
-          printf 'FROM busybox:1.37.0\nRUN echo built-by-buildkit > /done\n' > /tmp/bk/Dockerfile
-          tar -C /tmp/bk -c Dockerfile | docker run --rm -i --network dashboard_docker-rw curlimages/curl:8.11.1 \
+          # A real build through the write proxy, sent the way engine.Build
+          # sends it: the legacy builder (version=1), the context as the
+          # request body, a base image Docker has to pull. Unit tests use a
+          # fake daemon, so this is what proves builds work through /build
+          # alone. (BuildKit failed here with "no active sessions": it needs
+          # a client-side session to resolve base images.)
+          mkdir -p /tmp/build-probe
+          printf 'FROM busybox:1.37.0\nRUN echo built > /done\n' > /tmp/build-probe/Dockerfile
+          tar -C /tmp/build-probe -c Dockerfile | docker run --rm -i --network dashboard_docker-rw curlimages/curl:8.11.1 \
             -sS --data-binary @- -H 'Content-Type: application/x-tar' \
-            'http://docker-proxy-rw:2375/build?version=2&t=ci-buildkit-probe:latest' > /tmp/bk/out.json
-          if grep '"errorDetail"' /tmp/bk/out.json; then exit 1; fi
-          grep 'moby.buildkit.trace' /tmp/bk/out.json > /dev/null
-          docker image inspect ci-buildkit-probe:latest > /dev/null
+            'http://docker-proxy-rw:2375/build?version=1&t=ci-build-probe:latest' > /tmp/build-probe/out.json
+          if grep '"errorDetail"' /tmp/build-probe/out.json; then exit 1; fi
+          docker image inspect ci-build-probe:latest > /dev/null
           # A restart (like a redeploy) keeps the volume and finds nothing
           # left to migrate.
           docker compose restart platform

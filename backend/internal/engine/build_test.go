@@ -8,11 +8,12 @@ import (
 	"testing"
 )
 
-func TestBuildSendsContextToBuildKit(t *testing.T) {
+func TestBuildSendsContextToLegacyBuilder(t *testing.T) {
 	f, c := newFakeDaemon(t)
 	f.handle("POST /build", respondJSON(http.StatusOK,
-		`{"id":"moby.buildkit.trace","aux":"CgQ="}`+"\n"+
-			`{"aux":{"ID":"sha256:abc"}}`+"\n"))
+		`{"stream":"Step 1/2 : FROM busybox"}`+"\n"+
+			`{"aux":{"ID":"sha256:abc"}}`+"\n"+
+			`{"stream":"Successfully tagged hello:abc123"}`+"\n"))
 
 	err := c.Build(t.Context(), strings.NewReader("tar bytes"), "hello:abc123", map[string]string{"ops.platform.app": "hello"})
 	if err != nil {
@@ -24,8 +25,8 @@ func TestBuildSendsContextToBuildKit(t *testing.T) {
 		t.Fatalf("no build request; got %v", f.routes())
 	}
 	q, _ := url.ParseQuery(req.query)
-	if q.Get("version") != "2" {
-		t.Errorf("builder version = %q, want 2 (BuildKit)", q.Get("version"))
+	if q.Get("version") != "1" {
+		t.Errorf("builder version = %q, want 1 (the legacy builder: BuildKit needs a session)", q.Get("version"))
 	}
 	if q.Get("t") != "hello:abc123" {
 		t.Errorf("tag = %q, want hello:abc123", q.Get("t"))
@@ -43,8 +44,8 @@ func TestBuildReportsFailureFromStream(t *testing.T) {
 	// output may continue after it.
 	f, c := newFakeDaemon(t)
 	f.handle("POST /build", respondJSON(http.StatusOK,
-		`{"id":"moby.buildkit.trace","aux":"CgQ="}`+"\n"+
-			`{"errorDetail":{"message":"process \"/bin/sh -c npm ci\" did not complete successfully: exit code: 1"},"error":"process ... exit code: 1"}`+"\n"+
+		`{"stream":"Step 2/3 : RUN npm ci"}`+"\n"+
+			`{"errorDetail":{"code":1,"message":"The command '/bin/sh -c npm ci' returned a non-zero code: 1"},"error":"The command ... returned a non-zero code: 1"}`+"\n"+
 			`{"errorDetail":{"message":"a later error"}}`+"\n"))
 
 	err := c.Build(t.Context(), strings.NewReader(""), "hello:abc", nil)
