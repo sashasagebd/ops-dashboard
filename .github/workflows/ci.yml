@@ -306,7 +306,7 @@ jobs:
           grep -F 'Step 1/' /tmp/deploy.log || on_failure
           grep -F '(attempt 2)' /tmp/deploy.log || on_failure
           grep -F 'Live at http://selftest.apps.test/' /tmp/deploy.log || on_failure
-          tail -2 /tmp/deploy.log | grep -F 'event: end' || on_failure
+          grep -Fx 'event: end' /tmp/deploy.log || on_failure
           # The live app's output: the selftest app (the dashboard image)
           # logs "listening" as it starts. This stream stays open while the
           # app runs, so curl is stopped after a few seconds (exit 28 is that
