@@ -713,8 +713,11 @@ public later through cloudflared, not by widening this.
   test checks this. The fix, if needed, is `net.ipv4.ip_nonlocal_bind=1`
   (lets a socket bind an address that isn't up yet), or ordering Docker
   after Tailscale in systemd. The first reboot failed for a different
-  reason (Caddy's admin address, see "Caddy's admin API on a fixed IP"),
-  so this one is still untested until a reboot after that fix.
+  reason (Caddy's admin address, see "Caddy's admin API on a fixed IP").
+  The second, after that fix, came up cleanly: the Tailscale IP was there
+  in time, so neither fix was applied. It's a race, not a guarantee, so if
+  Caddy is ever down after a boot with "cannot assign requested address",
+  this is the fix.
 - **Spoofed destinations.** A device on the same LAN segment could, in
   principle, send packets addressed to the Tailscale IP straight to the
   server's LAN interface, and Docker's forwarding rule matches on the
