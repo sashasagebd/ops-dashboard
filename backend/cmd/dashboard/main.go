@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -94,6 +95,11 @@ func run(addr string) error {
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,
+		// Requests end when shutdown starts. Shutdown waits for handlers to
+		// return, and a log stream (Server-Sent Events) otherwise only
+		// returns when the browser leaves, so an open log viewer would
+		// hold up every restart until the shutdown timeout.
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 
 	errCh := make(chan error, 1)

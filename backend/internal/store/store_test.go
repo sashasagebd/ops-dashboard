@@ -509,3 +509,108 @@ func assertStatus(t *testing.T, s *Store, id int64, want DeploymentStatus) {
 		t.Errorf("deployment %d status = %s, want %s", id, d.Status, want)
 	}
 }
+
+func TestDeploymentLogs(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	d, _ := s.CreateDeployment(ctx, app.ID, sha1)
+	at := time.Now()
+
+	mustDo(t, s.AppendDeploymentLogs(ctx, d.ID, []NewLogLine{
+		{At: at, Stream: LogPlatform, Line: "Building"},
+		{At: at, Stream: LogBuild, Line: "Step 1/2 : FROM busybox"},
+		{At: at, Stream: LogBuild, Line: "Step 2/2 : RUN true"},
+	}))
+	mustDo(t, s.AppendDeploymentLogs(ctx, d.ID, []NewLogLine{{At: at, Stream: LogPlatform, Line: "Healthy"}}))
+
+	all, err := s.DeploymentLogs(ctx, d.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, l := range all {
+		got = append(got, l.Line)
+	}
+	if want := []string{"Building", "Step 1/2 : FROM busybox", "Step 2/2 : RUN true", "Healthy"}; !slices.Equal(got, want) {
+		t.Fatalf("lines = %q, want %q (in the order written)", got, want)
+	}
+	// Resuming after a line, with a limit.
+	rest, _ := s.DeploymentLogs(ctx, d.ID, all[0].ID, 2)
+	if len(rest) != 2 || rest[0].ID != all[1].ID || rest[1].ID != all[2].ID {
+		t.Errorf("after line 1, limit 2: %+v", rest)
+	}
+	if n, _ := s.CountDeploymentLogs(ctx, d.ID, LogBuild); n != 2 {
+		t.Errorf("build lines = %d, want 2", n)
+	}
+	if err := s.AppendDeploymentLogs(ctx, 999999, []NewLogLine{{At: at, Stream: LogBuild, Line: "x"}}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("appending to a missing deployment: error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeploymentLogCompleteFollowsTheJob(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	d, _ := s.CreateDeployment(ctx, app.ID, sha1)
+
+	complete := func() bool {
+		t.Helper()
+		c, err := s.DeploymentLogComplete(ctx, d.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	if complete() {
+		t.Error("complete while queued")
+	}
+	job := mustClaim(t, s, "w1")
+	// Waiting to be retried: more lines are coming.
+	mustDo(t, s.RetryJob(ctx, job.ID, "w1", 0, "docker unreachable"))
+	if complete() {
+		t.Error("complete while waiting for a retry")
+	}
+	job = mustClaim(t, s, "w1")
+	mustDo(t, s.CompleteJob(ctx, job.ID, "w1"))
+	if !complete() {
+		t.Error("not complete once the job is done")
+	}
+}
+
+func TestPruneDeploymentLogsKeepsTheMostRecent(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	other := createTestApp(t, s, "other")
+	ctx := t.Context()
+
+	var ids []int64
+	for range 4 {
+		d, err := s.CreateDeployment(ctx, app.ID, sha1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustDo(t, s.AppendDeploymentLogs(ctx, d.ID, []NewLogLine{{At: time.Now(), Stream: LogPlatform, Line: "x"}}))
+		mustDo(t, s.MarkFailed(ctx, d.ID, "x")) // frees the app for the next one
+		ids = append(ids, d.ID)
+	}
+	o, _ := s.CreateDeployment(ctx, other.ID, sha1)
+	mustDo(t, s.AppendDeploymentLogs(ctx, o.ID, []NewLogLine{{At: time.Now(), Stream: LogPlatform, Line: "x"}}))
+
+	n, err := s.PruneDeploymentLogs(ctx, app.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("deleted %d lines, want 2 (the two oldest deployments')", n)
+	}
+	for i, id := range ids {
+		lines, _ := s.DeploymentLogs(ctx, id, 0, 10)
+		if kept := len(lines) > 0; kept != (i >= 2) {
+			t.Errorf("deployment %d (#%d of 4): kept %v", id, i+1, kept)
+		}
+	}
+	if lines, _ := s.DeploymentLogs(ctx, o.ID, 0, 10); len(lines) != 1 {
+		t.Error("pruning one app deleted another app's logs")
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
@@ -22,6 +23,12 @@ type fakeStore struct {
 	env         map[string]string // "appID/KEY" -> value
 	deployments []store.Deployment
 	err         error // if set, every method fails with it
+
+	mu       sync.Mutex
+	logs     []store.LogLine
+	complete bool
+	onPoll   func(n int) // called with the poll's number (from 1) as each log poll starts
+	polls    int
 }
 
 func (f *fakeStore) Apps(context.Context) ([]store.App, error) { return f.apps, f.err }
@@ -82,6 +89,15 @@ func (f *fakeStore) Deployments(context.Context, int64, int) ([]store.Deployment
 	return f.deployments, f.err
 }
 
+func (f *fakeStore) Deployment(_ context.Context, id int64) (store.Deployment, error) {
+	for _, d := range f.deployments {
+		if d.ID == id {
+			return d, nil
+		}
+	}
+	return store.Deployment{}, store.ErrNotFound
+}
+
 func (f *fakeStore) CurrentDeployment(context.Context, int64) (store.Deployment, error) {
 	for _, d := range f.deployments {
 		if d.Status == store.StatusHealthy {
@@ -108,7 +124,7 @@ func newTestAPI() (http.Handler, *fakeStore, *fakeDeployer) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Hostname: "hello.apps.test", Port: 8080}}
 	dep := &fakeDeployer{}
-	return New(st, dep, "apps.test"), st, dep
+	return New(st, dep, &fakeEngine{}, "apps.test"), st, dep
 }
 
 // do sends a request; a non-empty body is sent as JSON.
@@ -287,7 +303,7 @@ func TestInternalErrorsAreGeneric(t *testing.T) {
 
 func TestListAppsEmptyIsArray(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
-	rec := do(t, New(st, &fakeDeployer{}, "apps.test"), "GET", "/api/platform/apps", "")
+	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, "apps.test"), "GET", "/api/platform/apps", "")
 	if strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Errorf("body = %s, want []", rec.Body)
 	}

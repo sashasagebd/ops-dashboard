@@ -1,5 +1,6 @@
 // Package api is the platform's HTTP API: registering apps, setting their env
-// vars and deploying them. The browser reaches it through the dashboard,
+// vars, deploying them, and streaming deploy and app logs (logs.go). The
+// browser reaches it through the dashboard,
 // which forwards /api/platform/* here, so the paths keep that prefix.
 //
 // There's no login: like the dashboard, it's only reachable over Tailscale.
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
@@ -35,7 +37,10 @@ type Store interface {
 	SetEnvVar(ctx context.Context, appID int64, key, value string) error
 	DeleteEnvVar(ctx context.Context, appID int64, key string) error
 	Deployments(ctx context.Context, appID int64, limit int) ([]store.Deployment, error)
+	Deployment(ctx context.Context, id int64) (store.Deployment, error)
 	CurrentDeployment(ctx context.Context, appID int64) (store.Deployment, error)
+	DeploymentLogs(ctx context.Context, deploymentID, afterID int64, limit int) ([]store.LogLine, error)
+	DeploymentLogComplete(ctx context.Context, deploymentID int64) (bool, error)
 }
 
 // Deployer starts deploys; in production it's a *deploy.Deployer.
@@ -43,10 +48,16 @@ type Deployer interface {
 	Start(ctx context.Context, appID int64, commitSHA string) (store.Deployment, error)
 }
 
+// Engine reads app containers' output; in production it's an *engine.Client.
+type Engine interface {
+	ManagedContainers(ctx context.Context, app string) ([]engine.ManagedContainer, error)
+	FollowLogs(ctx context.Context, id string, tail int, since time.Time, emit func(engine.LogLine)) error
+}
+
 // New returns the platform API's handler. Apps get the hostname
 // <name>.<appsDomain>.
-func New(st Store, dep Deployer, appsDomain string) http.Handler {
-	a := &api{store: st, deployer: dep, appsDomain: appsDomain}
+func New(st Store, dep Deployer, eng Engine, appsDomain string) http.Handler {
+	a := &api{store: st, deployer: dep, engine: eng, appsDomain: appsDomain}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/platform/apps", a.listApps)
 	mux.HandleFunc("POST /api/platform/apps", a.createApp)
@@ -55,12 +66,15 @@ func New(st Store, dep Deployer, appsDomain string) http.Handler {
 	mux.HandleFunc("DELETE /api/platform/apps/{id}/env/{key}", a.deleteEnvVar)
 	mux.HandleFunc("GET /api/platform/apps/{id}/deployments", a.listDeployments)
 	mux.HandleFunc("POST /api/platform/apps/{id}/deployments", a.createDeployment)
+	mux.HandleFunc("GET /api/platform/apps/{id}/deployments/{deploymentId}/logs", a.deploymentLogs)
+	mux.HandleFunc("GET /api/platform/apps/{id}/logs", a.appLogs)
 	return mux
 }
 
 type api struct {
 	store      Store
 	deployer   Deployer
+	engine     Engine
 	appsDomain string
 }
 

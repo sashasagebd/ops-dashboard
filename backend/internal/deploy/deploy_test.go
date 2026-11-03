@@ -43,12 +43,17 @@ type fakes struct {
 	containers  []engine.ManagedContainer // what's running; Run adds, Remove takes away
 	removed     []string
 	onProbe     func() // hook, e.g. to cancel mid-check
+
+	buildOutput []string // what Build reports as progress
+	priorBuild  int      // build lines stored by earlier attempts
+	logLines    []string // the deploy log, as "stream: line"
+	pruned      int      // PruneDeploymentLogs' keep, once called
 }
 
 func newFakes() *fakes {
 	return &fakes{
 		app: store.App{
-			ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Port: 8080,
+			ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Hostname: "hello.apps.test", Port: 8080,
 			HealthCheckPath: "/healthz", MemoryLimitBytes: 256 << 20, CPULimitMillicores: 500,
 			SourceDir: "web",
 		},
@@ -163,14 +168,39 @@ func (f *fakes) BuildContext(_ context.Context, repo, commit, dir string) (io.Re
 
 // Engine
 
-func (f *fakes) Build(_ context.Context, buildContext io.Reader, tag string, _ map[string]string) error {
+func (f *fakes) Build(_ context.Context, buildContext io.Reader, tag string, _ map[string]string, progress func(string)) error {
 	f.event("build %s", tag)
 	// Like Docker's client: a broken upload comes back as an error of its
 	// own, which may or may not wrap the reader's.
 	if _, err := io.ReadAll(buildContext); err != nil {
 		return errors.New("error during connect: unexpected EOF")
 	}
+	for _, l := range f.buildOutput {
+		progress(l)
+	}
 	return f.buildErr
+}
+
+// Deploy logs
+
+func (f *fakes) AppendDeploymentLogs(_ context.Context, _ int64, lines []store.NewLogLine) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, l := range lines {
+		f.logLines = append(f.logLines, l.Stream+": "+l.Line)
+	}
+	return nil
+}
+
+func (f *fakes) CountDeploymentLogs(context.Context, int64, string) (int, error) {
+	return f.priorBuild, nil
+}
+
+func (f *fakes) PruneDeploymentLogs(_ context.Context, _ int64, keep int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pruned = keep
+	return 0, nil
 }
 
 func (f *fakes) Run(_ context.Context, spec engine.RunSpec) (string, error) {
@@ -537,5 +567,106 @@ func TestStartQueuesAndNotifies(t *testing.T) {
 	f.createErr = store.ErrDeployInProgress
 	if _, err := d.Start(t.Context(), 1, sha); !errors.Is(err, store.ErrDeployInProgress) || notified != 1 {
 		t.Errorf("Start while in progress: err %v, notified %d; want ErrDeployInProgress, no notify", err, notified)
+	}
+}
+
+func TestDeployLog(t *testing.T) {
+	f := newFakes()
+	f.buildOutput = []string{"Step 1/2 : FROM busybox", "Step 2/2 : CMD [\"httpd\"]"}
+	if _, err := deploy(t, f, t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"platform: Deploying https://github.com/o/hello at 0123456 (attempt 1)",
+		"platform: Building image ops-platform/hello:" + sha + " from web/",
+		"build: Step 1/2 : FROM busybox",
+		"build: Step 2/2 : CMD [\"httpd\"]",
+		"platform: Starting container app-hello-7 (256 MiB memory, 0.5 CPU, 1 env vars)",
+		"platform: Waiting up to 200ms for GET /healthz to succeed",
+		"platform: Healthy",
+		"platform: Removed the previous container app-hello-6",
+		"platform: Removed the previous container app-hello-3",
+		"platform: Live at http://hello.apps.test/",
+	}
+	if !slices.Equal(f.logLines, want) {
+		t.Errorf("log:\n  got  %q\n  want %q", f.logLines, want)
+	}
+	// Env var values never reach the log.
+	for _, l := range f.logLines {
+		if strings.Contains(l, "s3cret") {
+			t.Errorf("log line %q contains an env var's value", l)
+		}
+	}
+	if f.pruned != keepLogsFor {
+		t.Errorf("pruned keeping %d deployments' logs, want %d", f.pruned, keepLogsFor)
+	}
+}
+
+func TestDeployLogOnFailure(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(f *fakes)
+		ctx   func(t *testing.T, f *fakes) context.Context
+		want  string // the log's last line
+	}{
+		{
+			name:  "permanent: the reason, once given up",
+			setup: func(f *fakes) { f.buildErr = &engine.BuildError{Message: "npm ci returned 1"} },
+			want:  "platform: Deploy failed: build failed: npm ci returned 1",
+		},
+		{
+			name:  "transient: the attempt failed, and why (generically)",
+			setup: func(f *fakes) { f.sourceErr = errors.New("dial tcp: i/o timeout") },
+			want:  "platform: Attempt 1 failed: internal error; see the platform's logs",
+		},
+		{
+			name:  "shutdown: it carries on later",
+			setup: func(f *fakes) { f.probeStatus = func(int) int { return 502 } },
+			ctx: func(t *testing.T, f *fakes) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				f.onProbe = cancel
+				return ctx
+			},
+			want: "platform: Interrupted: the platform is shutting down. The deploy carries on when it's back.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakes()
+			tt.setup(f)
+			d := f.deployer()
+			dep, _ := d.Start(t.Context(), 1, sha)
+			ctx := t.Context()
+			if tt.ctx != nil {
+				ctx = tt.ctx(t, f)
+			}
+			job := store.Job{ID: 1, DeploymentID: dep.ID, Attempts: 1}
+			// As the runner does: only a permanent error gives up here.
+			if err := d.Run(ctx, job); jobs.IsPermanent(err) {
+				d.GiveUp(t.Context(), job, err)
+			}
+			if n := len(f.logLines); n == 0 || f.logLines[n-1] != tt.want {
+				t.Errorf("log ends %q, want %q", f.logLines, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildOutputIsCapped(t *testing.T) {
+	f := newFakes()
+	f.priorBuild = maxBuildLines - 1 // an earlier attempt nearly used it up
+	f.buildOutput = []string{"one more", "too many", "and more"}
+	if _, err := deploy(t, f, t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var build []string
+	for _, l := range f.logLines {
+		if strings.HasPrefix(l, "build: ") || strings.Contains(l, "cut off") {
+			build = append(build, l)
+		}
+	}
+	want := []string{"build: one more", "platform: Build output cut off after 5000 lines; the build carries on."}
+	if !slices.Equal(build, want) {
+		t.Errorf("build lines = %q, want %q", build, want)
 	}
 }

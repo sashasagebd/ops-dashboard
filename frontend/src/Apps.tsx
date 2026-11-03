@@ -1,8 +1,10 @@
 import { useCallback, useState, type FormEvent, type ReactNode } from 'react'
 import {
+  appLogURL,
   createApp,
   deleteEnvVar,
   deployCommit,
+  deploymentLogURL,
   fetchApp,
   fetchApps,
   setEnvVar,
@@ -12,6 +14,7 @@ import {
   type PlatformApp,
 } from './api'
 import { formatBytes, formatDuration } from './format'
+import { LogViewer } from './LogViewer'
 import { appHref } from './route'
 import { usePolling, type PollState } from './usePolling'
 
@@ -129,7 +132,12 @@ function NewAppForm() {
   )
 }
 
-// AppPage is one app: what's live, deploying, env vars and past deploys.
+// LogChoice is which log the app page shows: a deploy's, or the live
+// container's output.
+type LogChoice = { kind: 'deployment'; id: number } | { kind: 'app' }
+
+// AppPage is one app: what's live, deploying, logs, past deploys and env
+// vars.
 export function AppPage({ id }: { id: number }) {
   // Bumped after each change, to show its effect without waiting for the
   // next poll.
@@ -137,6 +145,12 @@ export function AppPage({ id }: { id: number }) {
   const refresh = () => setRefreshKey((k) => k + 1)
   const fetcher = useCallback((signal: AbortSignal) => fetchApp(id, signal), [id])
   const state = usePolling(fetcher, APP_REFRESH_MS, refreshKey)
+  // null: the latest deploy's log.
+  const [log, setLog] = useState<LogChoice | null>(null)
+  const onDeployed = (d: Deployment) => {
+    setLog({ kind: 'deployment', id: d.id }) // watch the new deploy
+    refresh()
+  }
 
   return (
     <>
@@ -149,11 +163,18 @@ export function AppPage({ id }: { id: number }) {
             <h2>{app.name}</h2>
             <AppSummary app={app} />
             <h3>Deploy</h3>
-            <DeployForm app={app} onDone={refresh} />
+            <DeployForm app={app} onDeployed={onDeployed} />
+            <h3>Logs</h3>
+            <Logs app={app} choice={log} onChoose={setLog} />
+            <h3>Deployments</h3>
+            <DeploymentsTable
+              deployments={app.deployments}
+              now={checkedAt}
+              shownLog={log?.kind === 'deployment' ? log.id : (app.deployments.at(0)?.id ?? null)}
+              onShowLog={(id) => setLog({ kind: 'deployment', id })}
+            />
             <h3>Environment variables</h3>
             <EnvVars app={app} onDone={refresh} />
-            <h3>Deployments</h3>
-            <DeploymentsTable deployments={app.deployments} now={checkedAt} />
           </>
         )}
       </Loaded>
@@ -191,7 +212,7 @@ function AppSummary({ app }: { app: AppDetail }) {
   )
 }
 
-function DeployForm({ app, onDone }: { app: AppDetail; onDone: () => void }) {
+function DeployForm({ app, onDeployed }: { app: AppDetail; onDeployed: (d: Deployment) => void }) {
   const [sha, setSHA] = useState('')
   const [action, run] = useAction()
   const deploying = app.deployments.some((d) => IN_PROGRESS.has(d.status))
@@ -200,9 +221,9 @@ function DeployForm({ app, onDone }: { app: AppDetail; onDone: () => void }) {
   const onSubmit = (e: FormEvent) => {
     e.preventDefault()
     void run(async () => {
-      await deployCommit(app.id, sha)
+      const d = await deployCommit(app.id, sha)
       setSHA('')
-      onDone()
+      onDeployed(d)
     })
   }
 
@@ -294,7 +315,80 @@ function EnvVars({ app, onDone }: { app: AppDetail; onDone: () => void }) {
   )
 }
 
-function DeploymentsTable({ deployments, now }: { deployments: Deployment[]; now: number }) {
+// Logs shows one log at a time, chosen with a toggle: a deploy's (the latest
+// unless another was picked from the table) or the live app's output.
+function Logs({
+  app,
+  choice,
+  onChoose,
+}: {
+  app: AppDetail
+  choice: LogChoice | null
+  onChoose: (c: LogChoice) => void
+}) {
+  const latest = app.deployments.at(0)
+  const shown: LogChoice | null = choice ?? (latest === undefined ? null : { kind: 'deployment', id: latest.id })
+  if (shown === null) return <p className="muted">Logs appear here once the app has been deployed.</p>
+  const deploymentID = shown.kind === 'deployment' ? shown.id : latest?.id
+  const live = app.currentDeployment
+
+  return (
+    <>
+      <div className="toggle" role="group" aria-label="Which log">
+        <button
+          type="button"
+          aria-pressed={shown.kind === 'deployment'}
+          disabled={deploymentID === undefined}
+          onClick={() => deploymentID !== undefined && onChoose({ kind: 'deployment', id: deploymentID })}
+        >
+          Deploy #{deploymentID}
+        </button>
+        <button
+          type="button"
+          aria-pressed={shown.kind === 'app'}
+          disabled={live === null}
+          onClick={() => onChoose({ kind: 'app' })}
+        >
+          App output
+        </button>
+      </div>
+      {shown.kind === 'deployment' ? (
+        <LogViewer
+          key={shown.id}
+          url={deploymentLogURL(app.id, shown.id)}
+          label={`Deploy #${shown.id} log`}
+          endedText="End of the deploy's log."
+          emptyText="No log for this deploy: only an app's last 10 deploys keep theirs."
+        />
+      ) : live === null ? (
+        <p className="muted">Nothing is live, so there's no app output.</p>
+      ) : (
+        // Keyed by the live deployment, so a new one going live starts a
+        // new stream (the old container's has ended).
+        <LogViewer
+          key={`app-${live.id}`}
+          url={appLogURL(app.id)}
+          label="App output"
+          endedText="Output stopped: the container stopped, or a deploy replaced it."
+          emptyText="No output."
+          restartable
+        />
+      )}
+    </>
+  )
+}
+
+function DeploymentsTable({
+  deployments,
+  now,
+  shownLog,
+  onShowLog,
+}: {
+  deployments: Deployment[]
+  now: number
+  shownLog: number | null
+  onShowLog: (id: number) => void
+}) {
   if (deployments.length === 0) return <p>No deploys yet.</p>
   return (
     <div className="table-scroll">
@@ -305,6 +399,9 @@ function DeploymentsTable({ deployments, now }: { deployments: Deployment[]; now
             <th scope="col">Commit</th>
             <th scope="col">Status</th>
             <th scope="col">Started</th>
+            <th scope="col">
+              <span className="visually-hidden">Log</span>
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -319,6 +416,16 @@ function DeploymentsTable({ deployments, now }: { deployments: Deployment[]; now
                 {d.error !== null && <div className="deploy-error">{d.error}</div>}
               </td>
               <td title={d.createdAt}>{formatDuration(now - Date.parse(d.createdAt))} ago</td>
+              <td>
+                <button
+                  type="button"
+                  aria-pressed={shownLog === d.id}
+                  aria-label={`Show deploy #${d.id}'s log`}
+                  onClick={() => onShowLog(d.id)}
+                >
+                  Log
+                </button>
+              </td>
             </tr>
           ))}
         </tbody>

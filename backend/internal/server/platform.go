@@ -18,8 +18,10 @@ import (
 // check); the platform does all the validating.
 func NewPlatformProxy(target *url.URL) http.Handler {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	// Every platform request answers quickly (a deploy returns 202 and runs
-	// in the background), so a slow answer means it's stuck.
+	// Every platform request starts answering quickly (a deploy returns 202
+	// and runs in the background; a log stream sends its headers at once),
+	// so a slow start means it's stuck. It limits only the wait for the
+	// headers, not how long a log stream's body can go on.
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	return &httputil.ReverseProxy{
 		// Rewrite rather than Director: it drops any X-Forwarded-* headers
@@ -28,6 +30,12 @@ func NewPlatformProxy(target *url.URL) http.Handler {
 			r.SetURL(target)
 		},
 		Transport: transport,
+		// Pass each write on to the browser at once, so log lines (Server-
+		// Sent Events) arrive live instead of sitting in a buffer. The
+		// proxy does this for text/event-stream anyway; set here so it
+		// doesn't depend on that. The platform's other answers are small
+		// single writes, so this costs nothing.
+		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			slog.Error("forwarding to the platform", "method", r.Method, "path", r.URL.Path, "err", err)
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "the platform isn't reachable"})

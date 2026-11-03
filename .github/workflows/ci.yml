@@ -297,6 +297,23 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Sec-Fetch-Site: cross-site' \
             -H 'Content-Type: application/json' --data '{}' http://127.0.0.1:8080/api/platform/apps)" = 403
 
+          # Logs, through the dashboard as the browser reads them. The first
+          # deploy's log (the one killed mid-build) has the stage messages,
+          # Docker's build output and both attempts, and the stream ends by
+          # itself, since the deploy has finished.
+          curl -sSN --max-time 30 "http://127.0.0.1:8080/api/platform/apps/$APP/deployments/$DEP/logs" > /tmp/deploy.log || on_failure
+          grep -F 'Building image' /tmp/deploy.log || on_failure
+          grep -F 'Step 1/' /tmp/deploy.log || on_failure
+          grep -F '(attempt 2)' /tmp/deploy.log || on_failure
+          grep -F 'Live at http://selftest.apps.test/' /tmp/deploy.log || on_failure
+          tail -2 /tmp/deploy.log | grep -F 'event: end' || on_failure
+          # The live app's output: the selftest app (the dashboard image)
+          # logs "listening" as it starts. This stream stays open while the
+          # app runs, so curl is stopped after a few seconds (exit 28 is that
+          # timeout, expected).
+          curl -sSN --max-time 5 "http://127.0.0.1:8080/api/platform/apps/$APP/logs" > /tmp/app.log || [ $? = 28 ] || on_failure
+          grep -F 'listening' /tmp/app.log || { cat /tmp/app.log; on_failure; }
+
           # examples/hello, registered through the dashboard as the Apps page
           # does it: built from a folder of the repo, with an env var.
           APP=$(dash POST /api/platform/apps \

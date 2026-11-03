@@ -17,15 +17,17 @@ _Last updated: 2026-11-03_
 | M6: History sparklines | ✅ Done, deployed (with P0, 2026-11-02) |
 | P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
 | P1: Manual deploy of one app | ✅ Done, deployed 2026-11-03 |
-| P2: Push-to-deploy, job queue, live logs | 🚧 2.1 in review (branch `p2-job-queue`) |
+| P2: Push-to-deploy, job queue, live logs | 🚧 2.1 green in CI, 2.2 in review (branch `platform-p2`, one draft PR for the phase) |
 
 **Where we left off (2026-11-03):** P0 and P1 are done and deployed. A real
 app (`examples/hello`) is registered, configured and deployed from the
 dashboard's Apps page and served over the tailnet, and the whole stack comes
 back by itself after a reboot. The P2 plan is approved (see P2 below).
-Step 2.1 (the job queue) is written on branch `p2-job-queue` (from
-`p2-plan`), in review; CI not yet run.
-**Next:** owner review, a draft PR for CI, then 2.2 (live logs).
+P2 lives on branch `platform-p2`, which has one draft PR against `main` for
+the whole phase (as P1 did): each step is pushed there and checked by CI,
+and the phase is merged and deployed at the end. Step 2.1 (the job queue)
+is green in CI; 2.2 (live logs) is written, in review.
+**Next:** 2.2's CI result, then 2.3 (push-to-deploy) on the same branch.
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -341,8 +343,8 @@ killing the platform mid-build gets the deploy retried, not lost.
 
 | Step | What | Status |
 |---|---|---|
-| 2.1 | **Durable job queue.** A `jobs` table; workers inside the platform claim with `SELECT … FOR UPDATE SKIP LOCKED` and hold a renewed lease, so a crashed platform's jobs are picked up again after a restart (replacing "interrupted deploys are marked failed"). Retries with backoff only for transient errors (GitHub/Docker unreachable), at most 3 attempts; build or health-check failures fail at once. Retries are idempotent (leftover containers from the attempt removed first; the build cache makes rebuilding cheap). Still one deploy per app at a time, enforced by the database. Database tests for concurrent claims; CI kills the platform mid-build and requires the deploy to finish after it restarts. | 🚧 In review; CI not yet run. Migration 0005 (`jobs`; also fails pre-queue deployments left in progress, which have no job). `internal/jobs` runner (2 workers, 30s lease renewed every 10s, retries after 15s then 30s); the deployer is its handler. Beyond the plan: attempts are counted at claim, so a job whose worker keeps crashing gives up after 3; a clean shutdown hands the job back without counting the attempt; a retry of a deployment already healthy only finishes the route switch; cleanup after a switch now removes only *older* deployments' containers. Details in [decisions/platform.md](decisions/platform.md) ("How the job queue works"). |
-| 2.2 | **Live logs.** Deploy logs (Docker's build output and the platform's own stage messages) stored per deployment, capped per deployment, last few deployments per app kept. An SSE endpoint replays stored lines then streams new ones; the dashboard's proxy flushes immediately. App (runtime) logs tailed live from Docker, not stored. UI: a log viewer per deployment and an "App logs" tab. | |
+| 2.1 | **Durable job queue.** A `jobs` table; workers inside the platform claim with `SELECT … FOR UPDATE SKIP LOCKED` and hold a renewed lease, so a crashed platform's jobs are picked up again after a restart (replacing "interrupted deploys are marked failed"). Retries with backoff only for transient errors (GitHub/Docker unreachable), at most 3 attempts; build or health-check failures fail at once. Retries are idempotent (leftover containers from the attempt removed first; the build cache makes rebuilding cheap). Still one deploy per app at a time, enforced by the database. Database tests for concurrent claims; CI kills the platform mid-build and requires the deploy to finish after it restarts. | ✅ `53867d5`, green in CI (including the kill test); not yet deployed (P2 merges at the end). Migration 0005 (`jobs`; also fails pre-queue deployments left in progress, which have no job). `internal/jobs` runner (2 workers, 30s lease renewed every 10s, retries after 15s then 30s); the deployer is its handler. Beyond the plan: attempts are counted at claim, so a job whose worker keeps crashing gives up after 3; a clean shutdown hands the job back without counting the attempt; a retry of a deployment already healthy only finishes the route switch; cleanup after a switch now removes only *older* deployments' containers. Details in [decisions/platform.md](decisions/platform.md) ("How the job queue works"). |
+| 2.2 | **Live logs.** Deploy logs (Docker's build output and the platform's own stage messages) stored per deployment, capped per deployment, last few deployments per app kept. An SSE endpoint replays stored lines then streams new ones; the dashboard's proxy flushes immediately. App (runtime) logs tailed live from Docker, not stored. UI: a log viewer per deployment and an "App logs" tab. | 🚧 In review; CI not yet run. Migration 0006 (`deployment_logs`). Build output capped at 5,000 lines per deployment; the last 10 deployments per app keep logs. The deploy log stream polls Postgres every 500ms and ends once the deployment's *job* has finished (its status turns healthy before the last messages are written). App output streams use line timestamps as event IDs, so reconnects resume. Beyond the plan: both servers end open streams when shutdown starts (otherwise an open viewer holds every restart for the shutdown timeout); lines are cleaned up (colours, `\r` progress bars, NULs, 4 KiB cap); the app page shows the new deploy's log as soon as Deploy is clicked. CI reads both streams through the dashboard. Details in [decisions/platform.md](decisions/platform.md) ("How deploy logs are stored and streamed"). |
 | 2.3 | **Push-to-deploy.** A webhook endpoint on its own listener (see decisions): HMAC signature check (`GITHUB_WEBHOOK_SECRET`, constant-time), body cap, GitHub's redelivered events ignored (delivery ID), a deploy queued for each app whose repo and branch match. A per-app auto-deploy switch (on by default). A "Deploy latest" button that looks up the branch's newest commit. Server work: Tailscale Funnel for the webhook port, the GitHub webhook, and checking the three done-when points on the real server. | |
 
 Decisions (approved 2026-11-03), with entries in

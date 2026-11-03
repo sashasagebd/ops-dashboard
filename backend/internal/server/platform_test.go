@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 // fakePlatform records the last request it received and answers 201.
@@ -141,5 +142,45 @@ func TestPlatformUnreachable(t *testing.T) {
 	// Generic: the error (with the platform's address) goes to the log only.
 	if rec.Code != http.StatusBadGateway || body["error"] != "the platform isn't reachable" {
 		t.Errorf("response = %d %v", rec.Code, body)
+	}
+}
+
+func TestPlatformLogStreamsPassThroughLive(t *testing.T) {
+	// A platform log stream that sends one event, then waits: the browser
+	// must get that event while the stream is still open, not when it ends.
+	release := make(chan struct{})
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "id: 1\ndata: {\"line\":\"Building\"}\n\n")
+		http.NewResponseController(w).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer platform.Close()
+	defer close(release)
+	target, _ := url.Parse(platform.URL)
+	dashboard := httptest.NewServer(New(&fakeSource{}, nil, NewPlatformProxy(target), nil))
+	defer dashboard.Close()
+
+	res, err := http.Get(dashboard.URL + "/api/platform/apps/1/deployments/7/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	got := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, _ := io.ReadAtLeast(res.Body, buf, len("id: 1\n"))
+		got <- string(buf[:n])
+	}()
+	select {
+	case s := <-got:
+		if !strings.HasPrefix(s, "id: 1\n") {
+			t.Errorf("first bytes = %q, want the event", s)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the event didn't come through while the stream was open: the proxy is buffering")
 	}
 }

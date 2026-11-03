@@ -123,6 +123,27 @@ export type NewApp = {
   cpuLimitMillicores?: number
 }
 
+// LogLine matches logLineResponse: one line of a deploy's log (the
+// platform's stage messages, or Docker's build output) or of an app's output.
+// It's the data of each message in a log stream (Server-Sent Events).
+export type LogLine = {
+  at: string
+  stream: 'platform' | 'build' | 'stdout' | 'stderr'
+  line: string
+}
+
+// deploymentLogURL is a deploy's log stream: what's stored, then new lines
+// until the deploy has finished, then an "end" event.
+export function deploymentLogURL(appId: number, deploymentId: number): string {
+  return `/api/platform/apps/${appId}/deployments/${deploymentId}/logs`
+}
+
+// appLogURL is the live container's output: recent lines, then new ones,
+// then an "end" event if the container stops or is replaced.
+export function appLogURL(appId: number): string {
+  return `/api/platform/apps/${appId}/logs`
+}
+
 export function fetchContainers(signal?: AbortSignal): Promise<ContainersResponse> {
   return getJSON<ContainersResponse>('/api/containers', signal)
 }

@@ -871,3 +871,44 @@ passes through the dashboard's reverse proxy (with flushing) unchanged, and
 proxy must handle); polling (simpler, but laggy and wasteful for a build
 that prints hundreds of lines).
 
+
+### How deploy logs are stored and streamed (2.2, 2026-11-03)
+
+**What:** the details behind the two entries above.
+- **A `deployment_logs` table, one row per line,** with a global identity ID
+  that doubles as the stream's resume point (`Last-Event-ID`). One worker
+  writes a deployment's log at a time (the job's lease), so ID order is line
+  order.
+- **Written in batches every 500ms** (one `COPY` per batch), not per line: a
+  build prints hundreds of lines in seconds. Logging is best effort: a batch
+  that can't be written is dropped and noted in the platform's own log,
+  rather than failing a deploy that's otherwise fine.
+- **Bounded twice:** build output is capped at 5,000 lines per deployment
+  (across attempts; the platform's own messages always get through), and
+  only an app's 10 most recent deployments keep their logs (older ones are
+  deleted as each new deploy starts). Lines are cut at 4 KiB and cleaned up
+  (terminal colours, carriage-return progress bars, NUL bytes, invalid
+  UTF-8). Per-layer download progress while pulling a base image is dropped
+  as noise. Env var values never reach the log: they aren't build inputs,
+  and the platform's messages only count them.
+- **The stream polls Postgres every 500ms** while a deploy is running, and
+  ends with an `end` event once the deployment's job has finished for good.
+  "Finished" comes from the job, not the deployment's status: a deployment
+  is marked healthy before its last messages (route switched, old version
+  removed), but its job only finishes after every line is written. The
+  stream checks that before reading, so the read that follows has the rest.
+- **App output is followed live from Docker** with timestamps, which are the
+  event IDs, so a dropped connection resumes from the last line's time
+  (Docker's `since`, with already-seen lines skipped). When the container
+  stops or is replaced, the stream ends and the page offers to reconnect.
+- **Open streams end when shutdown starts** (the servers' `BaseContext` is
+  the shutdown signal). Otherwise one open log viewer would hold every
+  restart of the platform, and of the dashboard proxying it, for the full
+  shutdown timeout.
+
+**Alternatives:** waking streams in-process when lines are written, or
+Postgres `LISTEN/NOTIFY` (immediate rather than up to 500ms late, but extra
+moving parts for one viewer, and the writer batches every 500ms anyway); log
+files on disk with a pointer in the database (another volume, and retention
+done by hand); ending the deploy log on the deployment's status (would cut
+off its last lines).
