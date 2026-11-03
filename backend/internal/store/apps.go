@@ -20,12 +20,15 @@ type App struct {
 	HealthCheckPath    string    `db:"health_check_path"`
 	MemoryLimitBytes   int64     `db:"memory_limit_bytes"`
 	CPULimitMillicores int       `db:"cpu_limit_millicores"`
-	SourceDir          string    `db:"source_dir"` // "" is the repo's root
+	SourceDir          string    `db:"source_dir"`      // "" is the repo's root
+	AutoDeploy         bool      `db:"auto_deploy"`     // pushes to Branch deploy it
+	NextCommitSHA      string    `db:"next_commit_sha"` // a pushed commit waiting for the deploy in progress; "" if none
 	CreatedAt          time.Time `db:"created_at"`
 }
 
 const appColumns = `id, name, repo_url, branch, hostname, port, health_check_path,
-	memory_limit_bytes, cpu_limit_millicores, source_dir, created_at`
+	memory_limit_bytes, cpu_limit_millicores, source_dir, auto_deploy,
+	COALESCE(next_commit_sha, '') AS next_commit_sha, created_at`
 
 // NewApp is what CreateApp needs. Name, RepoURL, Hostname and Port are
 // required; for the rest, the zero value means "use the database's default",
@@ -86,4 +89,15 @@ func (s *Store) Apps(ctx context.Context) ([]App, error) {
 	rows, _ := s.pool.Query(ctx, "SELECT "+appColumns+" FROM apps ORDER BY name")
 	apps, err := pgx.CollectRows(rows, pgx.RowToStructByName[App])
 	return apps, translate(err)
+}
+
+// SetAutoDeploy turns push-to-deploy on or off for an app, returning the
+// updated app. Turning it off also drops a pushed commit waiting to deploy.
+func (s *Store) SetAutoDeploy(ctx context.Context, id int64, on bool) (App, error) {
+	rows, _ := s.pool.Query(ctx, `
+		UPDATE apps SET auto_deploy = $2,
+			next_commit_sha = CASE WHEN $2 THEN next_commit_sha END
+		WHERE id = $1 RETURNING `+appColumns, id, on)
+	app, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[App])
+	return app, translate(err)
 }

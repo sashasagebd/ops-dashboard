@@ -424,3 +424,13 @@ button:disabled {
   clip-path: inset(50%);
   white-space: nowrap;
 }
+
+/* The push-to-deploy switch, under the deploy form. */
+.auto-deploy {
+  margin-top: 8px;
+}
+
+.auto-deploy p {
+  margin: 4px 0 0;
+  font-size: 0.875rem;
+}

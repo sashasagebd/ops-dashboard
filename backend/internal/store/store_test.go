@@ -3,9 +3,12 @@ package store
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
 )
@@ -314,32 +317,179 @@ func TestDeploymentStatusOnlyMovesForward(t *testing.T) {
 	}
 }
 
-func TestFailInterruptedDeployments(t *testing.T) {
+func TestRetriedDeploymentCanBuildAgain(t *testing.T) {
 	s := testStore(t)
+	app := createTestApp(t, s, "hello")
 	ctx := t.Context()
-	building := createTestApp(t, s, "building")
-	live := createTestApp(t, s, "live")
+	d, _ := s.CreateDeployment(ctx, app.ID, sha1)
+	mustDo(t, s.MarkBuilding(ctx, d.ID))
+	mustDo(t, s.MarkStarting(ctx, d.ID, "img"))
+	first, _ := s.Deployment(ctx, d.ID)
 
-	b, _ := s.CreateDeployment(ctx, building.ID, sha1)
-	mustDo(t, s.MarkBuilding(ctx, b.ID))
-	l, _ := s.CreateDeployment(ctx, live.ID, sha1)
-	mustDo(t, s.MarkBuilding(ctx, l.ID))
-	mustDo(t, s.MarkStarting(ctx, l.ID, "img"))
-	mustDo(t, s.MarkHealthy(ctx, l.ID))
+	// An attempt cut off while starting is retried from the build.
+	mustDo(t, s.MarkBuilding(ctx, d.ID))
+	again, _ := s.Deployment(ctx, d.ID)
+	if again.Status != StatusBuilding || !again.StartedAt.Equal(*first.StartedAt) {
+		t.Errorf("after retry: %+v; want building, started_at kept from the first attempt", again)
+	}
+}
 
-	n, err := s.FailInterruptedDeployments(ctx, "interrupted")
+func TestCreateDeploymentQueuesItsJob(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+
+	if _, ok, err := s.ClaimJob(ctx, "w1", time.Minute); err != nil || ok {
+		t.Fatalf("ClaimJob on an empty queue = %v, %v; want nothing", ok, err)
+	}
+	d, err := s.CreateDeployment(ctx, app.ID, sha1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Errorf("failed %d deployments, want 1 (only the building one)", n)
+	job := mustClaim(t, s, "w1")
+	if job.Kind != "deploy" || job.DeploymentID != d.ID || job.Attempts != 1 {
+		t.Errorf("claimed %+v; want the deployment's deploy job, attempt 1", job)
 	}
-	assertStatus(t, s, b.ID, StatusFailed)
-	assertStatus(t, s, l.ID, StatusHealthy)
-	// The app is free to deploy again.
-	if _, err := s.CreateDeployment(ctx, building.ID, sha2); err != nil {
-		t.Errorf("CreateDeployment after clearing: %v", err)
+	// Held, with a live lease: nobody else gets it.
+	if _, ok, _ := s.ClaimJob(ctx, "w2", time.Minute); ok {
+		t.Error("a held job was claimed by a second worker")
 	}
+
+	// A refused deployment queues no job either.
+	if _, err := s.CreateDeployment(ctx, app.ID, sha2); !errors.Is(err, ErrDeployInProgress) {
+		t.Fatalf("second CreateDeployment error = %v, want ErrDeployInProgress", err)
+	}
+	var jobs int
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM jobs").Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Errorf("%d jobs, want 1", jobs)
+	}
+}
+
+func TestJobLifecycle(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	s.CreateDeployment(ctx, app.ID, sha1)
+	job := mustClaim(t, s, "w1")
+
+	// Only the holder can change it.
+	for name, err := range map[string]error{
+		"renew":    s.RenewLease(ctx, job.ID, "w2", time.Minute),
+		"complete": s.CompleteJob(ctx, job.ID, "w2"),
+		"retry":    s.RetryJob(ctx, job.ID, "w2", 0, "x"),
+		"fail":     s.FailJob(ctx, job.ID, "w2", "x"),
+		"release":  s.ReleaseJob(ctx, job.ID, "w2"),
+	} {
+		if !errors.Is(err, ErrLeaseLost) {
+			t.Errorf("%s by another worker: error = %v, want ErrLeaseLost", name, err)
+		}
+	}
+	mustDo(t, s.RenewLease(ctx, job.ID, "w1", time.Minute))
+
+	// A retry waits out its backoff before it can be claimed again.
+	mustDo(t, s.RetryJob(ctx, job.ID, "w1", time.Hour, "docker unreachable"))
+	if _, ok, _ := s.ClaimJob(ctx, "w1", time.Minute); ok {
+		t.Error("claimed a job still backing off")
+	}
+	if _, err := s.pool.Exec(ctx, "UPDATE jobs SET run_after = now()"); err != nil {
+		t.Fatal(err)
+	}
+	if job = mustClaim(t, s, "w2"); job.Attempts != 2 {
+		t.Errorf("retried job's attempts = %d, want 2", job.Attempts)
+	}
+
+	// Released at shutdown: claimable straight away, attempt not counted.
+	mustDo(t, s.ReleaseJob(ctx, job.ID, "w2"))
+	if job = mustClaim(t, s, "w1"); job.Attempts != 2 {
+		t.Errorf("released job's attempts = %d, want 2 (the release isn't counted)", job.Attempts)
+	}
+
+	mustDo(t, s.CompleteJob(ctx, job.ID, "w1"))
+	if _, ok, _ := s.ClaimJob(ctx, "w1", time.Minute); ok {
+		t.Error("claimed a finished job")
+	}
+	if err := s.CompleteJob(ctx, job.ID, "w1"); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("completing it twice: error = %v, want ErrLeaseLost", err)
+	}
+}
+
+func TestExpiredLeaseIsClaimedAgain(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	s.CreateDeployment(ctx, app.ID, sha1)
+	first := mustClaim(t, s, "w1")
+
+	// w1 dies: it stops renewing, and its lease runs out.
+	if _, err := s.pool.Exec(ctx, "UPDATE jobs SET locked_until = now() - interval '1 second'"); err != nil {
+		t.Fatal(err)
+	}
+	second := mustClaim(t, s, "w2")
+	if second.ID != first.ID || second.Attempts != 2 {
+		t.Errorf("claimed %+v; want job %d again, attempt 2", second, first.ID)
+	}
+	// If w1 was only slow, not dead, it can't touch the job now.
+	if err := s.CompleteJob(ctx, first.ID, "w1"); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("old holder completing: error = %v, want ErrLeaseLost", err)
+	}
+	mustDo(t, s.FailJob(ctx, second.ID, "w2", "build failed"))
+}
+
+func TestConcurrentClaimsTakeDifferentJobs(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	const jobs, workers = 30, 8
+	for i := range jobs {
+		app := createTestApp(t, s, fmt.Sprintf("app-%d", i))
+		if _, err := s.CreateDeployment(ctx, app.ID, sha1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Every worker claims until the queue is empty, all at once.
+	var mu sync.Mutex
+	claimed := map[int64]string{}
+	var wg sync.WaitGroup
+	for w := range workers {
+		worker := fmt.Sprintf("w%d", w)
+		wg.Go(func() {
+			for {
+				job, ok, err := s.ClaimJob(ctx, worker, time.Minute)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if !ok {
+					return
+				}
+				mu.Lock()
+				if other, dup := claimed[job.ID]; dup {
+					t.Errorf("job %d claimed by both %s and %s", job.ID, other, worker)
+				}
+				claimed[job.ID] = worker
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if len(claimed) != jobs {
+		t.Errorf("%d jobs claimed, want all %d", len(claimed), jobs)
+	}
+}
+
+func mustClaim(t *testing.T, s *Store, worker string) Job {
+	t.Helper()
+	job, ok, err := s.ClaimJob(t.Context(), worker, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatalf("%s found no job to claim", worker)
+	}
+	return job
 }
 
 func mustDo(t *testing.T, err error) {
@@ -357,5 +507,228 @@ func assertStatus(t *testing.T, s *Store, id int64, want DeploymentStatus) {
 	}
 	if d.Status != want {
 		t.Errorf("deployment %d status = %s, want %s", id, d.Status, want)
+	}
+}
+
+func TestDeploymentLogs(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	d, _ := s.CreateDeployment(ctx, app.ID, sha1)
+	at := time.Now()
+
+	mustDo(t, s.AppendDeploymentLogs(ctx, d.ID, []NewLogLine{
+		{At: at, Stream: LogPlatform, Line: "Building"},
+		{At: at, Stream: LogBuild, Line: "Step 1/2 : FROM busybox"},
+		{At: at, Stream: LogBuild, Line: "Step 2/2 : RUN true"},
+	}))
+	mustDo(t, s.AppendDeploymentLogs(ctx, d.ID, []NewLogLine{{At: at, Stream: LogPlatform, Line: "Healthy"}}))
+
+	all, err := s.DeploymentLogs(ctx, d.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, l := range all {
+		got = append(got, l.Line)
+	}
+	if want := []string{"Building", "Step 1/2 : FROM busybox", "Step 2/2 : RUN true", "Healthy"}; !slices.Equal(got, want) {
+		t.Fatalf("lines = %q, want %q (in the order written)", got, want)
+	}
+	// Resuming after a line, with a limit.
+	rest, _ := s.DeploymentLogs(ctx, d.ID, all[0].ID, 2)
+	if len(rest) != 2 || rest[0].ID != all[1].ID || rest[1].ID != all[2].ID {
+		t.Errorf("after line 1, limit 2: %+v", rest)
+	}
+	if n, _ := s.CountDeploymentLogs(ctx, d.ID, LogBuild); n != 2 {
+		t.Errorf("build lines = %d, want 2", n)
+	}
+	if err := s.AppendDeploymentLogs(ctx, 999999, []NewLogLine{{At: at, Stream: LogBuild, Line: "x"}}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("appending to a missing deployment: error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestDeploymentLogCompleteFollowsTheJob(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	d, _ := s.CreateDeployment(ctx, app.ID, sha1)
+
+	complete := func() bool {
+		t.Helper()
+		c, err := s.DeploymentLogComplete(ctx, d.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	if complete() {
+		t.Error("complete while queued")
+	}
+	job := mustClaim(t, s, "w1")
+	// Waiting to be retried: more lines are coming.
+	mustDo(t, s.RetryJob(ctx, job.ID, "w1", 0, "docker unreachable"))
+	if complete() {
+		t.Error("complete while waiting for a retry")
+	}
+	job = mustClaim(t, s, "w1")
+	mustDo(t, s.CompleteJob(ctx, job.ID, "w1"))
+	if !complete() {
+		t.Error("not complete once the job is done")
+	}
+}
+
+func TestPruneDeploymentLogsKeepsTheMostRecent(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	other := createTestApp(t, s, "other")
+	ctx := t.Context()
+
+	var ids []int64
+	for range 4 {
+		d, err := s.CreateDeployment(ctx, app.ID, sha1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustDo(t, s.AppendDeploymentLogs(ctx, d.ID, []NewLogLine{{At: time.Now(), Stream: LogPlatform, Line: "x"}}))
+		mustDo(t, s.MarkFailed(ctx, d.ID, "x")) // frees the app for the next one
+		ids = append(ids, d.ID)
+	}
+	o, _ := s.CreateDeployment(ctx, other.ID, sha1)
+	mustDo(t, s.AppendDeploymentLogs(ctx, o.ID, []NewLogLine{{At: time.Now(), Stream: LogPlatform, Line: "x"}}))
+
+	n, err := s.PruneDeploymentLogs(ctx, app.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("deleted %d lines, want 2 (the two oldest deployments')", n)
+	}
+	for i, id := range ids {
+		lines, _ := s.DeploymentLogs(ctx, id, 0, 10)
+		if kept := len(lines) > 0; kept != (i >= 2) {
+			t.Errorf("deployment %d (#%d of 4): kept %v", id, i+1, kept)
+		}
+	}
+	if lines, _ := s.DeploymentLogs(ctx, o.ID, 0, 10); len(lines) != 1 {
+		t.Error("pruning one app deleted another app's logs")
+	}
+}
+
+func TestRequestDeploymentWaitsForTheOneInProgress(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	if !app.AutoDeploy || app.NextCommitSHA != "" {
+		t.Errorf("new app: auto-deploy %v, next %q; want on, none", app.AutoDeploy, app.NextCommitSHA)
+	}
+
+	// Nothing in progress: it deploys straight away.
+	first, started, err := s.RequestDeployment(ctx, app.ID, sha1)
+	if err != nil || !started || first.CommitSHA != sha1 {
+		t.Fatalf("RequestDeployment = %+v, %v, %v; want started", first, started, err)
+	}
+	// Busy: the next pushes wait, and the newest wins.
+	for _, sha := range []string{sha2, sha3} {
+		if _, started, err := s.RequestDeployment(ctx, app.ID, sha); err != nil || started {
+			t.Fatalf("RequestDeployment(%s) while busy: started %v, %v; want it to wait", sha[:4], started, err)
+		}
+	}
+	got, _ := s.App(ctx, app.ID)
+	if got.NextCommitSHA != sha3 {
+		t.Errorf("next = %q, want the newest push %q", got.NextCommitSHA, sha3)
+	}
+	// Still busy: nothing to start yet, and it stays next.
+	if _, ok, err := s.StartNextDeployment(ctx, app.ID); err != nil || ok {
+		t.Errorf("StartNextDeployment while busy = %v, %v; want nothing", ok, err)
+	}
+
+	mustDo(t, s.MarkFailed(ctx, first.ID, "build failed"))
+	next, ok, err := s.StartNextDeployment(ctx, app.ID)
+	if err != nil || !ok || next.CommitSHA != sha3 {
+		t.Fatalf("StartNextDeployment after it finished = %+v, %v, %v; want %s started", next, ok, err, sha3[:4])
+	}
+	got, _ = s.App(ctx, app.ID)
+	if got.NextCommitSHA != "" {
+		t.Errorf("next = %q after starting it, want cleared", got.NextCommitSHA)
+	}
+	if _, ok, _ := s.StartNextDeployment(ctx, app.ID); ok {
+		t.Error("started the same next commit twice")
+	}
+	if _, _, err := s.RequestDeployment(ctx, 999999, sha1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("RequestDeployment(missing app) error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestConcurrentPushesStartOneDeploy(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+
+	var mu sync.Mutex
+	starts := 0
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			_, started, err := s.RequestDeployment(ctx, app.ID, sha1)
+			if err != nil {
+				t.Error(err)
+			}
+			if started {
+				mu.Lock()
+				starts++
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if starts != 1 {
+		t.Errorf("%d pushes started a deploy, want exactly 1 (the rest wait)", starts)
+	}
+	got, _ := s.App(ctx, app.ID)
+	if got.NextCommitSHA != sha1 {
+		t.Errorf("next = %q, want the waiting push", got.NextCommitSHA)
+	}
+}
+
+func TestSetAutoDeploy(t *testing.T) {
+	s := testStore(t)
+	app := createTestApp(t, s, "hello")
+	ctx := t.Context()
+	s.RequestDeployment(ctx, app.ID, sha1)
+	s.RequestDeployment(ctx, app.ID, sha2) // waits
+
+	off, err := s.SetAutoDeploy(ctx, app.ID, false)
+	if err != nil || off.AutoDeploy || off.NextCommitSHA != "" {
+		t.Errorf("turned off: %+v, %v; want off, and the waiting push dropped", off, err)
+	}
+	if on, _ := s.SetAutoDeploy(ctx, app.ID, true); !on.AutoDeploy {
+		t.Error("turned back on: still off")
+	}
+	if _, err := s.SetAutoDeploy(ctx, 999999, true); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing app: error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRecordDelivery(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	if isNew, err := s.RecordDelivery(ctx, "72d3162e-cc78-11e3-81ab-4c9367dc0958"); err != nil || !isNew {
+		t.Fatalf("first delivery: new %v, %v; want new", isNew, err)
+	}
+	if isNew, _ := s.RecordDelivery(ctx, "72d3162e-cc78-11e3-81ab-4c9367dc0958"); isNew {
+		t.Error("a redelivery counted as new")
+	}
+	// Old ones are forgotten.
+	if _, err := s.pool.Exec(ctx, "UPDATE webhook_deliveries SET received_at = now() - interval '31 days'"); err != nil {
+		t.Fatal(err)
+	}
+	if isNew, _ := s.RecordDelivery(ctx, "another"); !isNew {
+		t.Error("a different delivery wasn't new")
+	}
+	var n int
+	_ = s.pool.QueryRow(ctx, "SELECT count(*) FROM webhook_deliveries").Scan(&n)
+	if n != 1 {
+		t.Errorf("%d deliveries kept, want 1 (the old one pruned)", n)
 	}
 }

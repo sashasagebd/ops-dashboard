@@ -84,33 +84,10 @@ func (g *GitHub) BuildContext(ctx context.Context, repoURL, commitSHA, dir strin
 		return nil, fmt.Errorf("source directory %q: want a relative path inside the repo", dir)
 	}
 
-	u := fmt.Sprintf("%s/repos/%s/%s/tarball/%s", g.APIBase, url.PathEscape(owner), url.PathEscape(repo), commitSHA)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if g.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+g.Token)
-	}
-
 	// GitHub answers with a redirect to its download host, which the client
-	// follows. The token must only ever go to the API: Go's client drops
-	// Authorization on a redirect to a different domain, but compares
-	// hostnames only (not ports) and treats subdomains as the same, so the
-	// rule is made explicit here: any change of host:port drops it.
-	client := *g.HTTPClient
-	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return errors.New("too many redirects")
-		}
-		if next.URL.Host != via[0].URL.Host {
-			next.Header.Del("Authorization")
-		}
-		return nil
-	}
-	resp, err := client.Do(req)
+	// follows.
+	u := fmt.Sprintf("%s/repos/%s/%s/tarball/%s", g.APIBase, url.PathEscape(owner), url.PathEscape(repo), commitSHA)
+	resp, err := g.get(ctx, u, "application/vnd.github+json")
 	if err != nil {
 		return nil, fmt.Errorf("downloading code: %w", err)
 	}
@@ -133,6 +110,78 @@ func (g *GitHub) BuildContext(ctx context.Context, repoURL, commitSHA, dir strin
 		pw.CloseWithError(repack(download, pw, g.MaxUnpackedBytes, dir))
 	}()
 	return pr, nil
+}
+
+// ErrBranchNotFound means the repo has no such branch (or isn't readable).
+var ErrBranchNotFound = errors.New("branch not found in the repository")
+
+// LatestCommit returns the SHA of the newest commit on a branch of repoURL,
+// for deploying "whatever is on main now".
+func (g *GitHub) LatestCommit(ctx context.Context, repoURL, branch string) (string, error) {
+	owner, repo, err := ParseRepoURL(repoURL)
+	if err != nil {
+		return "", err
+	}
+	if branch == "" {
+		return "", ErrBranchNotFound
+	}
+	// Branch names can contain slashes (feature/x): each part is escaped,
+	// the slashes kept.
+	parts := strings.Split(branch, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	u := fmt.Sprintf("%s/repos/%s/%s/commits/%s", g.APIBase, url.PathEscape(owner), url.PathEscape(repo), strings.Join(parts, "/"))
+	// This media type answers with just the SHA, not the whole commit.
+	resp, err := g.get(ctx, u, "application/vnd.github.sha")
+	if err != nil {
+		return "", fmt.Errorf("looking up %s: %w", branch, err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusUnprocessableEntity:
+		return "", ErrBranchNotFound
+	case resp.StatusCode != http.StatusOK:
+		return "", fmt.Errorf("looking up %s: GitHub answered %s", branch, resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return "", fmt.Errorf("looking up %s: %w", branch, err)
+	}
+	sha := strings.TrimSpace(string(body))
+	if !shaPattern.MatchString(sha) {
+		return "", fmt.Errorf("looking up %s: GitHub answered %.50q, not a commit SHA", branch, sha)
+	}
+	return sha, nil
+}
+
+// get sends a GET to GitHub's API, with the token if there is one.
+//
+// The token must only ever go to the API: Go's client drops Authorization on
+// a redirect to a different domain, but compares hostnames only (not ports)
+// and treats subdomains as the same, so the rule is made explicit here: any
+// change of host:port drops it.
+func (g *GitHub) get(ctx context.Context, u, accept string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", accept)
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if g.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+g.Token)
+	}
+	client := *g.HTTPClient
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("too many redirects")
+		}
+		if next.URL.Host != via[0].URL.Host {
+			next.Header.Del("Authorization")
+		}
+		return nil
+	}
+	return client.Do(req)
 }
 
 // repack copies GitHub's .tar.gz to an uncompressed tar, removing the

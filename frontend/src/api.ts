@@ -100,6 +100,8 @@ export type PlatformApp = {
   memoryLimitBytes: number
   cpuLimitMillicores: number // 1000 = one core
   sourceDir: string // folder in the repo with the Dockerfile; '' is the root
+  autoDeploy: boolean // pushes to branch deploy it
+  nextCommitSha: string | null // a pushed commit waiting for the deploy in progress
   createdAt: string
   currentDeployment: Deployment | null // the live one; null if nothing is live
 }
@@ -121,6 +123,27 @@ export type NewApp = {
   sourceDir?: string
   memoryLimitBytes?: number
   cpuLimitMillicores?: number
+}
+
+// LogLine matches logLineResponse: one line of a deploy's log (the
+// platform's stage messages, or Docker's build output) or of an app's output.
+// It's the data of each message in a log stream (Server-Sent Events).
+export type LogLine = {
+  at: string
+  stream: 'platform' | 'build' | 'stdout' | 'stderr'
+  line: string
+}
+
+// deploymentLogURL is a deploy's log stream: what's stored, then new lines
+// until the deploy has finished, then an "end" event.
+export function deploymentLogURL(appId: number, deploymentId: number): string {
+  return `/api/platform/apps/${appId}/deployments/${deploymentId}/logs`
+}
+
+// appLogURL is the live container's output: recent lines, then new ones,
+// then an "end" event if the container stops or is replaced.
+export function appLogURL(appId: number): string {
+  return `/api/platform/apps/${appId}/logs`
 }
 
 export function fetchContainers(signal?: AbortSignal): Promise<ContainersResponse> {
@@ -149,6 +172,16 @@ export function deployCommit(appId: number, commitSha: string): Promise<Deployme
   return sendJSON<Deployment>('POST', `/api/platform/apps/${appId}/deployments`, { commitSha })
 }
 
+// deployLatest deploys the newest commit on the app's branch, which the
+// platform looks up on GitHub.
+export function deployLatest(appId: number): Promise<Deployment> {
+  return sendJSON<Deployment>('POST', `/api/platform/apps/${appId}/deployments/latest`)
+}
+
+export function setAutoDeploy(appId: number, autoDeploy: boolean): Promise<PlatformApp> {
+  return sendJSON<PlatformApp>('PATCH', `/api/platform/apps/${appId}`, { autoDeploy })
+}
+
 export async function setEnvVar(appId: number, key: string, value: string): Promise<void> {
   await sendJSON('PUT', `/api/platform/apps/${appId}/env/${encodeURIComponent(key)}`, { value })
 }
@@ -166,7 +199,11 @@ async function getJSON<T>(url: string, signal?: AbortSignal): Promise<T> {
 // sendJSON makes a request that changes something. Bodies are always sent as
 // JSON: the platform refuses anything else, which is part of its CSRF
 // protection. Resolves to the response's JSON, or undefined for 204.
-async function sendJSON<T = undefined>(method: 'POST' | 'PUT' | 'DELETE', url: string, body?: unknown): Promise<T> {
+async function sendJSON<T = undefined>(
+  method: 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  url: string,
+  body?: unknown,
+): Promise<T> {
   const res = await fetch(url, {
     method,
     headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },

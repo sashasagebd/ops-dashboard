@@ -352,6 +352,11 @@ story than starting with the queue.
 **Alternatives:** building the queue first (more correct from day one, but
 two hard things at once in the same phase).
 
+_Superseded in P2 step 2.1 (2026-11-03) by the job queue: see "How the job
+queue works" below. Migration 0005 fails any deployment still in progress
+from before it, since it has no job; the startup code that did this is
+gone._
+
 ### Docker's restart policy keeps apps up until the reconciler exists
 
 **What:** app containers get `restart: unless-stopped`.
@@ -753,6 +758,55 @@ back up, for a single-host system that already has Postgres); a plain
 `locked = true` flag (a crashed worker's jobs stay locked forever without a
 lease); retrying every error (wastes minutes on builds that can't succeed).
 
+### How the job queue works (2.1, 2026-11-03)
+
+**What:** the details behind the entry above.
+- **The deployment and its job are created in one statement** (a CTE), so
+  there's never a deployment nothing will run, or a job for a deployment
+  that was refused. "One deploy per app at a time" needs no queue logic: a
+  job belongs to one deployment, and the existing partial unique index
+  allows one in progress per app.
+- **A typed `deployment_id` column, not a JSON payload.** The database can
+  check it (foreign key, deleted with the deployment), and there's only one
+  kind of job. A later kind gets its own column.
+- **Attempts are counted when a job is claimed**, not when it fails. A job
+  whose worker keeps dying (say a build that takes the platform down with
+  it) would otherwise be retried forever. A job claimed a fourth time gives
+  up without running: "the platform stopped during every attempt".
+- **A lease of 30s, renewed every 10s.** Every change to a job after the
+  claim requires `locked_by` to still be this worker (fencing), so a worker
+  that stalled past its lease can't overwrite the outcome of the worker
+  that took over. If the worker can't renew (Postgres unreachable), it
+  stops the job before the lease runs out, rather than risk two workers
+  building the same deployment.
+- **A clean shutdown hands the job back** (queued, attempt not counted), so
+  `docker compose up -d` mid-deploy costs a rebuild, not an attempt and a
+  30-second wait. Only a crash waits for the lease.
+- **Each attempt is safe to repeat.** It removes any container an earlier
+  attempt left for this deployment (same name), then rebuilds, mostly from
+  Docker's cache. A deployment already marked healthy (the platform died
+  between marking it live and switching the route) only finishes the
+  switch. Cleanup after a switch removes only *older* deployments'
+  containers, since the next deploy may already be starting one.
+- **Which errors retry:** build failed, health check failed, repo, commit
+  or folder not found, source too large, and the 20-minute attempt timeout
+  are permanent. Anything else (Docker, GitHub or Postgres unreachable,
+  unexpected errors) retries after 15s, then 30s, up to 3 attempts.
+  Unknown errors retry because the transient ones come in too many shapes
+  (network errors, 5xx, proxy errors) to list, and 3 attempts bound the
+  cost.
+- **Two workers, woken directly.** The API wakes a worker in-process when
+  it queues a deploy; workers also poll every 5s for retries that are due
+  and expired leases. Workers start only after the startup cleanup of
+  orphaned containers, which would otherwise race a resumed deploy.
+
+**Alternatives:** Postgres `LISTEN/NOTIFY` to wake workers (needs a
+dedicated connection, and gains nothing while the API and the workers are
+one process); a `max_attempts` column per job (one limit for every deploy
+is enough); keeping the half-built image or container between attempts
+(rebuilding from cache is cheap, and starting clean is easier to reason
+about).
+
 ### The webhook arrives through Tailscale Funnel until there's a domain
 
 **What:** GitHub's push webhook reaches the platform through Tailscale
@@ -817,3 +871,83 @@ passes through the dashboard's reverse proxy (with flushing) unchanged, and
 proxy must handle); polling (simpler, but laggy and wasteful for a build
 that prints hundreds of lines).
 
+
+### How deploy logs are stored and streamed (2.2, 2026-11-03)
+
+**What:** the details behind the two entries above.
+- **A `deployment_logs` table, one row per line,** with a global identity ID
+  that doubles as the stream's resume point (`Last-Event-ID`). One worker
+  writes a deployment's log at a time (the job's lease), so ID order is line
+  order.
+- **Written in batches every 500ms** (one `COPY` per batch), not per line: a
+  build prints hundreds of lines in seconds. Logging is best effort: a batch
+  that can't be written is dropped and noted in the platform's own log,
+  rather than failing a deploy that's otherwise fine.
+- **Bounded twice:** build output is capped at 5,000 lines per deployment
+  (across attempts; the platform's own messages always get through), and
+  only an app's 10 most recent deployments keep their logs (older ones are
+  deleted as each new deploy starts). Lines are cut at 4 KiB and cleaned up
+  (terminal colours, carriage-return progress bars, NUL bytes, invalid
+  UTF-8). Per-layer download progress while pulling a base image is dropped
+  as noise. Env var values never reach the log: they aren't build inputs,
+  and the platform's messages only count them.
+- **The stream polls Postgres every 500ms** while a deploy is running, and
+  ends with an `end` event once the deployment's job has finished for good.
+  "Finished" comes from the job, not the deployment's status: a deployment
+  is marked healthy before its last messages (route switched, old version
+  removed), but its job only finishes after every line is written. The
+  stream checks that before reading, so the read that follows has the rest.
+- **App output is followed live from Docker** with timestamps, which are the
+  event IDs, so a dropped connection resumes from the last line's time
+  (Docker's `since`, with already-seen lines skipped). When the container
+  stops or is replaced, the stream ends and the page offers to reconnect.
+- **Open streams end when shutdown starts** (the servers' `BaseContext` is
+  the shutdown signal). Otherwise one open log viewer would hold every
+  restart of the platform, and of the dashboard proxying it, for the full
+  shutdown timeout.
+
+**Alternatives:** waking streams in-process when lines are written, or
+Postgres `LISTEN/NOTIFY` (immediate rather than up to 500ms late, but extra
+moving parts for one viewer, and the writer batches every 500ms anyway); log
+files on disk with a pointer in the database (another volume, and retention
+done by hand); ending the deploy log on the deployment's status (would cut
+off its last lines).
+
+### How push-to-deploy works (2.3, 2026-11-03)
+
+**What:** the details behind the Funnel and separate-listener entries above.
+- **The signature is checked before anything else**, in constant time
+  (`hmac.Equal`), on a body capped at 1 MiB. Until it checks out, the
+  request touches nothing: no database, no logging of its contents. The
+  secret must be at least 32 characters, and with none set the listener
+  doesn't run at all.
+- **Deliveries are deduped by GitHub's delivery ID** (kept 30 days), so a
+  redelivery doesn't deploy again. If the platform fails before doing
+  anything (it can't list apps), it forgets the delivery, so "Redeliver" on
+  GitHub works.
+- **A push that arrives mid-deploy waits as the app's next commit.** Only
+  one deploy per app can be in progress (a database rule), so the push
+  can't simply start one, and dropping it would break "a push deploys".
+  It's stored on the app (`next_commit_sha`), and the newest push replaces
+  an older waiting one, since deploying the one in between would only be
+  replaced straight away. Every deploy that finishes, whether healthy or
+  given up, starts the waiting commit. Both sides lock the app's row first,
+  so a push can't see a deploy in progress, miss it finishing, and leave
+  its commit with nothing to start it. A deploy that's still to be retried
+  hasn't finished, so the push keeps waiting.
+- **One webhook per repo deploys every matching app:** the same repo (owner
+  and name compared case-insensitively, as GitHub does) and branch, with
+  auto-deploy on. Tags and branch deletions are ignored. The response lists
+  what happened to each app, which GitHub shows on the webhook's "Recent
+  deliveries" page: the place to look when a push didn't deploy.
+- **Auto-deploy is per app, on by default**; turning it off also drops a
+  waiting push. "Deploy latest" looks up the branch's head with GitHub's
+  commits API (a few bytes, not the whole commit) and deploys it like any
+  commit.
+
+**Alternatives:** a queue of every pushed commit per app (deploys commits
+that are already out of date); refusing a mid-deploy push with a 409 (GitHub
+doesn't retry, so the push is lost); a `jobs` row per push to serialize
+deploys (the jobs table runs deploys, it doesn't decide which commit; and a
+push isn't a deployment until it starts); checking the signature after
+parsing (does work for unauthenticated requests).

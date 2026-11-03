@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -44,14 +45,98 @@ const deploymentColumns = `id, app_id, commit_sha, status,
 	created_at, started_at, finished_at`
 
 // CreateDeployment queues a deploy of commitSHA (40 lowercase hex characters)
-// for an app. ErrDeployInProgress if the app already has one in progress;
-// ErrNotFound if the app doesn't exist.
+// for an app: the deployment, and the job that runs it, in one statement, so
+// there's never a deployment that nothing will run. ErrDeployInProgress if
+// the app already has one in progress; ErrNotFound if the app doesn't exist.
 func (s *Store) CreateDeployment(ctx context.Context, appID int64, commitSHA string) (Deployment, error) {
-	rows, _ := s.pool.Query(ctx,
-		"INSERT INTO deployments (app_id, commit_sha) VALUES ($1, $2) RETURNING "+deploymentColumns,
+	return createDeployment(ctx, s.pool, appID, commitSHA)
+}
+
+func createDeployment(ctx context.Context, db interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}, appID int64, commitSHA string) (Deployment, error) {
+	rows, _ := db.Query(ctx, `
+		WITH d AS (
+			INSERT INTO deployments (app_id, commit_sha) VALUES ($1, $2) RETURNING *
+		), j AS (
+			INSERT INTO jobs (kind, deployment_id) SELECT 'deploy', id FROM d
+		)
+		SELECT `+deploymentColumns+` FROM d`,
 		appID, commitSHA)
 	d, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[Deployment])
 	return d, translate(err)
+}
+
+// Push-to-deploy can't simply call CreateDeployment: a push that arrives
+// while the app is deploying would be refused and lost. So a pushed commit
+// either starts a deploy or waits as the app's next commit, and finishing a
+// deploy starts the waiting one. Both sides lock the app's row first, so they
+// take turns: a push can't see a deploy in progress, then miss it finishing
+// and leave its commit waiting with nothing to start it.
+
+// RequestDeployment queues a deploy of commitSHA for an app if it has none in
+// progress (started is true), and otherwise makes commitSHA the app's next
+// commit, replacing any older one, for StartNextDeployment to deploy once the
+// one in progress has finished.
+func (s *Store) RequestDeployment(ctx context.Context, appID int64, commitSHA string) (d Deployment, started bool, err error) {
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := lockApp(ctx, tx, appID); err != nil {
+			return err
+		}
+		// In a savepoint (a nested transaction), because a refused insert
+		// would otherwise abort the whole transaction.
+		err := pgx.BeginFunc(ctx, tx, func(sp pgx.Tx) error {
+			var err error
+			d, err = createDeployment(ctx, sp, appID, commitSHA)
+			return err
+		})
+		switch {
+		case err == nil:
+			started = true
+			return nil
+		case errors.Is(err, ErrDeployInProgress):
+			_, err := tx.Exec(ctx, "UPDATE apps SET next_commit_sha = $2 WHERE id = $1", appID, commitSHA)
+			return err
+		default:
+			return err
+		}
+	})
+	return d, started, translate(err)
+}
+
+// StartNextDeployment queues a deploy of the app's next commit, if it has one
+// and no deploy is in progress, and clears it. ok reports whether it queued
+// one. The deployer calls it whenever a deploy finishes.
+func (s *Store) StartNextDeployment(ctx context.Context, appID int64) (d Deployment, ok bool, err error) {
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var next *string
+		err := tx.QueryRow(ctx, "SELECT next_commit_sha FROM apps WHERE id = $1 FOR UPDATE", appID).Scan(&next)
+		if err != nil || next == nil {
+			return err
+		}
+		err = pgx.BeginFunc(ctx, tx, func(sp pgx.Tx) error {
+			var err error
+			d, err = createDeployment(ctx, sp, appID, *next)
+			return err
+		})
+		if errors.Is(err, ErrDeployInProgress) {
+			return nil // still busy: it stays next, for when that one finishes
+		}
+		if err != nil {
+			return err
+		}
+		ok = true
+		_, err = tx.Exec(ctx, "UPDATE apps SET next_commit_sha = NULL WHERE id = $1", appID)
+		return err
+	})
+	return d, ok, translate(err)
+}
+
+// lockApp locks an app's row until the transaction ends (ErrNotFound if
+// there's no such app).
+func lockApp(ctx context.Context, tx pgx.Tx, appID int64) error {
+	var one int
+	return translate(tx.QueryRow(ctx, "SELECT 1 FROM apps WHERE id = $1 FOR UPDATE", appID).Scan(&one))
 }
 
 // Deployment returns one deployment, or ErrNotFound.
@@ -103,10 +188,14 @@ func (s *Store) LiveApps(ctx context.Context) ([]LiveApp, error) {
 // so it's atomic: if the deployment has moved on in the meantime (or never
 // got there), nothing changes and the caller gets ErrWrongStatus.
 
-// MarkBuilding moves a queued deployment to building.
+// MarkBuilding moves an unfinished deployment to building. Usually it's
+// queued; building or starting means an earlier attempt was cut off (the
+// platform restarted, or Docker was unreachable) and its job is retrying it.
+// That's the one move back a deployment can make: once finished, it stays
+// finished. started_at keeps the first attempt's time.
 func (s *Store) MarkBuilding(ctx context.Context, id int64) error {
-	return s.transition(ctx, s.pool, id, "SET status = 'building', started_at = now()",
-		[]string{string(StatusQueued)})
+	return s.transition(ctx, s.pool, id, "SET status = 'building', started_at = COALESCE(started_at, now())",
+		inProgress)
 }
 
 // MarkStarting records the built image and moves a building deployment to
@@ -140,22 +229,6 @@ func (s *Store) MarkHealthy(ctx context.Context, id int64) error {
 func (s *Store) MarkFailed(ctx context.Context, id int64, reason string) error {
 	return s.transition(ctx, s.pool, id, "SET status = 'failed', error = $3, finished_at = now()",
 		inProgress, reason)
-}
-
-// FailInterruptedDeployments marks every unfinished deployment failed, and
-// returns how many there were. The platform calls it at startup: in P1 a
-// deploy runs in a goroutine, so one that was in progress when the platform
-// stopped will never finish, and would otherwise block the app's next deploy
-// forever (see deployments_one_in_progress_per_app). P2's job queue replaces
-// this with retrying the deploy instead.
-func (s *Store) FailInterruptedDeployments(ctx context.Context, reason string) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE deployments SET status = 'failed', error = $2, finished_at = now()
-		WHERE status = ANY($1)`, inProgress, reason)
-	if err != nil {
-		return 0, translate(err)
-	}
-	return tag.RowsAffected(), nil
 }
 
 // querier is what transition needs: the pool, or a transaction.

@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
 
@@ -22,6 +24,12 @@ type fakeStore struct {
 	env         map[string]string // "appID/KEY" -> value
 	deployments []store.Deployment
 	err         error // if set, every method fails with it
+
+	mu       sync.Mutex
+	logs     []store.LogLine
+	complete bool
+	onPoll   func(n int) // called with the poll's number (from 1) as each log poll starts
+	polls    int
 }
 
 func (f *fakeStore) Apps(context.Context) ([]store.App, error) { return f.apps, f.err }
@@ -49,6 +57,16 @@ func (f *fakeStore) CreateApp(_ context.Context, n store.NewApp) (store.App, err
 		SourceDir: n.SourceDir}
 	f.apps = append(f.apps, a)
 	return a, nil
+}
+
+func (f *fakeStore) SetAutoDeploy(_ context.Context, id int64, on bool) (store.App, error) {
+	for i, a := range f.apps {
+		if a.ID == id {
+			f.apps[i].AutoDeploy = on
+			return f.apps[i], nil
+		}
+	}
+	return store.App{}, store.ErrNotFound
 }
 
 func (f *fakeStore) EnvVarKeys(_ context.Context, appID int64) ([]string, error) {
@@ -82,6 +100,15 @@ func (f *fakeStore) Deployments(context.Context, int64, int) ([]store.Deployment
 	return f.deployments, f.err
 }
 
+func (f *fakeStore) Deployment(_ context.Context, id int64) (store.Deployment, error) {
+	for _, d := range f.deployments {
+		if d.ID == id {
+			return d, nil
+		}
+	}
+	return store.Deployment{}, store.ErrNotFound
+}
+
 func (f *fakeStore) CurrentDeployment(context.Context, int64) (store.Deployment, error) {
 	for _, d := range f.deployments {
 		if d.Status == store.StatusHealthy {
@@ -94,6 +121,14 @@ func (f *fakeStore) CurrentDeployment(context.Context, int64) (store.Deployment,
 type fakeDeployer struct {
 	err     error
 	started []string
+	latest  string // the branch head StartLatest finds; "" for none
+}
+
+func (f *fakeDeployer) StartLatest(ctx context.Context, appID int64) (store.Deployment, error) {
+	if f.latest == "" {
+		return store.Deployment{}, source.ErrBranchNotFound
+	}
+	return f.Start(ctx, appID, f.latest)
 }
 
 func (f *fakeDeployer) Start(_ context.Context, appID int64, commit string) (store.Deployment, error) {
@@ -108,7 +143,7 @@ func newTestAPI() (http.Handler, *fakeStore, *fakeDeployer) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Hostname: "hello.apps.test", Port: 8080}}
 	dep := &fakeDeployer{}
-	return New(st, dep, "apps.test"), st, dep
+	return New(st, dep, &fakeEngine{}, "apps.test"), st, dep
 }
 
 // do sends a request; a non-empty body is sent as JSON.
@@ -287,8 +322,51 @@ func TestInternalErrorsAreGeneric(t *testing.T) {
 
 func TestListAppsEmptyIsArray(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
-	rec := do(t, New(st, &fakeDeployer{}, "apps.test"), "GET", "/api/platform/apps", "")
+	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, "apps.test"), "GET", "/api/platform/apps", "")
 	if strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Errorf("body = %s, want []", rec.Body)
+	}
+}
+
+func TestAutoDeploySwitch(t *testing.T) {
+	h, st, _ := newTestAPI()
+	st.apps[0].AutoDeploy = true
+	st.apps[0].NextCommitSHA = sha
+
+	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", ""))
+	if !got.AutoDeploy || got.NextCommitSHA == nil || *got.NextCommitSHA != sha {
+		t.Errorf("app = autoDeploy %v, next %v; want on, the waiting commit", got.AutoDeploy, got.NextCommitSHA)
+	}
+
+	rec := do(t, h, "PATCH", "/api/platform/apps/1", `{"autoDeploy":false}`)
+	if rec.Code != http.StatusOK || decode[appResponse](t, rec).AutoDeploy || st.apps[0].AutoDeploy {
+		t.Errorf("turning it off: %d %s", rec.Code, rec.Body)
+	}
+	for body, want := range map[string]int{
+		`{}`:                   http.StatusBadRequest, // nothing to change
+		`{"autoDeploy":"yes"}`: http.StatusBadRequest,
+		`{"name":"renamed"}`:   http.StatusBadRequest, // not changeable
+	} {
+		if rec := do(t, h, "PATCH", "/api/platform/apps/1", body); rec.Code != want {
+			t.Errorf("PATCH %s: status %d, want %d", body, rec.Code, want)
+		}
+	}
+	if rec := do(t, h, "PATCH", "/api/platform/apps/9", `{"autoDeploy":true}`); rec.Code != http.StatusNotFound {
+		t.Errorf("missing app: status %d, want 404", rec.Code)
+	}
+}
+
+func TestDeployLatest(t *testing.T) {
+	h, _, dep := newTestAPI()
+	dep.latest = sha
+	rec := do(t, h, "POST", "/api/platform/apps/1/deployments/latest", "")
+	if rec.Code != http.StatusAccepted || decode[deploymentResponse](t, rec).CommitSHA != sha {
+		t.Errorf("deploy latest: %d %s; want 202 with the branch head", rec.Code, rec.Body)
+	}
+
+	dep.latest = ""
+	rec = do(t, h, "POST", "/api/platform/apps/1/deployments/latest", "")
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "branch wasn't found") {
+		t.Errorf("unknown branch: %d %s; want 400 saying so", rec.Code, rec.Body)
 	}
 }
