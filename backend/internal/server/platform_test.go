@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 // fakePlatform records the last request it received and answers 201.
@@ -60,6 +61,27 @@ func TestPlatformRequestsAreForwarded(t *testing.T) {
 	}
 	if f.forwardedHost == "spoofed.example" {
 		t.Error("a client's X-Forwarded-Host reached the platform")
+	}
+}
+
+// As production wires it: the platform and the built frontend together.
+// (Registering both once panicked at startup: overlapping ServeMux patterns.)
+func TestPlatformAlongsideStaticFiles(t *testing.T) {
+	f, target := newFakePlatform(t)
+	static := fstest.MapFS{"index.html": {Data: []byte("<h1>dashboard</h1>")}}
+	h := New(&fakeSource{}, nil, NewPlatformProxy(target), static)
+
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(method, "/api/platform/apps", nil))
+		if rec.Code != http.StatusCreated || f.method != method {
+			t.Errorf("%s: status %d, platform saw %q; want it forwarded", method, rec.Code, f.method)
+		}
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "dashboard") {
+		t.Errorf("GET / = %d %q, want the frontend", rec.Code, rec.Body)
 	}
 }
 

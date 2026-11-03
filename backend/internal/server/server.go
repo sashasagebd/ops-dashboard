@@ -36,7 +36,12 @@ func New(snapshots SnapshotSource, hist HistorySource, platform http.Handler, st
 	mux.HandleFunc("GET /api/containers", handleListContainers(snapshots))
 	mux.HandleFunc("GET /api/history", handleHistory(hist))
 	if platform != nil {
-		mux.Handle("/api/platform/", platform)
+		// One pattern per method, not a bare "/api/platform/": that and
+		// "GET /" below would each be more specific in one way (path vs
+		// method), which ServeMux refuses as a conflict. GET covers HEAD.
+		for _, method := range []string{"GET", "POST", "PUT", "PATCH", "DELETE"} {
+			mux.Handle(method+" /api/platform/", platform)
+		}
 	}
 	if static != nil {
 		// "GET /" matches everything, but ServeMux always prefers the most
