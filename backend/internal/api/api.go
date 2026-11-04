@@ -1,5 +1,6 @@
 // Package api is the platform's HTTP API: registering apps, setting their env
-// vars, deploying them, and streaming deploy and app logs (logs.go). The
+// vars, deploying them, the reconciler's events, and streaming deploy and app
+// logs (logs.go). The
 // browser reaches it through the dashboard,
 // which forwards /api/platform/* here, so the paths keep that prefix.
 //
@@ -43,6 +44,7 @@ type Store interface {
 	DeploymentLogs(ctx context.Context, deploymentID, afterID int64, limit int) ([]store.LogLine, error)
 	DeploymentLogComplete(ctx context.Context, deploymentID int64) (bool, error)
 	KeptImages(ctx context.Context, appID int64) ([]string, error)
+	Events(ctx context.Context, appID int64, limit int) ([]store.Event, error)
 }
 
 // Deployer starts deploys; in production it's a *deploy.Deployer.
@@ -75,6 +77,7 @@ func New(st Store, dep Deployer, eng Engine, appsDomain string) http.Handler {
 	mux.HandleFunc("POST /api/platform/apps/{id}/deployments/{deploymentId}/rollback", a.rollback)
 	mux.HandleFunc("GET /api/platform/apps/{id}/deployments/{deploymentId}/logs", a.deploymentLogs)
 	mux.HandleFunc("GET /api/platform/apps/{id}/logs", a.appLogs)
+	mux.HandleFunc("GET /api/platform/events", a.listEvents)
 	return mux
 }
 
@@ -109,6 +112,17 @@ type appDetailResponse struct {
 	appResponse
 	EnvKeys     []string             `json:"envKeys"`     // names only; values are write-only
 	Deployments []deploymentResponse `json:"deployments"` // newest first
+	Events      []eventResponse      `json:"events"`      // the reconciler's, newest first
+}
+
+// eventResponse is something the reconciler found and fixed (or failed to).
+type eventResponse struct {
+	ID      int64     `json:"id"`
+	At      time.Time `json:"at"`
+	AppID   *int64    `json:"appId"` // null if it isn't about one app
+	Kind    string    `json:"kind"`
+	Message string    `json:"message"`
+	Output  []string  `json:"output"` // a crashed container's last lines, oldest first; [] if none
 }
 
 type deploymentResponse struct {
@@ -148,6 +162,21 @@ func newAppResponse(a store.App, current *store.Deployment) appResponse {
 		r.CurrentDeployment = &d
 	}
 	return r
+}
+
+func newEventResponses(es []store.Event) []eventResponse {
+	out := make([]eventResponse, 0, len(es)) // [] not null when empty
+	for _, e := range es {
+		r := eventResponse{ID: e.ID, At: e.At, Kind: string(e.Kind), Message: e.Message, Output: e.Output}
+		if e.AppID != 0 {
+			r.AppID = &e.AppID
+		}
+		if r.Output == nil {
+			r.Output = []string{}
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 func newDeploymentResponse(d store.Deployment) deploymentResponse {
@@ -312,10 +341,16 @@ func (a *api) getApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	events, err := a.store.Events(ctx, id, appEvents)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, appDetailResponse{
 		appResponse: newAppResponse(app, current),
 		EnvKeys:     keys,
 		Deployments: list,
+		Events:      newEventResponses(events),
 	})
 }
 
@@ -479,6 +514,24 @@ func (a *api) rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, newDeploymentResponse(d))
+}
+
+// How many of the reconciler's events each view gets: the recent ones, for
+// a glance at what has needed fixing.
+const (
+	appEvents = 20 // in an app's detail
+	allEvents = 50 // GET /api/platform/events
+)
+
+// listEvents is the reconciler's most recent events, for every app and those
+// about no app, newest first.
+func (a *api) listEvents(w http.ResponseWriter, r *http.Request) {
+	events, err := a.store.Events(r.Context(), 0, allEvents)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, newEventResponses(events))
 }
 
 // current returns an app's live deployment, or nil if it has none.

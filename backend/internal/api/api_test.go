@@ -24,7 +24,8 @@ type fakeStore struct {
 	env         map[string]string // "appID/KEY" -> value
 	deployments []store.Deployment
 	kept        []string // KeptImages' answer
-	err         error    // if set, every method fails with it
+	events      []store.Event
+	err         error // if set, every method fails with it
 
 	mu       sync.Mutex
 	logs     []store.LogLine
@@ -102,6 +103,16 @@ func (f *fakeStore) Deployments(context.Context, int64, int) ([]store.Deployment
 }
 
 func (f *fakeStore) KeptImages(context.Context, int64) ([]string, error) { return f.kept, f.err }
+
+func (f *fakeStore) Events(_ context.Context, appID int64, limit int) ([]store.Event, error) {
+	var out []store.Event
+	for _, e := range f.events {
+		if (appID == 0 || e.AppID == appID) && len(out) < limit {
+			out = append(out, e)
+		}
+	}
+	return out, f.err
+}
 
 func (f *fakeStore) Deployment(_ context.Context, id int64) (store.Deployment, error) {
 	for _, d := range f.deployments {
@@ -437,5 +448,33 @@ func TestRollback(t *testing.T) {
 		if rec.Code != tt.wantCode || !strings.Contains(rec.Body.String(), tt.wantBody) {
 			t.Errorf("POST %s with %v: %d %s, want %d mentioning %q", tt.path, tt.err, rec.Code, rec.Body, tt.wantCode, tt.wantBody)
 		}
+	}
+}
+
+func TestEvents(t *testing.T) {
+	h, st, _ := newTestAPI()
+
+	// None yet: [] in both places.
+	if rec := do(t, h, "GET", "/api/platform/events", ""); strings.TrimSpace(rec.Body.String()) != "[]" {
+		t.Errorf("no events: body %s, want []", rec.Body)
+	}
+	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"events":[]`) {
+		t.Errorf("app detail %s lacks events: []", rec.Body)
+	}
+
+	st.events = []store.Event{
+		{ID: 3, AppID: 1, Kind: store.EventRestarted, Message: "Restarted hello", Output: []string{"panic: nil map"}},
+		{ID: 2, Kind: store.EventRoutesReapplied, Message: "re-applied routes"}, // about no app
+		{ID: 1, AppID: 2, Kind: store.EventRemovedOrphan, Message: "removed app-api-3"},
+	}
+	all := decode[[]eventResponse](t, do(t, h, "GET", "/api/platform/events", ""))
+	if len(all) != 3 || all[0].Kind != "restarted" || all[0].Output[0] != "panic: nil map" ||
+		all[1].AppID != nil || all[1].Output == nil || *all[2].AppID != 2 {
+		t.Errorf("all events = %+v", all)
+	}
+	// An app's detail has only its own.
+	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", ""))
+	if len(got.Events) != 1 || got.Events[0].ID != 3 {
+		t.Errorf("hello's events = %+v, want only its restart", got.Events)
 	}
 }

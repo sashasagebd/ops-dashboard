@@ -490,6 +490,14 @@ jobs:
           test "$(docker inspect -f '{{.State.Status}}' ci-unmanaged)" = running || on_failure
           test "$(docker inspect -f '{{.State.Status}}' ci-unmanaged-stopped)" = created || on_failure
           docker rm -f ci-unmanaged ci-unmanaged-stopped
+          # Each fix is an event, read through the dashboard as its pages do:
+          # hello's own (the kill's restart with hello's last output lines,
+          # the recreate, the first pass's restart) and the routes fix,
+          # which is about no app.
+          dash GET "/api/platform/apps/$APP" | jq '.events' > /tmp/events.json
+          jq -e 'map(.kind) | index("restarted") and index("recreated")' /tmp/events.json || { cat /tmp/events.json; on_failure; }
+          jq -e 'map(select(.kind == "restarted")) | last | .output | length > 0' /tmp/events.json || { cat /tmp/events.json; on_failure; }
+          dash GET /api/platform/events | jq -e 'map(select(.kind == "routes_reapplied" and .appId == null)) | length > 0' || on_failure
 
           # A source directory that doesn't exist fails with a clear reason
           # (found mid-stream, so this also checks the reason survives

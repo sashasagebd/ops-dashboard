@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AppDetail, Deployment, PlatformApp } from './api'
+import type { AppDetail, Deployment, PlatformApp, PlatformEvent } from './api'
 import App from './App'
 import { FakeEventSource } from './test/fakeEventSource'
 
@@ -44,16 +44,30 @@ function app(overrides: Partial<PlatformApp> = {}): PlatformApp {
 }
 
 function detail(overrides: Partial<AppDetail> = {}): AppDetail {
-  return { ...app(), envKeys: [], deployments: [], ...overrides }
+  return { ...app(), envKeys: [], deployments: [], events: [], ...overrides }
+}
+
+function event(overrides: Partial<PlatformEvent> = {}): PlatformEvent {
+  return {
+    id: 1,
+    at: new Date(Date.now() - 2 * 60_000).toISOString(),
+    appId: 1,
+    kind: 'restarted',
+    message: 'Restarted hello: its container app-hello-7 had exited with code 137',
+    output: [],
+    ...overrides,
+  }
 }
 
 type Handler = (init: RequestInit | undefined) => [number, unknown]
 
-// mockFetch answers "METHOD /path" with a handler; anything else is a 404.
+// mockFetch answers "METHOD /path" with a handler; anything else is a 404,
+// apart from the Apps page's events, which are none unless a test says.
 // It returns the mock, whose calls show what was sent.
 function mockFetch(routes: Record<string, Handler>) {
+  const all: Record<string, Handler> = { 'GET /api/platform/events': () => [200, []], ...routes }
   const fetchMock = vi.fn((url: string, init?: RequestInit) => {
-    const handler = routes[`${init?.method ?? 'GET'} ${url}`]
+    const handler = all[`${init?.method ?? 'GET'} ${url}`]
     const [status, body] = handler ? handler(init) : [404, { error: 'not found' }]
     return Promise.resolve({
       ok: status < 400,
@@ -130,6 +144,37 @@ describe('Apps page', () => {
       port: 8080,
       healthCheckPath: '/',
     })
+  })
+
+  it("shows what the platform has fixed recently, with a crash's last lines", async () => {
+    mockFetch({
+      'GET /api/platform/apps': () => [200, [app()]],
+      'GET /api/platform/events': () => [
+        200,
+        [
+          event({ id: 3, kind: 'crash_looping', message: 'hello keeps stopping', output: ['listening', 'panic: nil map'] }),
+          event({ id: 2, appId: null, kind: 'routes_reapplied', message: "Caddy's routes didn't match" }),
+        ],
+      ],
+    })
+    window.location.hash = '#/apps'
+    render(<App />)
+
+    const looping = await screen.findByText('crash-looping')
+    expect(looping).toHaveClass('badge-down')
+    expect(screen.getByText('routes fixed')).toHaveClass('badge-neutral')
+    expect(screen.getByText(/hello keeps stopping/)).toBeInTheDocument()
+    // The output folds out under its event; the routes event has none.
+    expect(screen.getAllByText(/lines of output/)).toHaveLength(1)
+    fireEvent.click(screen.getByText('Its last 2 lines of output'))
+    expect(screen.getByText(/panic: nil map/)).toBeVisible()
+  })
+
+  it('says when nothing has needed fixing', async () => {
+    mockFetch({ 'GET /api/platform/apps': () => [200, []] })
+    window.location.hash = '#/apps'
+    render(<App />)
+    expect(await screen.findByText('Nothing has needed fixing.')).toBeInTheDocument()
   })
 
   it("shows the platform's error when registering fails", async () => {
@@ -344,6 +389,17 @@ describe('App page', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Roll back to deploy #7' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('its image is no longer kept')
+  })
+
+  it("shows the app's own events", async () => {
+    mockFetch({
+      'GET /api/platform/apps/1': () => [200, detail({ events: [event({ kind: 'recreated', message: 'Recreated hello' })] })],
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    expect(await screen.findByText('recreated')).toHaveClass('badge-warn')
+    expect(screen.getByText(/Recreated hello/)).toBeInTheDocument()
+    expect(screen.getByText('2m ago', { exact: false })).toBeInTheDocument()
   })
 
   it('has no app output to show when nothing is live', async () => {

@@ -8,13 +8,16 @@ import {
   deploymentLogURL,
   fetchApp,
   fetchApps,
+  fetchEvents,
   rollback,
   setAutoDeploy,
   setEnvVar,
   type AppDetail,
   type Deployment,
   type DeploymentStatus,
+  type EventKind,
   type PlatformApp,
+  type PlatformEvent,
 } from './api'
 import { formatBytes, formatDuration } from './format'
 import { LogViewer } from './LogViewer'
@@ -36,6 +39,27 @@ const STATUS_BADGE: Record<DeploymentStatus, string> = {
   rolled_back: 'neutral',
 }
 
+// How each kind of reconciler event looks: what was fixed is a warning (the
+// app was down, briefly); housekeeping is neutral; what keeps going wrong is
+// a fault.
+const EVENT_BADGE: Record<EventKind, string> = {
+  restarted: 'warn',
+  recreated: 'warn',
+  crash_looping: 'down',
+  removed_orphan: 'neutral',
+  routes_reapplied: 'neutral',
+  fix_failed: 'down',
+}
+
+const EVENT_LABEL: Record<EventKind, string> = {
+  restarted: 'restarted',
+  recreated: 'recreated',
+  crash_looping: 'crash-looping',
+  removed_orphan: 'cleaned up',
+  routes_reapplied: 'routes fixed',
+  fix_failed: 'fix failed',
+}
+
 const IN_PROGRESS: ReadonlySet<DeploymentStatus> = new Set(['queued', 'building', 'starting'])
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/
@@ -43,11 +67,20 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/
 // AppsPage lists the platform's apps and registers new ones.
 export function AppsPage() {
   const state = usePolling(fetchApps, APPS_REFRESH_MS)
+  const events = usePolling(fetchEvents, APPS_REFRESH_MS)
   return (
     <>
       <h2>Apps</h2>
       <Loaded state={state} what="apps">
         {(apps) => <AppsTable apps={apps} />}
+      </Loaded>
+      <h2>Recent events</h2>
+      <p className="muted">
+        What the platform found wrong and put right: apps that stopped, containers that went missing, routes that
+        changed.
+      </p>
+      <Loaded state={events} what="events">
+        {(es, checkedAt) => <EventsList events={es} now={checkedAt} emptyText="Nothing has needed fixing." />}
       </Loaded>
       <h2>Register an app</h2>
       <NewAppForm />
@@ -178,6 +211,8 @@ export function AppPage({ id }: { id: number }) {
               shownLog={log?.kind === 'deployment' ? log.id : (app.deployments.at(0)?.id ?? null)}
               onShowLog={(id) => setLog({ kind: 'deployment', id })}
             />
+            <h3>Events</h3>
+            <EventsList events={app.events} now={checkedAt} emptyText="Nothing has needed fixing for this app." />
             <h3>Environment variables</h3>
             <EnvVars app={app} onDone={refresh} />
           </>
@@ -520,6 +555,30 @@ function DeploymentsTable({
       </table>
       <ActionError state={action} />
     </div>
+  )
+}
+
+// EventsList is the reconciler's events, newest first; a crash's last lines
+// of output fold out under it.
+function EventsList({ events, now, emptyText }: { events: PlatformEvent[]; now: number; emptyText: string }) {
+  if (events.length === 0) return <p className="muted">{emptyText}</p>
+  return (
+    <ul className="events">
+      {events.map((e) => (
+        <li key={e.id}>
+          <span className={`badge badge-${EVENT_BADGE[e.kind]}`}>{EVENT_LABEL[e.kind]}</span> {e.message}{' '}
+          <span className="muted" title={e.at}>
+            {formatDuration(now - Date.parse(e.at))} ago
+          </span>
+          {e.output.length > 0 && (
+            <details>
+              <summary>Its last {e.output.length} lines of output</summary>
+              <pre className="event-output">{e.output.join('\n')}</pre>
+            </details>
+          )}
+        </li>
+      ))}
+    </ul>
   )
 }
 
