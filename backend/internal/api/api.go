@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/deploy"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
@@ -45,6 +46,8 @@ type Store interface {
 	DeploymentLogComplete(ctx context.Context, deploymentID int64) (bool, error)
 	KeptImages(ctx context.Context, appID int64) ([]string, error)
 	Events(ctx context.Context, appID int64, limit int) ([]store.Event, error)
+	Database(ctx context.Context, appID int64) (store.Database, error)
+	CreateDatabase(ctx context.Context, appID int64) (store.Database, error)
 }
 
 // Deployer starts deploys; in production it's a *deploy.Deployer.
@@ -78,6 +81,7 @@ func New(st Store, dep Deployer, eng Engine, appsDomain string) http.Handler {
 	mux.HandleFunc("GET /api/platform/apps/{id}/deployments/{deploymentId}/logs", a.deploymentLogs)
 	mux.HandleFunc("GET /api/platform/apps/{id}/logs", a.appLogs)
 	mux.HandleFunc("GET /api/platform/events", a.listEvents)
+	mux.HandleFunc("POST /api/platform/apps/{id}/database", a.createDatabase)
 	return mux
 }
 
@@ -113,6 +117,18 @@ type appDetailResponse struct {
 	EnvKeys     []string             `json:"envKeys"`     // names only; values are write-only
 	Deployments []deploymentResponse `json:"deployments"` // newest first
 	Events      []eventResponse      `json:"events"`      // the reconciler's, newest first
+	Database    *databaseResponse    `json:"database"`    // null if the app has none
+}
+
+// databaseResponse is an app's own Postgres. Its password is never shown:
+// the app gets it inside DATABASE_URL.
+type databaseResponse struct {
+	Name      string    `json:"name"` // its container, volume and network, e.g. ops-db-hello
+	CreatedAt time.Time `json:"createdAt"`
+	// "creating" until the platform has first created its container, then
+	// Docker's state of it ("running", "exited", ...), or "missing" while it's
+	// being created again.
+	State string `json:"state"`
 }
 
 // eventResponse is something the reconciler found and fixed (or failed to).
@@ -346,11 +362,17 @@ func (a *api) getApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	db, err := a.database(ctx, app)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, appDetailResponse{
 		appResponse: newAppResponse(app, current),
 		EnvKeys:     keys,
 		Deployments: list,
 		Events:      newEventResponses(events),
+		Database:    db,
 	})
 }
 
@@ -532,6 +554,61 @@ func (a *api) listEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, newEventResponses(events))
+}
+
+// createDatabase gives the app a database (no body): the platform creates it
+// within seconds, and the app gets DATABASE_URL from its next deploy. 201;
+// 409 if it has one already.
+func (a *api) createDatabase(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	app, err := a.store.App(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	if _, err := a.store.CreateDatabase(r.Context(), id); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	db, err := a.database(r.Context(), app)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, db)
+}
+
+// database is the app's database as the API shows it, or nil if it has none.
+// Its state comes from Docker; if Docker can't be asked, it's "unknown"
+// rather than failing the whole page.
+func (a *api) database(ctx context.Context, app store.App) (*databaseResponse, error) {
+	db, err := a.store.Database(ctx, app.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r := &databaseResponse{Name: deploy.DatabaseName(app.Name), CreatedAt: db.CreatedAt, State: "creating"}
+	if db.ProvisionedAt == nil {
+		return r, nil
+	}
+	containers, err := a.engine.ManagedContainers(ctx, app.Name)
+	if err != nil {
+		slog.Warn("reading a database's state", "app", app.Name, "err", err)
+		r.State = "unknown"
+		return r, nil
+	}
+	r.State = "missing"
+	for _, c := range containers {
+		if c.Labels[engine.LabelRole] == engine.RoleDatabase {
+			r.State = c.State
+		}
+	}
+	return r, nil
 }
 
 // current returns an app's live deployment, or nil if it has none.

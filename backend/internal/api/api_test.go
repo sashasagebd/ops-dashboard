@@ -10,7 +10,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
@@ -25,6 +27,7 @@ type fakeStore struct {
 	deployments []store.Deployment
 	kept        []string // KeptImages' answer
 	events      []store.Event
+	databases   map[int64]store.Database
 	err         error // if set, every method fails with it
 
 	mu       sync.Mutex
@@ -103,6 +106,26 @@ func (f *fakeStore) Deployments(context.Context, int64, int) ([]store.Deployment
 }
 
 func (f *fakeStore) KeptImages(context.Context, int64) ([]string, error) { return f.kept, f.err }
+
+func (f *fakeStore) Database(_ context.Context, appID int64) (store.Database, error) {
+	db, ok := f.databases[appID]
+	if !ok {
+		return store.Database{}, store.ErrNotFound
+	}
+	return db, nil
+}
+
+func (f *fakeStore) CreateDatabase(_ context.Context, appID int64) (store.Database, error) {
+	if _, ok := f.databases[appID]; ok {
+		return store.Database{}, fmt.Errorf("%w: the app already has a database", store.ErrConflict)
+	}
+	if f.databases == nil {
+		f.databases = map[int64]store.Database{}
+	}
+	db := store.Database{AppID: appID, Password: "secret-pw", CreatedAt: time.Now()}
+	f.databases[appID] = db
+	return db, nil
+}
 
 func (f *fakeStore) Events(_ context.Context, appID int64, limit int) ([]store.Event, error) {
 	var out []store.Event
@@ -476,5 +499,61 @@ func TestEvents(t *testing.T) {
 	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", ""))
 	if len(got.Events) != 1 || got.Events[0].ID != 3 {
 		t.Errorf("hello's events = %+v, want only its restart", got.Events)
+	}
+}
+
+func TestDatabase(t *testing.T) {
+	st := &fakeStore{env: map[string]string{}}
+	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test", Port: 8080}}
+	eng := &fakeEngine{}
+	h := New(st, &fakeDeployer{}, eng, "apps.test")
+
+	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"database":null`) {
+		t.Errorf("no database yet: body %s, want database null", rec.Body)
+	}
+
+	rec := do(t, h, "POST", "/api/platform/apps/1/database", "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	got := decode[databaseResponse](t, rec)
+	// Not created by the reconciler yet.
+	if got.Name != "ops-db-hello" || got.State != "creating" || got.CreatedAt.IsZero() {
+		t.Errorf("created = %+v", got)
+	}
+	// The password never comes back, here or in the app's detail.
+	for _, path := range []string{"/api/platform/apps/1"} {
+		if body := do(t, h, "GET", path, "").Body.String(); strings.Contains(body, "secret-pw") {
+			t.Errorf("GET %s shows the database password: %s", path, body)
+		}
+	}
+	if strings.Contains(rec.Body.String(), "secret-pw") {
+		t.Errorf("create response shows the password: %s", rec.Body)
+	}
+
+	// Once created, its state is Docker's; gone is "missing".
+	now := time.Now()
+	db := st.databases[1]
+	db.ProvisionedAt = &now
+	st.databases[1] = db
+	eng.containers = []engine.ManagedContainer{
+		{ID: "a", Name: "app-hello-7", State: "running", Labels: map[string]string{engine.LabelDeployment: "7"}},
+		{ID: "d", Name: "ops-db-hello", State: "exited", Labels: map[string]string{engine.LabelRole: engine.RoleDatabase}},
+	}
+	if d := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", "")).Database; d == nil || d.State != "exited" {
+		t.Errorf("database = %+v, want exited", d)
+	}
+	eng.containers = eng.containers[:1]
+	if d := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", "")).Database; d == nil || d.State != "missing" {
+		t.Errorf("database = %+v, want missing", d)
+	}
+
+	// One per app; unknown apps are 404.
+	if rec := do(t, h, "POST", "/api/platform/apps/1/database", ""); rec.Code != http.StatusConflict ||
+		!strings.Contains(rec.Body.String(), "already has a database") {
+		t.Errorf("second: %d %s, want 409 saying so", rec.Code, rec.Body)
+	}
+	if rec := do(t, h, "POST", "/api/platform/apps/9/database", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("missing app: %d, want 404", rec.Code)
 	}
 }

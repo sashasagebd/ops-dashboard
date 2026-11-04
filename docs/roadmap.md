@@ -20,6 +20,7 @@ _Last updated: 2026-11-04_
 | P2: Push-to-deploy, job queue, live logs | ✅ Done, deployed 2026-11-03 (PR #7) |
 | P3: Zero-downtime deploys and rollbacks | ✅ Done, deployed 2026-11-04 (PR #9) |
 | P4: Reconciliation and crash recovery | ✅ Done, deployed 2026-11-04 (PR #11) |
+| P5: Databases for apps, observability, public hostnames | 🚧 In progress (plan approved 2026-11-04) |
 
 **Where we left off (2026-11-04):** P0 to P4 are done and deployed.
 Pushing to `main` deploys `examples/hello` with no clicks, the build log
@@ -30,9 +31,9 @@ previous versions can be rolled back to from the dashboard, with no build.
 A reconciler keeps what runs in line with the database every 10s: a killed
 or deleted app container, a lost route, or a whole-server reboot all come
 back on their own, each fix shown as an event in the dashboard.
-**Next:** plan P5 (databases for apps and observability; see
-[platform-plan.md](platform-plan.md)), with the first real app, the
-pokewordle backend, and the domain question below.
+P5's plan is approved (below); work is on the `platform-p5` branch. The
+domain is bought: `sashasagebd.com` (Cloudflare Registrar).
+**Next:** 5.1 (databases for apps).
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -520,17 +521,64 @@ Decisions (approved 2026-11-04), with entries in
   next pass checks again. A redeploy would rebuild, take minutes and clutter
   the history.
 
+## P5: Databases for apps, observability, public hostnames 🚧
+
+Phase 5 of [platform-plan.md](platform-plan.md), adjusted. Plan approved
+2026-11-04.
+
+**Done when** (adjusted from the plan, see below): `examples/hello` runs
+with its own database, backed up daily to `~/backups` (and restorable),
+shows up with CPU, memory and request metrics in the dashboard, and is
+reachable at a public hostname on `sashasagebd.com`.
+
+**Adjusted from the plan:** its done-when is the pokewordle backend running
+with its own database and metrics. That backend doesn't exist yet; the owner
+will write it after P5, so `hello` stands in for it, and deploying
+pokewordle afterwards is registering it, adding a database and giving it
+`api.sashasagebd.com` (or `pokewordle-api.`). The domain was bought for this
+(2026-11-04), so public hostnames through Cloudflare Tunnel, deferred since
+P2, are this phase's last step.
+
+What exists: the dashboard samples every container's CPU and memory and
+keeps 24h of trends, but keyed by container name, which changes with each
+deploy (`app-hello-16`); nothing counts requests; the reconciler already
+makes desired state real, which a database fits.
+
+| Step | What | Status |
+|---|---|---|
+| 5.1 | **Databases for apps.** "Add a database" on an app's page: one per app, created once; its password encrypted like env vars. The reconciler creates and keeps it running: a `postgres:18.6` container (its own memory limit) with its data on a named volume, on an internal Docker network of the app's own that only its database and its containers join (never `platform-apps`, so other apps can't reach it). A recreated container finds its data on the volume. App containers get `DATABASE_URL` from the next deploy. No new Docker permissions (a container create makes its volume; `IMAGES` pulls, `NETWORKS` creates the network); database containers are the one exception to "no mounts", a named volume only, never a host path. Deleting a database isn't in P5, and the platform never removes a volume. `examples/hello` gets a `/visits` counter in its database; CI checks the count survives a redeploy, a `docker rm -f` of the database container and a rollback, and that another app can't reach it. | 🔍 Written, awaiting review and CI. Migration 0010 (`app_databases`, and a `database_created` event kind). Beyond the plan: `provisioned_at` records the database's first creation, so the reconciler tells "not created yet" (event `database_created`) from "its container was deleted" (`recreated`, data kept) without the Docker volumes permission; the dashboard shows "being created" until then, and "Deploy the app to start using it" while the live version predates the database. The platform's `DATABASE_URL` replaces a user env var of that name. Names derived: `ops-db-<app>` for the container, volume, network and hostname. **Not checked in CI: a rollback with the database** (CI's only other image of hello is the parent commit's, without `/visits`); rollbacks start containers through the same code as deploys, which unit tests cover. CI also checks the password appears in neither the API nor a deploy log. Details in [decisions/platform.md](decisions/platform.md) ("How app databases work"). |
+| 5.2 | **Backups.** A daily `pg_dump` per database, as a job in the queue (retried, survives restarts), plus "Back up now". Run in a short-lived `postgres:18.6` container on the app's database network, writing into a volume compose defines as a bind of `BACKUP_DIR` (`~/backups`), so the platform never names a host path; files owned by the owner's user, not root. Keep 7 daily per app. The last backup's time and size on the app page. Restore is a documented manual `pg_restore`; CI backs up, drops hello's table, restores, and checks the count is back. | Not started |
+| 5.3 | **Per-app metrics.** CPU and memory: the dashboard's history also keeps a series per platform app (`app:<name>`, by the container's app label), surviving deploys, shown as sparklines on the app page. Requests: the platform turns on Caddy's per-host metrics, reads them from the admin API every minute, and keeps 24h per app in memory (requests per minute, the 5xx share, p95 latency), on the app page and as last-hour requests on the Apps list. CI sends hello known requests and checks the counts. | Not started |
+| 5.4 | **Public hostnames through Cloudflare Tunnel.** A `cloudflared` service in compose that reaches Caddy over a network of its own (no published port, no port forwarding). Each app gets an optional public hostname (e.g. `api.sashasagebd.com`) alongside its tailnet one; apps without one stay tailnet-only, and the dashboard and the platform's API stay tailnet-only. The GitHub webhook moves to `hooks.sashasagebd.com` and Tailscale Funnel is turned off. The owner does the Cloudflare side (the tunnel and its token) from exact steps. Server checks of the done-when. | Not started |
+
+Decisions (approved 2026-11-04), to be written up in
+[decisions/platform.md](decisions/platform.md) as they land:
+- **One Postgres container per app,** not one shared instance with a
+  database per app: isolation (one app can't exhaust another's connections
+  or memory), per-app backups, independent upgrades later. About 30-60 MiB
+  per database, fine for a few apps.
+- **The platform owns Caddy's `apps.http.metrics`** as well as its `apps`
+  server: it sets per-host metrics on, and the reconciler keeps it so.
+  Caddy's per-server `metrics` would stay inside the platform's server, but
+  it's deprecated (a warning on every config load). It's the one path
+  outside the platform's own server; `grace_period` (P3) was skipped for
+  that reason, metrics are worth it.
+- **Backups daily, 7 kept, in `~/backups`,** through a compose-defined bind;
+  restore tested in CI.
+- **Request metrics in memory, 24h,** like the dashboard's history: reset by
+  a platform restart, no table or pruning for numbers that matter mostly
+  now.
+- **The domain is `sashasagebd.com`** (Cloudflare Registrar, 2026-11-04).
+  Public names stay one level deep (`api.sashasagebd.com`, not
+  `api.pokewordle.sashasagebd.com`): Cloudflare's free certificate covers
+  the bare domain and one level of subdomains only.
+
 ## Open questions
 
-- **Domain for public apps** (deferred, not blocking P1 or P2). The owner
-  will buy one (Cloudflare Registrar, cost price; confirmed 2026-11-03), most
-  likely for pokewordle in P5. When it arrives: cloudflared (Cloudflare
-  Tunnel) for public app hostnames, the GitHub webhook moved from Tailscale
-  Funnel to the tunnel, and Funnel turned off. One domain covers every public site via
-  subdomains. `pokewordle.sashasagebd.workers.dev` is Cloudflare's free
-  Workers subdomain and can't carry a tunnel or per-app hostnames. Also worth
-  checking then: whether pokewordle's Worker could reach its backend through
-  a tunnel without a public hostname (Cloudflare "Workers VPC").
+- **pokewordle's Worker and its backend** (for after P5): worth checking
+  whether the Worker could reach the backend through the tunnel without a
+  public hostname (Cloudflare "Workers VPC"). Until then, the backend gets a
+  public hostname and handles CORS itself.
 
 Resolved:
 - **M2 plan** approved 2026-10-01.
@@ -542,6 +590,8 @@ Resolved:
 - **P2 plan** approved 2026-11-03.
 - **P3 plan** approved 2026-11-04.
 - **P4 plan** approved 2026-11-04.
+- **P5 plan** approved 2026-11-04 (adjusted: hello stands in for pokewordle, public hostnames added).
+- **Domain for public apps** (2026-11-04): `sashasagebd.com`, bought on Cloudflare Registrar; set up in 5.4.
 - **Docker version on the server** (2026-11-02): 29.8.1, API 1.56; see P1's
   risks for what it means for building.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a

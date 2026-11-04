@@ -114,6 +114,18 @@ export type AppDetail = PlatformApp & {
   envKeys: string[] // names only: values are write-only
   deployments: Deployment[] // newest first, at most 20
   events: PlatformEvent[] // the reconciler's, newest first, at most 20
+  database: AppDatabase | null // null if the app has none
+}
+
+// AppDatabase matches databaseResponse: an app's own Postgres. Its password
+// is never shown; the app gets it inside DATABASE_URL.
+export type AppDatabase = {
+  name: string // its container, volume and network, e.g. ops-db-hello
+  createdAt: string // when it was added
+  // 'creating' until the platform first creates its container, then Docker's
+  // state ('running', 'exited', ...), 'missing' while it's created again, or
+  // 'unknown' if Docker couldn't be asked.
+  state: string
 }
 
 // EventKind is what the reconciler did about something it found wrong.
@@ -124,6 +136,7 @@ export type EventKind =
   | 'removed_orphan' // a container no live deployment uses, removed
   | 'routes_reapplied' // Caddy's routes didn't match, re-applied
   | 'fix_failed' // one of the above, tried and failed
+  | 'database_created' // an app's database created for the first time
 
 // PlatformEvent matches eventResponse.
 export type PlatformEvent = {
@@ -211,6 +224,12 @@ export function deployLatest(appId: number): Promise<Deployment> {
 // off.
 export function rollback(appId: number, deploymentId: number): Promise<Deployment> {
   return sendJSON<Deployment>('POST', `/api/platform/apps/${appId}/deployments/${deploymentId}/rollback`)
+}
+
+// createDatabase gives the app a Postgres of its own. The platform creates it
+// within seconds; the app gets DATABASE_URL from its next deploy.
+export function createDatabase(appId: number): Promise<AppDatabase> {
+  return sendJSON<AppDatabase>('POST', `/api/platform/apps/${appId}/database`)
 }
 
 export function setAutoDeploy(appId: number, autoDeploy: boolean): Promise<PlatformApp> {

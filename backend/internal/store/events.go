@@ -18,6 +18,7 @@ const (
 	EventRemovedOrphan   EventKind = "removed_orphan"
 	EventRoutesReapplied EventKind = "routes_reapplied"
 	EventFixFailed       EventKind = "fix_failed"
+	EventDatabaseCreated EventKind = "database_created"
 )
 
 // Event is one thing the reconciler found and fixed (or failed to).

@@ -1151,3 +1151,58 @@ deployment and leaving the app down.
 
 **Alternatives:** applying the routes every pass (a Caddy config rebuild
 every 10s); restarting through a new deployment (a rebuild for a crash).
+
+## Phase 5 (approved 2026-11-04)
+
+### One Postgres container per app
+
+**What:** an app that asks for a database gets a Postgres of its own: a
+`postgres:18.6` container (256 MiB memory limit) with its data on a named
+volume, on an internal network that only it and the app's containers join.
+**Why:** isolation (one app can't exhaust another's connections or memory,
+or read its data), backups and restores per app, and upgrades per app later.
+**Cost:** about 30-60 MiB of memory per database, fine for a few apps.
+**Alternatives:** one shared Postgres with a database and user per app
+(less memory, but one app's load or a bad migration reaches every app, and
+a restore is all or nothing); SQLite in the app's container (lost on every
+deploy: app containers have no volumes).
+
+### How app databases work (5.1, 2026-11-04)
+
+**What:** the details behind the entry above.
+- **A row is the desired state.** "Add a database" stores the app's row in
+  `app_databases`: a random password (32 bytes, hex, so it needs no
+  escaping in a URL), encrypted and bound to the row like env vars. The
+  reconciler then creates the database in its next pass, as it keeps apps
+  running: network, image, container. `provisioned_at` records the first
+  creation, which tells "not created yet" from "its container was deleted";
+  Docker can't tell those apart without the volumes permission, which the
+  platform doesn't have.
+- **No new Docker permissions.** Creating a container with a named volume
+  makes the volume (no `VOLUMES` group); `IMAGES` pulls `postgres:18.6`;
+  `NETWORKS` creates the network. The volume is the one mount any platform
+  container gets, and only ever a named volume, never a host path. The
+  platform never removes a volume, so an app's data outlives its container,
+  and deleting a database isn't offered (yet).
+- **Names are derived, not stored:** `ops-db-<app>` is the container, its
+  volume, its network and its hostname. Its user and database are `app`:
+  each app has its own Postgres, so they needn't vary.
+- **Its own network, internal.** The app's containers join it at creation
+  (Docker API 1.44+ takes several networks at once), next to
+  `platform-apps`; the database is on nothing else. Other apps can't reach
+  it, and it can't reach the internet.
+- **The app gets `DATABASE_URL`** from its next deploy (or a recreate, or a
+  rollback: all start containers the same way), replacing an env var of
+  that name. Never logged or returned by the API; only the app's container
+  and the database's own env hold the password.
+- **The reconciler keeps it running** as it does apps: restarted if it
+  stops (its own backoff, separate from the app's), recreated if deleted,
+  with its data kept on the volume. A database container whose app has no
+  database row is an orphan like any other (its volume stays).
+- **The password is set once.** The image only reads `POSTGRES_PASSWORD`
+  when its volume is first initialised; a recreated container finds the
+  data, and the user, it had.
+
+**Alternatives:** a job per database creation (the reconciler already does
+"make it real, retry until it is"); a fixed hostname alias `db` (names are
+unique per network anyway, and `ops-db-<app>` says which).

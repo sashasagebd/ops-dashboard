@@ -2,6 +2,7 @@ import { useCallback, useState, type FormEvent, type ReactNode } from 'react'
 import {
   appLogURL,
   createApp,
+  createDatabase,
   deleteEnvVar,
   deployCommit,
   deployLatest,
@@ -49,6 +50,7 @@ const EVENT_BADGE: Record<EventKind, string> = {
   removed_orphan: 'neutral',
   routes_reapplied: 'neutral',
   fix_failed: 'down',
+  database_created: 'up',
 }
 
 const EVENT_LABEL: Record<EventKind, string> = {
@@ -58,6 +60,7 @@ const EVENT_LABEL: Record<EventKind, string> = {
   removed_orphan: 'cleaned up',
   routes_reapplied: 'routes fixed',
   fix_failed: 'fix failed',
+  database_created: 'database created',
 }
 
 const IN_PROGRESS: ReadonlySet<DeploymentStatus> = new Set(['queued', 'building', 'starting'])
@@ -213,6 +216,8 @@ export function AppPage({ id }: { id: number }) {
             />
             <h3>Events</h3>
             <EventsList events={app.events} now={checkedAt} emptyText="Nothing has needed fixing for this app." />
+            <h3>Database</h3>
+            <Database app={app} onDone={refresh} />
             <h3>Environment variables</h3>
             <EnvVars app={app} onDone={refresh} />
           </>
@@ -338,6 +343,64 @@ function AutoDeploy({ app, onDone }: { app: AppDetail; onDone: () => void }) {
 // null if its latest deploy isn't a rollback.
 function rolledBackTo(app: AppDetail): number | null {
   return app.deployments.at(0)?.rollbackOf ?? null
+}
+
+// Database is the app's own Postgres: a button to add one, or what it is and
+// whether it's running.
+function Database({ app, onDone }: { app: AppDetail; onDone: () => void }) {
+  const [action, run] = useAction()
+  const db = app.database
+  if (db === null) {
+    const onAdd = () => {
+      const question =
+        `Add a Postgres database for ${app.name}? It reaches the app as DATABASE_URL from its next deploy, ` +
+        `and it can't be removed from the dashboard.`
+      if (!window.confirm(question)) return
+      void run(async () => {
+        await createDatabase(app.id)
+        onDone()
+      })
+    }
+    return (
+      <div>
+        <p className="muted">
+          No database. Add one and the platform runs a Postgres for this app alone, keeps it running and keeps its data.
+        </p>
+        <button type="button" onClick={onAdd} disabled={action.status === 'busy'}>
+          Add a database
+        </button>
+        <ActionError state={action} />
+      </div>
+    )
+  }
+  // A live version deployed before the database was added has no
+  // DATABASE_URL yet.
+  const live = app.currentDeployment
+  const needsDeploy = live === null || Date.parse(live.createdAt) < Date.parse(db.createdAt)
+  return (
+    <>
+      <dl className="facts">
+        <dt>Postgres 18</dt>
+        <dd>
+          <span className="mono">{db.name}</span>{' '}
+          <span className={`badge badge-${DATABASE_BADGE[db.state] ?? 'warn'}`}>
+            {db.state === 'creating' ? 'being created' : db.state}
+          </span>
+        </dd>
+      </dl>
+      <p className="muted">
+        The app gets it as <span className="mono">DATABASE_URL</span>; the password is never shown.
+        {needsDeploy && ' Deploy the app to start using it.'}
+      </p>
+    </>
+  )
+}
+
+// How a database's state looks; anything else (stopped, missing) is a
+// warning, since the reconciler is bringing it back.
+const DATABASE_BADGE: Record<string, string> = {
+  running: 'up',
+  unknown: 'neutral',
 }
 
 function EnvVars({ app, onDone }: { app: AppDetail; onDone: () => void }) {

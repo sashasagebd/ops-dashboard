@@ -44,7 +44,7 @@ function app(overrides: Partial<PlatformApp> = {}): PlatformApp {
 }
 
 function detail(overrides: Partial<AppDetail> = {}): AppDetail {
-  return { ...app(), envKeys: [], deployments: [], events: [], ...overrides }
+  return { ...app(), envKeys: [], deployments: [], events: [], database: null, ...overrides }
 }
 
 function event(overrides: Partial<PlatformEvent> = {}): PlatformEvent {
@@ -400,6 +400,49 @@ describe('App page', () => {
     expect(await screen.findByText('recreated')).toHaveClass('badge-warn')
     expect(screen.getByText(/Recreated hello/)).toBeInTheDocument()
     expect(screen.getByText('2m ago', { exact: false })).toBeInTheDocument()
+  })
+
+  it('adds a database, after asking', async () => {
+    let added = false
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({
+          currentDeployment: deployment(),
+          database: added ? { name: 'ops-db-hello', createdAt: new Date().toISOString(), state: 'creating' } : null,
+        }),
+      ],
+      'POST /api/platform/apps/1/database': () => {
+        added = true
+        return [201, { name: 'ops-db-hello', createdAt: new Date().toISOString(), state: 'creating' }]
+      },
+    })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add a database' }))
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('DATABASE_URL from its next deploy'))
+    expect(await screen.findByText('being created')).toHaveClass('badge-warn')
+    expect(screen.getByText('ops-db-hello')).toBeInTheDocument()
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/database')).toHaveLength(1)
+    // The live version predates it, so it says to deploy.
+    expect(screen.getByText(/Deploy the app to start using it/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Add a database' })).not.toBeInTheDocument()
+  })
+
+  it('shows a running database the live version already uses', async () => {
+    const created = new Date(Date.now() - 60 * 60_000).toISOString()
+    mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({ currentDeployment: deployment(), database: { name: 'ops-db-hello', createdAt: created, state: 'running' } }),
+      ],
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    expect(await screen.findByText('running')).toHaveClass('badge-up')
+    expect(screen.queryByText(/Deploy the app to start using it/)).not.toBeInTheDocument()
   })
 
   it('has no app output to show when nothing is live', async () => {

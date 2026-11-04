@@ -25,6 +25,10 @@ For trying out failure handling:
   saying which container answered. One started just before a deploy's
   switch still finishes on the old version: the platform stops it only once
   its requests are done (up to 15s).
+- **A database:** press "Add a database" on its page, then deploy. `/visits`
+  counts visits in it ("Visits: 3"), and the count survives deploys, the
+  database's container being recreated, and a backup restored. Without a
+  database it answers 404.
 - **Graceful shutdown:** on SIGTERM (how Docker stops a container), it stops
   taking new connections and finishes the requests it has, within 9s.
 

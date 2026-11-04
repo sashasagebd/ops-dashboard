@@ -17,15 +17,18 @@ import (
 // fakes is the store, Docker and the deployer at once, recording what the
 // reconciler did as "actions".
 type fakes struct {
-	apps       []store.App
-	appsLater  []store.App // what Apps returns from its second call on, if set
-	appsCalls  int
-	live       map[int64]store.Deployment // by app ID
-	containers []engine.ManagedContainer
-	exit       engine.ExitInfo
-	logs       []engine.LogLine
-	startErr   error
-	removeErr  error
+	apps        []store.App
+	appsLater   []store.App // what Apps returns from its second call on, if set
+	appsCalls   int
+	live        map[int64]store.Deployment // by app ID
+	dbs         []store.Database
+	provisioned []int64 // apps MarkDatabaseProvisioned was called for
+	runDBErr    error
+	containers  []engine.ManagedContainer
+	exit        engine.ExitInfo
+	logs        []engine.LogLine
+	startErr    error
+	removeErr   error
 
 	locked      map[int64]bool // apps with a deploy running
 	recreateErr error
@@ -55,6 +58,29 @@ func (f *fakes) CurrentDeployment(_ context.Context, appID int64) (store.Deploym
 		return store.Deployment{}, store.ErrNotFound
 	}
 	return d, nil
+}
+
+func (f *fakes) Databases(context.Context) ([]store.Database, error) { return f.dbs, nil }
+
+func (f *fakes) MarkDatabaseProvisioned(_ context.Context, appID int64) error {
+	f.provisioned = append(f.provisioned, appID)
+	return nil
+}
+
+func (f *fakes) RunDatabase(_ context.Context, app store.App, _ store.Database) error {
+	f.actions = append(f.actions, "run database "+app.Name)
+	if f.runDBErr != nil {
+		return f.runDBErr
+	}
+	f.containers = append(f.containers, dbContainer(app.Name, "running"))
+	return nil
+}
+
+func dbContainer(app, state string) engine.ManagedContainer {
+	return engine.ManagedContainer{
+		ID: "db-" + app, Name: deploy.DatabaseName(app), State: state,
+		Labels: map[string]string{engine.LabelApp: app, engine.LabelRole: engine.RoleDatabase},
+	}
 }
 
 func (f *fakes) AddEvent(_ context.Context, e store.NewEvent) error {
@@ -434,5 +460,93 @@ func TestEventsArePrunedHourly(t *testing.T) {
 	r.Pass(t.Context()) // an hour after the first
 	if len(f.pruned) != 2 || !f.pruned[0].Equal(newClock().t.Add(-30*24*time.Hour)) {
 		t.Errorf("pruned at %v, want twice (an hour apart), keeping 30 days", f.pruned)
+	}
+}
+
+func TestCreatesAnAppsDatabase(t *testing.T) {
+	f := newFakes()
+	f.dbs = []store.Database{{AppID: 1, Password: "pw"}} // just added: never created
+	r := f.reconciler(newClock())
+	if err := r.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.actions, []string{"run database hello"}) || !slices.Equal(f.provisioned, []int64{1}) {
+		t.Errorf("actions %q, provisioned %v; want it created and recorded", f.actions, f.provisioned)
+	}
+	if len(f.events) != 1 || f.events[0].Kind != store.EventDatabaseCreated ||
+		!strings.Contains(f.events[0].Message, "DATABASE_URL from its next deploy") {
+		t.Errorf("events = %+v", f.events)
+	}
+	// Running now: the next pass leaves it, and the app's container, alone.
+	r.Pass(t.Context())
+	if len(f.actions) != 1 {
+		t.Errorf("actions = %q, want nothing more", f.actions)
+	}
+}
+
+func TestADeletedDatabaseIsRecreatedWithItsData(t *testing.T) {
+	f := newFakes()
+	now := time.Now()
+	f.dbs = []store.Database{{AppID: 1, Password: "pw", ProvisionedAt: &now}} // created before; container gone
+	f.reconciler(newClock()).Pass(t.Context())
+	if !slices.Equal(f.actions, []string{"run database hello"}) || len(f.events) != 1 ||
+		f.events[0].Kind != store.EventRecreated || !strings.Contains(f.events[0].Message, "data was kept on the volume ops-db-hello") {
+		t.Errorf("actions %q, events %+v; want it recreated, saying its data was kept", f.actions, f.events)
+	}
+}
+
+func TestAStoppedDatabaseIsRestarted(t *testing.T) {
+	f := newFakes()
+	now := time.Now()
+	f.dbs = []store.Database{{AppID: 1, Password: "pw", ProvisionedAt: &now}}
+	f.containers = append(f.containers, dbContainer("hello", "exited"))
+	f.exit = engine.ExitInfo{ExitCode: 0}
+	r := f.reconciler(newClock())
+	r.Pass(t.Context())
+	if !slices.Equal(f.actions, []string{"start db-hello"}) || len(f.events) != 1 ||
+		f.events[0].Message != "Restarted hello: its database ops-db-hello had exited with code 0" {
+		t.Errorf("actions %q, events %+v", f.actions, f.events)
+	}
+	// The database's backoff is its own: the app's container crashing now
+	// is restarted straight away.
+	f.setState("hello-6", "exited")
+	r.Pass(t.Context())
+	if !slices.Contains(f.actions, "start hello-6") {
+		t.Errorf("actions = %q, want the app's container restarted too", f.actions)
+	}
+}
+
+func TestADatabaseIsNeverAnAppOrphan(t *testing.T) {
+	// A database container has no deployment label; it mustn't be taken
+	// for a leftover of a deploy.
+	f := newFakes()
+	now := time.Now()
+	f.dbs = []store.Database{{AppID: 1, Password: "pw", ProvisionedAt: &now}}
+	f.containers = append(f.containers, dbContainer("hello", "running"))
+	f.reconciler(newClock()).Pass(t.Context())
+	if len(f.actions) != 0 {
+		t.Errorf("actions = %q, want none", f.actions)
+	}
+	// Without a database row, it is one (its volume stays).
+	f.dbs = nil
+	f.reconciler(newClock()).Pass(t.Context())
+	if !slices.Equal(f.actions, []string{"remove db-hello"}) {
+		t.Errorf("actions = %q, want the unowned database container removed", f.actions)
+	}
+}
+
+func TestDatabaseCreationFailingIsRecordedOnce(t *testing.T) {
+	f := newFakes()
+	f.dbs = []store.Database{{AppID: 1, Password: "pw"}}
+	f.runDBErr = errors.New("pull failed: registry unreachable")
+	r := f.reconciler(newClock())
+	for range 3 {
+		r.Pass(t.Context())
+	}
+	if len(f.events) != 1 || f.events[0].Kind != store.EventFixFailed || f.events[0].Message != "Creating hello's database ops-db-hello failed" {
+		t.Errorf("events = %+v", f.events)
+	}
+	if len(f.provisioned) != 0 {
+		t.Error("recorded as created although creating it failed")
 	}
 }

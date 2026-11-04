@@ -60,6 +60,8 @@ func translate(err error) error {
 			return fmt.Errorf("%w: an app with that hostname already exists", ErrConflict)
 		case "deployments_one_in_progress_per_app":
 			return ErrDeployInProgress
+		case "app_databases_pkey":
+			return fmt.Errorf("%w: the app already has a database", ErrConflict)
 		}
 		return ErrConflict
 	case foreignKeyViolation:
