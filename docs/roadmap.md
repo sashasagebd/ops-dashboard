@@ -18,14 +18,19 @@ _Last updated: 2026-11-04_
 | P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
 | P1: Manual deploy of one app | ✅ Done, deployed 2026-11-03 |
 | P2: Push-to-deploy, job queue, live logs | ✅ Done, deployed 2026-11-03 (PR #7) |
-| P3: Zero-downtime deploys and rollbacks | 🚧 In progress (plan approved 2026-11-04) |
+| P3: Zero-downtime deploys and rollbacks | ✅ Done, deployed 2026-11-04 (PR #9) |
 
-**Where we left off (2026-11-04):** P0, P1 and P2 are done and deployed.
+**Where we left off (2026-11-04):** P0 to P3 are done and deployed.
 Pushing to `main` deploys `examples/hello` with no clicks, the build log
 streams live, and a platform killed mid-build finishes the same deploy after
-it restarts. P3's plan is approved (below); work is on the `platform-p3`
-branch.
-**Next:** 3.2 (rollback) is written; after CI, the server checks of P3's done-when, then merge and deploy.
+it restarts. Deploys have no downtime (the old version drains before it's
+stopped), a broken deploy never goes live, and any of an app's last 5
+previous versions can be rolled back to from the dashboard, with no build.
+**Next:** plan P4 (reconciliation and crash recovery; see
+[platform-plan.md](platform-plan.md)). Some of it exists (routes re-applied
+and orphans removed at startup, Docker's restart policy for crashed apps),
+so the plan should start from what's left: a continuous reconciler loop,
+its events in the dashboard, and the Caddy memory note below.
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -41,7 +46,9 @@ Notes for resuming:
   CI couldn't.
 - **Footprint** (idle, `docker stats`): after P1, platform 7.7 MiB,
   Postgres 35 MiB, Caddy 10 MiB. After P2's server checks: platform
-  8.3 MiB, Postgres 67 MiB (warm cache), Caddy 52 MiB. **Watch Caddy:**
+  8.3 MiB, Postgres 67 MiB (warm cache), Caddy 52 MiB. After P3's server
+  checks: platform 8.7 MiB, Postgres 69 MiB, Caddy 56 MiB, hello 1.7 MiB.
+  **Watch Caddy:**
   each route update rebuilds its config, and Go holds freed memory until it
   needs to return it; it caps itself near its 128 MiB limit (`GOMEMLIMIT`,
   ~115 MiB). If it keeps climbing over days, look at it in P4.
@@ -396,7 +403,7 @@ Decisions (approved 2026-11-03), with entries in
 - **SSE, not WebSockets,** for streaming logs: one-way, works through the
   dashboard's plain HTTP proxy, and browsers reconnect on their own.
 
-## P3: Zero-downtime deploys and rollbacks 🚧
+## P3: Zero-downtime deploys and rollbacks ✅
 
 Phase 3 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-04.
 
@@ -413,10 +420,24 @@ rollback, and built images are never removed.
 | Step | What | Status |
 |---|---|---|
 | 3.1 | **Drain the old container, and prove there's no downtime.** First, confirm what Caddy does with in-flight proxied requests on a config change (and how that interacts with the router's 10s client timeout); set an explicit `grace_period` on the `apps` server. After the route switch, wait until Caddy's `GET /reverse_proxy/upstreams` shows no requests in flight to the old upstream (bounded, ~15s), then stop it (SIGTERM, 10s stop timeout). `examples/hello` shuts down gracefully on SIGTERM, and `BROKEN=1` makes its `/healthz` answer 500 (a broken deploy on purpose). CI: requests in a loop against hello during a redeploy, zero failures; a slow request started just before the switch completes; a broken deploy leaves the old version serving. | ✅ `3799b91`, CI green. From Caddy's source: a config change returns once the old config *starts* shutting down (no clash with the 10s timeout), and in-flight counts per upstream survive config changes, so the drain works as planned. `grace_period` **not** set (it's the whole `http` app's setting, not the platform's server, and `--resume` ignores `caddy.json`); the 15s cap plus stopping the container bounds it instead. Drain checks every 250ms. Beyond the plan: a live deployment whose job is given up isn't marked failed (its log says the switch was cut off); `hello` gained `/slow?seconds=N`. Details in [decisions/platform.md](decisions/platform.md) ("Draining the old version"). |
-| 3.2 | **One-click rollback, end to end.** Migration 0008 (`deployments.rollback_of`). A rollback is a new deployment reusing the target's image: queued → starting (no build) → probe → switch → drain; the version it replaces becomes `rolled_back`. Same job kind and one-in-progress rule (409 while a deploy runs). `POST /api/platform/apps/{id}/deployments/{deploymentId}/rollback` → 202; the target must have been live once and still have its image; deployments get `rollbackable`. Engine: image inspect and remove. Image retention: after a successful deploy, keep the live image plus the last 5 previously live per app, remove the rest. UI: a Rollback button (with confirm) on eligible rows, "rollback of #N", a notice that auto-deploy was turned off. CI rolls back through the dashboard (no build lines in its log) and checks the old version is served. Decision entries; server checks of the done-when. | 🔍 Written, awaiting review and CI; then the server checks. Migration 0008 (`rollback_of`, a foreign key on `(app_id, rollback_of)` so the database refuses another app's deployment). `store.CheckRollback` decides what's rollbackable, for both the API flag and `CreateRollback`. Image cleanup goes by what Docker lists for the app (tags not kept, and untagged images left by a redeploy of the same commit); never forced. CI deploys this commit's parent, then this commit, rolls back to the parent while the visitor keeps requesting, and checks the image, the `rolled_back` status, no build, auto-deploy off, and a 409 for rolling back to what's live. Details in [decisions/platform.md](decisions/platform.md) ("How rollbacks and image cleanup work"). |
+| 3.2 | **One-click rollback, end to end.** Migration 0008 (`deployments.rollback_of`). A rollback is a new deployment reusing the target's image: queued → starting (no build) → probe → switch → drain; the version it replaces becomes `rolled_back`. Same job kind and one-in-progress rule (409 while a deploy runs). `POST /api/platform/apps/{id}/deployments/{deploymentId}/rollback` → 202; the target must have been live once and still have its image; deployments get `rollbackable`. Engine: image inspect and remove. Image retention: after a successful deploy, keep the live image plus the last 5 previously live per app, remove the rest. UI: a Rollback button (with confirm) on eligible rows, "rollback of #N", a notice that auto-deploy was turned off. CI rolls back through the dashboard (no build lines in its log) and checks the old version is served. Decision entries; server checks of the done-when. | ✅ `0e2cd25`, merged in PR #9 and deployed 2026-11-04. Migration 0008 (`rollback_of`, a foreign key on `(app_id, rollback_of)` so the database refuses another app's deployment). `store.CheckRollback` decides what's rollbackable, for both the API flag and `CreateRollback`. Image cleanup goes by what Docker lists for the app (tags not kept, and untagged images left by a redeploy of the same commit); never forced. CI deploys this commit's parent, then this commit, rolls back to the parent while the visitor keeps requesting, and checks the image, the `rolled_back` status, no build, auto-deploy off, and a 409 for rolling back to what's live. Details in [decisions/platform.md](decisions/platform.md) ("How rollbacks and image cleanup work"). |
 
-Decisions (approved 2026-11-04), to be written up in
-[decisions/platform.md](decisions/platform.md) as they land:
+Verified on the server (2026-11-04, Docker 29.8.1): both done-when points.
+- **Setup:** migration 8 applied on deploy (`applied=[8]`).
+- **No downtime:** a visitor loop on the server requested hello every 0.5s
+  through a broken deploy, redeploys and a rollback: 648 requests, all 200.
+- **Broken deploy:** with `BROKEN=1`, the deploy failed its health check and
+  never went live; the previous version served throughout.
+- **Rollback from the dashboard:** the rollback went live with no build;
+  afterwards the only hello container was `app-hello-13`, running an earlier
+  deployment's image (`ops-platform/hello:d7f7c51`).
+- **Image cleanup:** 6 hello images left, exactly the cap.
+- Not reported: the slow-request drain check (3b; CI covers it on its own
+  Docker), and whether hello's auto-deploy was turned back on afterwards (if
+  not, pushes to `main` don't deploy hello).
+
+Decisions (approved 2026-11-04), with entries in
+[decisions/platform.md](decisions/platform.md):
 - **A rollback is a new deployment,** not the old row made healthy again:
   statuses stay forward-only and the history reads truthfully ("#12:
   rollback of #9").
