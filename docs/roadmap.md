@@ -19,16 +19,20 @@ _Last updated: 2026-11-04_
 | P1: Manual deploy of one app | ✅ Done, deployed 2026-11-03 |
 | P2: Push-to-deploy, job queue, live logs | ✅ Done, deployed 2026-11-03 (PR #7) |
 | P3: Zero-downtime deploys and rollbacks | ✅ Done, deployed 2026-11-04 (PR #9) |
-| P4: Reconciliation and crash recovery | 🚧 In progress (plan approved 2026-11-04) |
+| P4: Reconciliation and crash recovery | ✅ Done, deployed 2026-11-04 (PR #11) |
 
-**Where we left off (2026-11-04):** P0 to P3 are done and deployed.
+**Where we left off (2026-11-04):** P0 to P4 are done and deployed.
 Pushing to `main` deploys `examples/hello` with no clicks, the build log
 streams live, and a platform killed mid-build finishes the same deploy after
 it restarts. Deploys have no downtime (the old version drains before it's
 stopped), a broken deploy never goes live, and any of an app's last 5
 previous versions can be rolled back to from the dashboard, with no build.
-P4's plan is approved (below); work is on the `platform-p4` branch.
-**Next:** 4.2 (events in the dashboard, and the server checks); 4.1 (the reconciler loop) is done, CI green.
+A reconciler keeps what runs in line with the database every 10s: a killed
+or deleted app container, a lost route, or a whole-server reboot all come
+back on their own, each fix shown as an event in the dashboard.
+**Next:** plan P5 (databases for apps and observability; see
+[platform-plan.md](platform-plan.md)), with the first real app, the
+pokewordle backend, and the domain question below.
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -46,10 +50,12 @@ Notes for resuming:
   Postgres 35 MiB, Caddy 10 MiB. After P2's server checks: platform
   8.3 MiB, Postgres 67 MiB (warm cache), Caddy 52 MiB. After P3's server
   checks: platform 8.7 MiB, Postgres 69 MiB, Caddy 56 MiB, hello 1.7 MiB.
-  **Watch Caddy:**
-  each route update rebuilds its config, and Go holds freed memory until it
-  needs to return it; it caps itself near its 128 MiB limit (`GOMEMLIMIT`,
-  ~115 MiB). If it keeps climbing over days, look at it in P4.
+  After P4's reboot (measured 30s after boot): platform 18.7 MiB, Postgres
+  65 MiB, Caddy 51 MiB, hello 7.2 MiB. **Caddy:** each route update rebuilds
+  its config, and Go holds freed memory until it needs to return it; it caps
+  itself near its 128 MiB limit (`GOMEMLIMIT`, ~115 MiB). Since P4 the
+  reconciler only applies routes when Caddy's differ, so an idle platform
+  no longer causes rebuilds. If Caddy still climbs over days, look again.
 - M5's 5.5 (README) and 5.6 (`v1.0.0` tag) are set aside; the README gets
   rewritten for the platform later.
 
@@ -447,7 +453,7 @@ Decisions (approved 2026-11-04), with entries in
 - **Five previously live images are kept per app** (plus the live one),
   which is how far back a rollback can go.
 
-## P4: Reconciliation and crash recovery 🚧
+## P4: Reconciliation and crash recovery ✅
 
 Phase 4 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-04.
 
@@ -465,10 +471,35 @@ and nothing records or shows what was fixed.
 | Step | What | Status |
 |---|---|---|
 | 4.1 | **The reconciler loop.** `internal/reconcile`, every 10s: desired state from Postgres (each app's live deployment and route) against actual state from Docker (managed containers only) and Caddy (its current routes). Fixes: a live container that's stopped is started again; one that's gone is recreated from its deployment's image (same name, so its route reaches it); orphans are removed; Caddy's routes are re-applied only if they differ from the database's (also fewer config reloads, see the Caddy note). Skips any app with a deploy attempt running (a per-app lock shared with the deployer, covering the drain too). Crash loops back off (10s, doubling, up to 5 min) with a "crash-looping" event. The startup cleanup becomes its first pass, still before the workers start. New app containers get restart policy `no`. Each fix is a row in `reconciler_events` (app, kind, message; a crash's last 20 output lines), kept 30 days. CI: `docker kill` and `docker rm -f` on hello, back within ~20s; its route deleted through Caddy's admin API, back; an unlabelled container and a stopped one, untouched. | ✅ `dcd1e50`, CI green. Migration 0009 (`reconciler_events`). Beyond the plan: a pass does **routes first**, and removes orphans only once Caddy's routes are known to match the database (a deploy whose route switch failed keeps the old container because Caddy still routes to it; removing it first would take the site down). A `dead` live container is removed and recreated. A fix that keeps failing is recorded once, not every pass. Containers of apps that no longer exist are removed (after re-listing apps, so a just-registered app isn't mistaken for a deleted one). CI also stops hello while the platform is down (a reboot, in miniature) and checks the first pass starts it; its teardown now stops the platform first, or the reconciler recreates what it removes. Details in [decisions/platform.md](decisions/platform.md) ("How the reconciler works"). |
-| 4.2 | **Events in the dashboard, and the server checks.** `GET /api/platform/events` (all apps) and events in the app detail. "Recent events" on the Apps page and each app's page ("restarted hello: container exited (code 137)"), a crash's last lines expandable. CI reads events through the dashboard. Decision entries. Server checks: `docker kill`, deleting the route, and a real `sudo reboot`. | 🔍 Written, awaiting review and CI; then the server checks. API: `events` in the app detail (last 20) and `GET /api/platform/events` (last 50). UI: "Recent events" on the Apps page (polled every 10s, like the apps) and "Events" on each app's page, with a badge per kind and a crash's output folding out. CI reads hello's events and the routes fix through the dashboard. |
+| 4.2 | **Events in the dashboard, and the server checks.** `GET /api/platform/events` (all apps) and events in the app detail. "Recent events" on the Apps page and each app's page ("restarted hello: container exited (code 137)"), a crash's last lines expandable. CI reads events through the dashboard. Decision entries. Server checks: `docker kill`, deleting the route, and a real `sudo reboot`. | ✅ `acc52ef`, merged in PR #11 and deployed 2026-11-04. API: `events` in the app detail (last 20) and `GET /api/platform/events` (last 50). UI: "Recent events" on the Apps page (polled every 10s, like the apps) and "Events" on each app's page, with a badge per kind and a crash's output folding out. CI reads hello's events and the routes fix through the dashboard. |
 
-Decisions (approved 2026-11-04), to be written up in
-[decisions/platform.md](decisions/platform.md) as they land:
+Verified on the server (2026-11-04, Docker 29.8.1): all three done-when
+points.
+- **Setup:** migration 9 applied on deploy, and the first reconcile pass
+  ran. hello's container from before the deploy still had `unless-stopped`
+  (the merge's push had deployed it through the old platform); a fresh
+  "Deploy latest" gave it restart policy `no`, so the checks below were the
+  reconciler's work, not Docker's.
+- **`docker kill`:** the same container (`app-hello-16`) was started again
+  within a pass ("had exited with code 137"); its `StartedAt` matched the
+  log line to the second.
+- **`docker rm -f`:** recreated under the same name (a new container ID),
+  serving straight away through the unchanged route.
+- **Route deleted** through Caddy's admin API: re-applied within seconds
+  ("re-applied Caddy's routes"), before the next request even saw it
+  missing.
+- **`sudo reboot`:** Docker brought back the compose services, `mc` and the
+  Discord bot by their own policies; the platform's first pass started
+  `app-hello-16` a second after it came up ("had exited with code 0":
+  Docker had stopped it cleanly at shutdown), and hello answered 38s into
+  the boot. Tailscale Funnel came back on `:8443` by itself (the reboot
+  check left open since P2).
+- Not reported: the uptime check of `mc` and the bot before the reboot
+  (step 6); CI checks unmanaged containers are untouched, and the reconciler
+  only lists containers with the platform's label.
+
+Decisions (approved 2026-11-04), with entries in
+[decisions/platform.md](decisions/platform.md):
 - **The reconciler restarts crashed apps, not Docker:** new app containers
   get restart policy `no`. One actor, backoff under the platform's control,
   and every crash becomes an event with its last lines (with Docker
