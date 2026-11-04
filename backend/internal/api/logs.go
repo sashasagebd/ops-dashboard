@@ -206,7 +206,7 @@ func (a *api) appLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	if containerID == "" {
 		// Docker and the database disagree (e.g. the container was
-		// removed by hand); P4's reconciler fixes that.
+		// removed by hand); the reconciler fixes that within seconds.
 		writeJSON(w, http.StatusNotFound, errorResponse{"the live deployment's container isn't running"})
 		return
 	}

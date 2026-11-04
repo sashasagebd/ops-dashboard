@@ -101,6 +101,49 @@ func (c *Caddy) Probe(ctx context.Context, host, path string) (int, error) {
 	return resp.StatusCode, nil
 }
 
+// Routes returns the routes Caddy has now, in the platform's terms, for the
+// reconciler to compare with what it should have. A route in any shape Apply
+// doesn't produce (edited by hand, say) comes back with an empty Upstream, so
+// it never matches a wanted route. If the platform's server is missing
+// altogether (Caddy started without its saved config), that's no routes.
+func (c *Caddy) Routes(ctx context.Context) ([]Route, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.AdminURL+serverPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reading routes: %w", err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode >= 400 && resp.StatusCode < 500:
+		// Caddy answers 4xx for a path into config that doesn't exist.
+		return []Route{}, nil
+	case resp.StatusCode != http.StatusOK:
+		return nil, fmt.Errorf("reading routes: Caddy answered %s", resp.Status)
+	}
+	var server *caddyServer // "null" if the server was removed
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&server); err != nil {
+		return nil, fmt.Errorf("reading routes: %w", err)
+	}
+	out := []Route{}
+	if server == nil {
+		return out, nil
+	}
+	for _, r := range server.Routes {
+		var route Route
+		if len(r.Match) == 1 && len(r.Match[0].Host) == 1 {
+			route.Host = r.Match[0].Host[0]
+		}
+		if len(r.Handle) == 1 && r.Handle[0].Handler == "reverse_proxy" && len(r.Handle[0].Upstreams) == 1 && r.Terminal {
+			route.Upstream = r.Handle[0].Upstreams[0].Dial
+		}
+		out = append(out, route)
+	}
+	return out, nil
+}
+
 // InFlight returns how many requests Caddy is proxying to each upstream right
 // now, by dial address (e.g. "app-hello-7:8080"); upstreams with none may be
 // missing.

@@ -19,6 +19,7 @@ _Last updated: 2026-11-04_
 | P1: Manual deploy of one app | ✅ Done, deployed 2026-11-03 |
 | P2: Push-to-deploy, job queue, live logs | ✅ Done, deployed 2026-11-03 (PR #7) |
 | P3: Zero-downtime deploys and rollbacks | ✅ Done, deployed 2026-11-04 (PR #9) |
+| P4: Reconciliation and crash recovery | 🚧 In progress (plan approved 2026-11-04) |
 
 **Where we left off (2026-11-04):** P0 to P3 are done and deployed.
 Pushing to `main` deploys `examples/hello` with no clicks, the build log
@@ -26,11 +27,8 @@ streams live, and a platform killed mid-build finishes the same deploy after
 it restarts. Deploys have no downtime (the old version drains before it's
 stopped), a broken deploy never goes live, and any of an app's last 5
 previous versions can be rolled back to from the dashboard, with no build.
-**Next:** plan P4 (reconciliation and crash recovery; see
-[platform-plan.md](platform-plan.md)). Some of it exists (routes re-applied
-and orphans removed at startup, Docker's restart policy for crashed apps),
-so the plan should start from what's left: a continuous reconciler loop,
-its events in the dashboard, and the Caddy memory note below.
+P4's plan is approved (below); work is on the `platform-p4` branch.
+**Next:** 4.2 (events in the dashboard, and the server checks); 4.1 (the reconciler loop) is done, CI green.
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -449,6 +447,48 @@ Decisions (approved 2026-11-04), with entries in
 - **Five previously live images are kept per app** (plus the live one),
   which is how far back a rollback can go.
 
+## P4: Reconciliation and crash recovery 🚧
+
+Phase 4 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-04.
+
+**Done when** (from the plan): `docker kill`-ing a managed container,
+deleting its route, or restarting the whole server all result in apps coming
+back on their own, without touching unmanaged containers.
+
+Already in place: at startup, the platform re-applies routes from the
+database and removes orphaned app containers, before the job workers start;
+Docker's `unless-stopped` restart policy brings a crashed app back, silently.
+What's left: nothing runs continuously (a container or route deleted, or an
+orphan left, while the platform runs stays that way until its next restart),
+and nothing records or shows what was fixed.
+
+| Step | What | Status |
+|---|---|---|
+| 4.1 | **The reconciler loop.** `internal/reconcile`, every 10s: desired state from Postgres (each app's live deployment and route) against actual state from Docker (managed containers only) and Caddy (its current routes). Fixes: a live container that's stopped is started again; one that's gone is recreated from its deployment's image (same name, so its route reaches it); orphans are removed; Caddy's routes are re-applied only if they differ from the database's (also fewer config reloads, see the Caddy note). Skips any app with a deploy attempt running (a per-app lock shared with the deployer, covering the drain too). Crash loops back off (10s, doubling, up to 5 min) with a "crash-looping" event. The startup cleanup becomes its first pass, still before the workers start. New app containers get restart policy `no`. Each fix is a row in `reconciler_events` (app, kind, message; a crash's last 20 output lines), kept 30 days. CI: `docker kill` and `docker rm -f` on hello, back within ~20s; its route deleted through Caddy's admin API, back; an unlabelled container and a stopped one, untouched. | ✅ `dcd1e50`, CI green. Migration 0009 (`reconciler_events`). Beyond the plan: a pass does **routes first**, and removes orphans only once Caddy's routes are known to match the database (a deploy whose route switch failed keeps the old container because Caddy still routes to it; removing it first would take the site down). A `dead` live container is removed and recreated. A fix that keeps failing is recorded once, not every pass. Containers of apps that no longer exist are removed (after re-listing apps, so a just-registered app isn't mistaken for a deleted one). CI also stops hello while the platform is down (a reboot, in miniature) and checks the first pass starts it; its teardown now stops the platform first, or the reconciler recreates what it removes. Details in [decisions/platform.md](decisions/platform.md) ("How the reconciler works"). |
+| 4.2 | **Events in the dashboard, and the server checks.** `GET /api/platform/events` (all apps) and events in the app detail. "Recent events" on the Apps page and each app's page ("restarted hello: container exited (code 137)"), a crash's last lines expandable. CI reads events through the dashboard. Decision entries. Server checks: `docker kill`, deleting the route, and a real `sudo reboot`. | 🔍 Written, awaiting review and CI; then the server checks. API: `events` in the app detail (last 20) and `GET /api/platform/events` (last 50). UI: "Recent events" on the Apps page (polled every 10s, like the apps) and "Events" on each app's page, with a badge per kind and a crash's output folding out. CI reads hello's events and the routes fix through the dashboard. |
+
+Decisions (approved 2026-11-04), to be written up in
+[decisions/platform.md](decisions/platform.md) as they land:
+- **The reconciler restarts crashed apps, not Docker:** new app containers
+  get restart policy `no`. One actor, backoff under the platform's control,
+  and every crash becomes an event with its last lines (with Docker
+  restarting silently, the reconciler would only see a restart count go
+  up). The cost: while the platform itself is down, a crashed app stays
+  down, and after a reboot apps come back with the platform (seconds after
+  Postgres), not with Docker. Existing containers keep `unless-stopped`
+  until their next deploy.
+- **Polling every 10s, not Docker's event stream:** events would need the
+  `EVENTS` proxy group (a new Docker permission) to react seconds sooner. A
+  pass costs one container list and one Caddy GET.
+- **An in-process per-app lock** coordinates the reconciler with deploys,
+  not Postgres advisory locks: there's only ever one platform process (the
+  startup cleanup already relies on it), and several instances are a
+  non-goal.
+- **A deleted live container is recreated directly,** with no new
+  deployment and no health-check gate: the site is down already, and the
+  next pass checks again. A redeploy would rebuild, take minutes and clutter
+  the history.
+
 ## Open questions
 
 - **Domain for public apps** (deferred, not blocking P1 or P2). The owner
@@ -470,6 +510,7 @@ Resolved:
 - **P1 plan** approved 2026-11-02.
 - **P2 plan** approved 2026-11-03.
 - **P3 plan** approved 2026-11-04.
+- **P4 plan** approved 2026-11-04.
 - **Docker version on the server** (2026-11-02): 29.8.1, API 1.56; see P1's
   risks for what it means for building.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a

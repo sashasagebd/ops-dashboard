@@ -435,6 +435,70 @@ jobs:
           test "$(wc -l < /tmp/load.txt)" -ge 50 || on_failure
           test "$(docker ps -q --filter label=ops.platform.app=hello | wc -l)" = 1 || on_failure
 
+          # Reconciliation: hello is broken from outside the platform in four
+          # ways, and each time the reconciler (a pass every 10s) puts it
+          # back by itself. Containers the platform doesn't own, one running
+          # and one stopped, stay exactly as they are throughout.
+          docker run -d --name ci-unmanaged busybox:1.37.0 sleep 600
+          docker create --name ci-unmanaged-stopped busybox:1.37.0 true
+          # Waits up to 40s for hello to answer through Caddy's published port.
+          hello_back() {
+            for i in $(seq 1 40); do
+              curl -fsS --max-time 2 -H 'Host: hello.apps.test' http://127.0.0.1/healthz 2>/dev/null | grep ok > /dev/null && return 0
+              sleep 1
+            done
+            return 1
+          }
+          # Waits up to 40s for the platform to log $1 since $SINCE.
+          logged() {
+            for i in $(seq 1 40); do
+              docker compose logs --no-log-prefix --since "$SINCE" platform | grep "$1" && return 0
+              sleep 1
+            done
+            return 1
+          }
+          HELLO_NAME=$(docker ps --filter label=ops.platform.app=hello --format '{{.Names}}')
+          # 1. Killed (as a crash would): the same container is started again.
+          #    Its restart policy is "no", so it's the reconciler, not Docker.
+          test "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$HELLO_NAME")" = no || on_failure
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          docker kill "$HELLO_NAME"
+          logged "restarted an app's container.*app=hello" || on_failure
+          hello_back || on_failure
+          # 2. Deleted: recreated under the same name.
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          docker rm -f "$HELLO_NAME"
+          logged "recreated an app's container.*app=hello" || on_failure
+          hello_back || on_failure
+          test "$(docker ps --filter label=ops.platform.app=hello --format '{{.Names}}')" = "$HELLO_NAME" || on_failure
+          # 3. Its route deleted through Caddy's admin API (routes are in app
+          #    name order, so hello's is the first): re-applied.
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          docker run --rm --network dashboard_caddy-admin curlimages/curl:8.11.1 -fsS -X DELETE \
+            http://10.203.0.2:2019/config/apps/http/servers/apps/routes/0
+          logged "re-applied Caddy's routes" || on_failure
+          hello_back || on_failure
+          # 4. Stopped while the platform is down, as in a reboot: the
+          #    platform's first pass starts it.
+          docker compose stop platform
+          docker stop "$HELLO_NAME"
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          docker compose start platform
+          logged 'first reconcile pass done' || on_failure
+          hello_back || on_failure
+          # Untouched, after all those passes.
+          test "$(docker inspect -f '{{.State.Status}}' ci-unmanaged)" = running || on_failure
+          test "$(docker inspect -f '{{.State.Status}}' ci-unmanaged-stopped)" = created || on_failure
+          docker rm -f ci-unmanaged ci-unmanaged-stopped
+          # Each fix is an event, read through the dashboard as its pages do:
+          # hello's own (the kill's restart with hello's last output lines,
+          # the recreate, the first pass's restart) and the routes fix,
+          # which is about no app.
+          dash GET "/api/platform/apps/$APP" | jq '.events' > /tmp/events.json
+          jq -e 'map(.kind) | index("restarted") and index("recreated")' /tmp/events.json || { cat /tmp/events.json; on_failure; }
+          jq -e 'map(select(.kind == "restarted")) | last | .output | length > 0' /tmp/events.json || { cat /tmp/events.json; on_failure; }
+          dash GET /api/platform/events | jq -e 'map(select(.kind == "routes_reapplied" and .appId == null)) | length > 0' || on_failure
+
           # A source directory that doesn't exist fails with a clear reason
           # (found mid-stream, so this also checks the reason survives
           # Docker's client).
@@ -459,11 +523,14 @@ jobs:
           docker compose restart caddy
           sleep 2
           visit selftest.apps.test /healthz | grep '"ok"' || on_failure
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           docker compose restart platform
           docker compose up -d --wait --wait-timeout 60 platform
           docker compose logs --no-log-prefix platform | grep 'database schema up to date' | tail -1 | grep -F 'applied=[]'
+          # Its own logs since the restart (the container's logs span every
+          # restart).
           for i in $(seq 1 15); do
-            docker compose logs --no-log-prefix platform | grep 'routes applied' && break
+            docker compose logs --no-log-prefix --since "$SINCE" platform | grep 'first reconcile pass done' && break
             [ "$i" = 15 ] && on_failure
             sleep 1
           done
@@ -481,6 +548,8 @@ jobs:
           visit selftest.apps.test /healthz | grep '"ok"' || on_failure
 
           # App containers aren't Compose's, so remove them first, or the
-          # apps network can't be deleted.
+          # apps network can't be deleted; with the platform stopped, or its
+          # reconciler would recreate them.
+          docker compose stop platform
           docker rm -f $(docker ps -aq --filter label=ops.platform.managed=true)
           docker compose down -v

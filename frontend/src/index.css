@@ -434,3 +434,33 @@ button:disabled {
   margin: 4px 0 0;
   font-size: 0.875rem;
 }
+
+/* The reconciler's events: one per line, a crash's output folded under it. */
+.events {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+}
+
+.events li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.events details {
+  margin-top: 4px;
+  font-size: 0.875rem;
+}
+
+.event-output {
+  margin: 4px 0 0;
+  padding: 8px;
+  max-height: 16rem;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 0.8125rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}

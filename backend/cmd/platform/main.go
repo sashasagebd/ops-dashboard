@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/jobs"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/reconcile"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/router"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
@@ -151,20 +153,34 @@ func run(addr string) error {
 		RetryDelay:   15 * time.Second,
 	}, st, deployer)
 	deployer.Notify = runner.Wake
+	reconciler := reconcile.New(reconcile.Config{
+		Interval:    10 * time.Second,
+		MinBackoff:  10 * time.Second,
+		MaxBackoff:  5 * time.Minute,
+		StableAfter: 5 * time.Minute,
+		KeepEvents:  30 * 24 * time.Hour,
+		OutputLines: 20,
+	}, st, dockerClient, deployer)
 
-	// Caddy keeps routes in memory (plus its autosave), so it may have
-	// restarted or missed an update while the platform was down. Re-send the
-	// full table from the database, and clear away containers left by
-	// deploys that were cut off. Then start the job workers, which resume
-	// any deploy the platform was in the middle of: only afterwards, so the
-	// cleanup can't remove a container a deploy has just started. In the
-	// background, retrying until Caddy and Docker answer: neither should
-	// stop the API from starting, and deploys queue up meanwhile.
+	// The reconciler's first pass brings things back in line after the
+	// platform was down (or the whole server restarted): it starts stopped
+	// apps, re-applies Caddy's routes if they were lost, and removes
+	// containers left by deploys that were cut off. Then the job workers
+	// start, resuming any deploy the platform was in the middle of: only
+	// afterwards, so the cleanup can't remove a container a resumed deploy
+	// has just started. In the background, retrying until Docker and Caddy
+	// answer: neither should stop the API from starting, and deploys queue
+	// up meanwhile. After that, a pass every 10s.
 	workersDone := make(chan struct{})
 	go func() {
 		defer close(workersDone)
-		startupSync(ctx, deployer)
+		firstPass(ctx, reconciler)
+		// Both stop when ctx is done; waited for, so neither is still
+		// using the database when it closes.
+		var wg sync.WaitGroup
+		wg.Go(func() { reconciler.Run(ctx) })
 		runner.Run(ctx) // returns at once if ctx is already done
+		wg.Wait()
 	}()
 
 	// Only listen once the database is ready, so /healthz passing means the
@@ -233,19 +249,16 @@ func run(addr string) error {
 	return nil
 }
 
-// startupSync re-applies Caddy's routes and removes orphaned app containers,
-// retrying every 5s until both succeed or the platform shuts down.
-func startupSync(ctx context.Context, d *deploy.Deployer) {
+// firstPass makes the reconciler's first pass, retrying every 5s until it
+// succeeds or the platform shuts down.
+func firstPass(ctx context.Context, r *reconcile.Reconciler) {
 	for {
-		err := d.ApplyRoutes(ctx)
+		err := r.Pass(ctx)
 		if err == nil {
-			err = d.RemoveOrphans(ctx)
-		}
-		if err == nil {
-			slog.Info("routes applied and orphaned containers cleaned up")
+			slog.Info("first reconcile pass done: apps started, routes applied, orphans removed")
 			return
 		}
-		slog.Warn("startup sync failed; retrying in 5s", "err", err)
+		slog.Warn("first reconcile pass failed; retrying in 5s", "err", err)
 		select {
 		case <-ctx.Done():
 			return

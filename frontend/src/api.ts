@@ -113,6 +113,26 @@ export type PlatformApp = {
 export type AppDetail = PlatformApp & {
   envKeys: string[] // names only: values are write-only
   deployments: Deployment[] // newest first, at most 20
+  events: PlatformEvent[] // the reconciler's, newest first, at most 20
+}
+
+// EventKind is what the reconciler did about something it found wrong.
+export type EventKind =
+  | 'restarted' // a stopped app container started again
+  | 'recreated' // a missing app container created again
+  | 'crash_looping' // restarted again, backing off: it keeps stopping
+  | 'removed_orphan' // a container no live deployment uses, removed
+  | 'routes_reapplied' // Caddy's routes didn't match, re-applied
+  | 'fix_failed' // one of the above, tried and failed
+
+// PlatformEvent matches eventResponse.
+export type PlatformEvent = {
+  id: number
+  at: string // RFC 3339
+  appId: number | null // null if it isn't about one app
+  kind: EventKind
+  message: string
+  output: string[] // a crashed container's last lines, oldest first
 }
 
 // NewApp is the body of POST /api/platform/apps. Optional fields left out
@@ -163,6 +183,11 @@ export function fetchApps(signal?: AbortSignal): Promise<PlatformApp[]> {
 
 export function fetchApp(id: number, signal?: AbortSignal): Promise<AppDetail> {
   return getJSON<AppDetail>(`/api/platform/apps/${id}`, signal)
+}
+
+// fetchEvents is the reconciler's most recent events, for every app.
+export function fetchEvents(signal?: AbortSignal): Promise<PlatformEvent[]> {
+  return getJSON<PlatformEvent[]>('/api/platform/events', signal)
 }
 
 export function createApp(app: NewApp): Promise<PlatformApp> {

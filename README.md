@@ -185,6 +185,19 @@ Rolling back turns auto-deploy off, so that a push doesn't replace it; turn
 it back on once the fix is pushed. The platform keeps the images of each
 app's last 6 live versions, so a rollback can go back 5 versions.
 
+### Crash recovery
+
+Every 10 seconds the platform compares what should be running (in its
+database) with what Docker and Caddy actually have, and fixes the
+difference. A crashed or killed app is started again, and if it keeps
+crashing, the restarts back off up to 5 minutes apart. A deleted app
+container is recreated, a lost route is re-applied, and leftover containers
+are removed. The same check runs when the platform starts, so after a
+reboot, apps come back with it. It only ever touches containers the
+platform created, never the game servers or anything else on the host.
+Docker itself doesn't restart platform apps: the platform does, so it can
+record each crash.
+
 ### Updating
 
 ```sh

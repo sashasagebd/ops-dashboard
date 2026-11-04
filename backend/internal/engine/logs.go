@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +39,27 @@ func (c *Client) FollowLogs(ctx context.Context, id string, tail int, since time
 		opts.Since = fmt.Sprintf("%d.%09d", since.Unix(), since.Nanosecond())
 		opts.Tail = "all"
 	}
+	return c.readLogs(ctx, id, opts, emit)
+}
+
+// TailLogs returns a container's last n lines of output (running or not),
+// cleaned up like FollowLogs's, e.g. to record why a crashed app stopped.
+func (c *Client) TailLogs(ctx context.Context, id string, n int) ([]LogLine, error) {
+	var lines []LogLine
+	err := c.readLogs(ctx, id, client.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Timestamps: true,
+		Tail:       strconv.Itoa(n),
+	}, func(l LogLine) { lines = append(lines, l) })
+	// stdout and stderr are separated as they're read, so lines from the two
+	// arrive interleaved per chunk; Docker's timestamps put them back in
+	// order.
+	slices.SortStableFunc(lines, func(a, b LogLine) int { return a.At.Compare(b.At) })
+	return lines, err
+}
+
+func (c *Client) readLogs(ctx context.Context, id string, opts client.ContainerLogsOptions, emit func(LogLine)) error {
 	res, err := c.api.ContainerLogs(ctx, id, opts)
 	if err != nil {
 		return fmt.Errorf("reading container logs: %w", err)
