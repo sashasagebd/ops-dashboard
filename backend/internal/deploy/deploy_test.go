@@ -42,7 +42,9 @@ type fakes struct {
 	runSpec     engine.RunSpec
 	containers  []engine.ManagedContainer // what's running; Run adds, Remove takes away
 	removed     []string
-	onProbe     func() // hook, e.g. to cancel mid-check
+	onProbe     func()                              // hook, e.g. to cancel mid-check
+	inFlight    func(n int) (map[string]int, error) // Caddy's in-flight counts at the nth check; none if nil
+	drainChecks int
 
 	buildOutput []string // what Build reports as progress
 	priorBuild  int      // build lines stored by earlier attempts
@@ -288,6 +290,24 @@ func (f *fakes) Probe(context.Context, string, string) (int, error) {
 	return f.probeStatus(n), nil
 }
 
+func (f *fakes) InFlight(context.Context) (map[string]int, error) {
+	f.mu.Lock()
+	n := f.drainChecks
+	f.drainChecks++
+	fn := f.inFlight
+	f.mu.Unlock()
+	if fn == nil {
+		return map[string]int{}, nil
+	}
+	m, err := fn(n)
+	if err != nil {
+		f.event("in flight: error")
+	} else {
+		f.event("in flight %d", m["app-hello-6:8080"]+m["app-hello-3:8080"])
+	}
+	return m, err
+}
+
 func describe(routes []router.Route) string {
 	var parts []string
 	for _, r := range routes {
@@ -302,6 +322,8 @@ func (f *fakes) deployer() *Deployer {
 		DeployTimeout:  time.Minute,
 		HealthTimeout:  200 * time.Millisecond,
 		HealthInterval: time.Millisecond,
+		DrainTimeout:   200 * time.Millisecond,
+		DrainInterval:  time.Millisecond,
 	}, f, f, f, f)
 }
 
@@ -488,6 +510,115 @@ func TestShutdownDuringHealthCheck(t *testing.T) {
 	}
 	if !slices.Contains(f.removed, "new") {
 		t.Errorf("removed %v, want the half-started container removed", f.removed)
+	}
+}
+
+func TestDrainWaitsForInFlightRequests(t *testing.T) {
+	f := newFakes()
+	// Two requests still on the old version at the switch, then one, then
+	// none; the new version's own requests don't count.
+	f.inFlight = func(n int) (map[string]int, error) {
+		return map[string]int{"app-hello-6:8080": max(2-n, 0), "app-hello-7:8080": 5}, nil
+	}
+	if _, err := deploy(t, f, t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	i := slices.Index(f.events, "apply [hello.apps.test->app-hello-7:8080]")
+	want := []string{"apply [hello.apps.test->app-hello-7:8080]", "in flight 2", "in flight 1", "in flight 0", "remove old6", "remove stale3"}
+	if i < 0 || !slices.Equal(f.events[i:], want) {
+		t.Errorf("events:\n  got  %q\n  want them to end %q", f.events, want)
+	}
+	for _, l := range []string{
+		"platform: Waiting up to 200ms for the previous version's requests to finish (2 in flight)",
+		"platform: The previous version's requests have finished",
+	} {
+		if !slices.Contains(f.logLines, l) {
+			t.Errorf("log %q is missing %q", f.logLines, l)
+		}
+	}
+}
+
+func TestDrainIsBounded(t *testing.T) {
+	tests := []struct {
+		name     string
+		inFlight func(int) (map[string]int, error)
+		wantLog  string
+	}{
+		{
+			name:     "a request never finishes",
+			inFlight: func(int) (map[string]int, error) { return map[string]int{"app-hello-6:8080": 1}, nil },
+			wantLog:  "platform: Stopping the previous version after 200ms with requests still in flight (1)",
+		},
+		{
+			name:     "Caddy can't be asked",
+			inFlight: func(int) (map[string]int, error) { return nil, errors.New("connection refused") },
+			wantLog:  "platform: Couldn't check the previous version's requests; stopping it after 200ms",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakes()
+			f.inFlight = tt.inFlight
+			start := time.Now()
+			if _, err := deploy(t, f, t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if waited := time.Since(start); waited < 200*time.Millisecond {
+				t.Errorf("deploy took %s; want it to wait out the 200ms drain timeout", waited)
+			}
+			if !slices.Equal(f.removed, []string{"old6", "stale3"}) {
+				t.Errorf("removed %v, want the old containers removed after the timeout", f.removed)
+			}
+			if !slices.Contains(f.logLines, tt.wantLog) {
+				t.Errorf("log %q is missing %q", f.logLines, tt.wantLog)
+			}
+		})
+	}
+}
+
+func TestShutdownDuringDrain(t *testing.T) {
+	f := newFakes()
+	ctx, cancel := context.WithCancel(t.Context())
+	f.inFlight = func(int) (map[string]int, error) {
+		cancel() // the platform shuts down while the old version is draining
+		return map[string]int{"app-hello-6:8080": 1}, nil
+	}
+	dep, err := deploy(t, f, ctx)
+
+	// The deployment is live; the job is handed back, and the old containers
+	// stay until the retry has drained them.
+	if !errors.Is(err, context.Canceled) || jobs.IsPermanent(err) {
+		t.Errorf("Run error = %v, want a (non-permanent) cancellation", err)
+	}
+	if f.statuses[dep.ID] != store.StatusHealthy || len(f.removed) != 0 {
+		t.Errorf("status %s, removed %v; want healthy, nothing removed", f.statuses[dep.ID], f.removed)
+	}
+
+	f.inFlight = nil // drained by the time the platform is back
+	if err := retry(t, f); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.removed, []string{"old6", "stale3"}) {
+		t.Errorf("removed %v after the retry, want old6 and stale3", f.removed)
+	}
+}
+
+func TestGiveUpOnLiveDeploymentIsNotAFailure(t *testing.T) {
+	f := newFakes()
+	// 7 went live, but every attempt to finish the switch was cut off.
+	f.statuses = map[int64]store.DeploymentStatus{6: store.StatusSuperseded, 7: store.StatusHealthy}
+	f.nextCommit = sha
+	f.deployer().GiveUp(t.Context(), store.Job{DeploymentID: 7, Attempts: 3}, errTimedOut)
+
+	if f.statuses[7] != store.StatusHealthy || slices.Contains(f.events, "failed") {
+		t.Errorf("status %s, events %q; want still healthy, never marked failed", f.statuses[7], f.events)
+	}
+	want := "platform: The new version is live, but finishing the switch from the previous one was cut off: deploy timed out after 1m0s"
+	if n := len(f.logLines); n == 0 || f.logLines[n-1] != want {
+		t.Errorf("log ends %q, want %q", f.logLines, want)
+	}
+	if !slices.Equal(f.startedNext, []int64{1}) {
+		t.Errorf("started next for %v, want app 1", f.startedNext)
 	}
 }
 

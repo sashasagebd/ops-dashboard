@@ -367,6 +367,47 @@ jobs:
           [ "$DEP" != null ] || on_failure
           [ "$(wait_deploy "$DEP")" = healthy ] || on_failure
 
+          # Zero downtime. A visitor keeps requesting hello from here on, and
+          # every request must succeed. First this commit's hello goes live
+          # again ("Deploy latest" deployed main's), for its /slow endpoint.
+          [ "$(deploy "$DEPLOY_SHA")" = healthy ] || on_failure
+          rm -f /tmp/load.stop
+          ( while [ ! -f /tmp/load.stop ]; do
+              curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 -H 'Host: hello.apps.test' http://127.0.0.1/
+              sleep 0.1
+            done ) > /tmp/load.txt &
+          LOAD=$!
+          # A slow request, started on the old version just before a
+          # redeploy (a cached build, a few seconds), is still running at the
+          # switch. It must finish there: the old container is only stopped
+          # once Caddy has no requests in flight to it (up to 15s).
+          curl -fsS --max-time 30 -H 'Host: hello.apps.test' 'http://127.0.0.1/slow?seconds=14' > /tmp/slow.txt &
+          SLOW=$!
+          sleep 1
+          DEP=$(start_deploy "$DEPLOY_SHA")
+          [ "$(wait_deploy "$DEP")" = healthy ] || on_failure
+          wait "$SLOW" || { echo "the slow request was cut off"; on_failure; }
+          grep 'Slow answer' /tmp/slow.txt || on_failure
+          # It really was in flight at the switch (otherwise this proves
+          # nothing), and the old container went once it had finished.
+          curl -sSN --max-time 30 "http://127.0.0.1:8080/api/platform/apps/$APP/deployments/$DEP/logs" > /tmp/drain.log || on_failure
+          grep -F "for the previous version's requests to finish" /tmp/drain.log || { cat /tmp/drain.log; on_failure; }
+          grep -F "The previous version's requests have finished" /tmp/drain.log || { cat /tmp/drain.log; on_failure; }
+          # A broken deploy (BROKEN=1 fails hello's health check) never goes
+          # live, and the old version serves throughout.
+          dash PUT "/api/platform/apps/$APP/env/BROKEN" '{"value":"1"}'
+          [ "$(deploy "$DEPLOY_SHA")" = failed ] || on_failure
+          api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].error' | grep 'health check failed' || on_failure
+          visit hello.apps.test / | grep 'Howdy from the platform' || on_failure
+          dash DELETE "/api/platform/apps/$APP/env/BROKEN"
+          touch /tmp/load.stop
+          wait "$LOAD"
+          # Every request answered 200, and there were plenty of them.
+          sort /tmp/load.txt | uniq -c
+          test "$(grep -vc '^200$' /tmp/load.txt)" = 0 || on_failure
+          test "$(wc -l < /tmp/load.txt)" -ge 50 || on_failure
+          test "$(docker ps -q --filter label=ops.platform.app=hello | wc -l)" = 1 || on_failure
+
           # A source directory that doesn't exist fails with a clear reason
           # (found mid-stream, so this also checks the reason survives
           # Docker's client).

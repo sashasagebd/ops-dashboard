@@ -136,6 +136,8 @@ func run(addr string) error {
 		DeployTimeout:  20 * time.Minute,
 		HealthTimeout:  time.Minute,
 		HealthInterval: time.Second,
+		DrainTimeout:   15 * time.Second,
+		DrainInterval:  250 * time.Millisecond,
 	}, st, github, dockerClient, caddy)
 	runner := jobs.New(jobs.Config{
 		// Two deploys (of different apps) at once: builds are heavy, and

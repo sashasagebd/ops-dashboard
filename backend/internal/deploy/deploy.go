@@ -1,6 +1,7 @@
 // Package deploy runs a deployment from start to finish: download the code,
 // build it, start a container, check it's healthy through Caddy, switch the
-// app's route to it, and remove the previous version.
+// app's route to it, let the previous version finish its requests, and
+// remove it.
 //
 // Each deploy is a job in the platform's queue (internal/jobs): the
 // Deployer is its handler, and Run makes one attempt. An attempt can be cut
@@ -65,6 +66,7 @@ type Engine interface {
 type Router interface {
 	Apply(ctx context.Context, routes []router.Route) error
 	Probe(ctx context.Context, host, path string) (int, error)
+	InFlight(ctx context.Context) (map[string]int, error)
 }
 
 // Config holds the deployer's settings.
@@ -73,6 +75,8 @@ type Config struct {
 	DeployTimeout  time.Duration // one attempt at a deploy, download to switch
 	HealthTimeout  time.Duration // how long a new container gets to answer healthily
 	HealthInterval time.Duration // time between health probes
+	DrainTimeout   time.Duration // how long the old version gets to finish its requests after the switch
+	DrainInterval  time.Duration // time between checks that it has
 }
 
 // Deployer queues deployments and runs them as jobs.
@@ -226,6 +230,15 @@ func (d *Deployer) Run(ctx context.Context, job store.Job) error {
 // dashboard shows it, and at the end of its log (jobs.Handler).
 func (d *Deployer) GiveUp(ctx context.Context, job store.Job, err error) {
 	reason := publicReason(err, d.cfg.DeployTimeout)
+	// Already live: the deploy succeeded, and only what follows the switch
+	// (routing to it, draining and removing the old version) was cut off.
+	// That isn't a failure to record; the platform's next start, or the next
+	// deploy, re-applies the routes and removes the old container.
+	if dep, err := d.store.Deployment(ctx, job.DeploymentID); err == nil && dep.Status == store.StatusHealthy {
+		d.appendLogLine(ctx, job.DeploymentID, "The new version is live, but finishing the switch from the previous one was cut off: "+reason)
+		d.startNext(ctx, job.DeploymentID)
+		return
+	}
 	d.appendLogLine(ctx, job.DeploymentID, "Deploy failed: "+reason)
 	err = d.store.MarkFailed(ctx, job.DeploymentID, reason)
 	// Already finished (recorded by an earlier call that the platform died
@@ -282,7 +295,10 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		// switching the route or removing the old version: finish those.
 		log.Info("deploy already healthy; finishing the route switch")
 		out.Printf("Already healthy; finishing the switch to the new version (attempt %d)", job.Attempts)
-		if err := d.switchTo(ctx, log, out, app.Name, dep.ID); err != nil {
+		if err := d.ApplyRoutes(ctx); err != nil {
+			return err
+		}
+		if err := d.retireOlder(ctx, log, out, app, dep.ID); err != nil {
 			return err
 		}
 		out.Printf("Live at http://%s/", app.Hostname)
@@ -371,7 +387,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 	if err := d.store.MarkHealthy(ctx, dep.ID); err != nil {
 		return err
 	}
-	if err := d.switchTo(ctx, log, out, app.Name, dep.ID); err != nil {
+	if err := d.ApplyRoutes(ctx); err != nil {
 		// The database says the new deployment is live, but Caddy still
 		// routes to the old container, which is still running, so the
 		// site stays up on the old version. Keeping the old container is
@@ -382,18 +398,11 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		out.Printf("Couldn't update the route yet: the previous version keeps serving until the next route update")
 		return nil
 	}
-	log.Info("deploy finished: healthy")
-	out.Printf("Live at http://%s/", app.Hostname)
-	return nil
-}
-
-// switchTo points Caddy at a deployment that's now live, then removes the
-// app's older containers. If the route update fails, nothing is removed.
-func (d *Deployer) switchTo(ctx context.Context, log *slog.Logger, out *deployLog, app string, deploymentID int64) error {
-	if err := d.ApplyRoutes(ctx); err != nil {
+	if err := d.retireOlder(ctx, log, out, app, dep.ID); err != nil {
 		return err
 	}
-	d.removeOlderContainers(context.WithoutCancel(ctx), log, out, app, deploymentID)
+	log.Info("deploy finished: healthy")
+	out.Printf("Live at http://%s/", app.Hostname)
 	return nil
 }
 
@@ -497,27 +506,117 @@ func (d *Deployer) ApplyRoutes(ctx context.Context) error {
 	return d.router.Apply(ctx, routes)
 }
 
-// removeOlderContainers removes the app's containers from deployments before
-// live: the version it replaced, and any left over from earlier failures.
-// Newer ones are left alone: once live is no longer in progress, the app's
-// next deploy may already have started its container. Failures are logged
+// retireOlder stops and removes the app's containers from deployments before
+// live, once Caddy routes to live: the version it replaced, and any left over
+// from earlier failures. It drains them first (see drain). Newer containers
+// are left alone: once live is no longer in progress, the app's next deploy
+// may already have started its container.
+//
+// The only error is being cut off (the platform shutting down, or the attempt
+// running out of time), and then nothing is removed: a retry finds the
+// deployment healthy and comes back here, and failing that, the next deploy
+// or the platform's next start removes them. Other failures are logged
 // rather than failing the deploy, which has succeeded.
-func (d *Deployer) removeOlderContainers(ctx context.Context, log *slog.Logger, out *deployLog, app string, live int64) {
-	containers, err := d.engine.ManagedContainers(ctx, app)
+func (d *Deployer) retireOlder(ctx context.Context, log *slog.Logger, out *deployLog, app store.App, live int64) error {
+	containers, err := d.engine.ManagedContainers(ctx, app.Name)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		log.Error("listing old containers", "err", err)
-		return
+		return nil
 	}
+	var older []engine.ManagedContainer
 	for _, c := range containers {
 		id, err := strconv.ParseInt(c.Labels[engine.LabelDeployment], 10, 64)
-		if err != nil || id >= live {
-			continue
+		if err == nil && id < live {
+			older = append(older, c)
 		}
-		if err := d.engine.Remove(ctx, c.ID); err != nil {
+	}
+	if len(older) == 0 {
+		return nil
+	}
+	if err := d.drain(ctx, log, out, app.Port, older); err != nil {
+		return err
+	}
+	// Not cancelled part-way: once drained, each takes at most its stop
+	// timeout, and stopping only some would leave the rest for a retry that
+	// may not come.
+	rmCtx := context.WithoutCancel(ctx)
+	for _, c := range older {
+		if err := d.engine.Remove(rmCtx, c.ID); err != nil {
 			log.Error("removing old container", "container", c.Name, "err", err)
 			continue
 		}
 		out.Printf("Removed the previous container %s", c.Name)
+	}
+	return nil
+}
+
+// drain waits until Caddy has no requests in flight to any of containers, or
+// DrainTimeout passes.
+//
+// After a route switch, Caddy sends new requests to the new version but lets
+// the ones already started finish against the old one; stopping the old
+// container under them would cut them off. So the old version is stopped only
+// once Caddy's in-flight count for it is zero. The first check comes one
+// interval after the switch, by when any request the old config had just
+// routed has been counted. Bounded, because a client holding a request open
+// (a long poll, a stream) mustn't hold up the deploy forever; and if Caddy
+// can't be asked, it waits the whole timeout, which is slower but safe.
+//
+// The alternative, a fixed wait, is either too short for a slow request or
+// makes every deploy slower than it needs to be.
+func (d *Deployer) drain(ctx context.Context, log *slog.Logger, out *deployLog, port int, containers []engine.ManagedContainer) error {
+	addrs := make([]string, 0, len(containers))
+	for _, c := range containers {
+		addrs = append(addrs, c.Name+":"+strconv.Itoa(port))
+	}
+	timeout := time.NewTimer(d.cfg.DrainTimeout)
+	defer timeout.Stop()
+	last := -1 // in flight at the last check; -1 if Caddy couldn't be asked
+	warned, waiting := false, false
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			if last < 0 {
+				out.Printf("Couldn't check the previous version's requests; stopping it after %s", d.cfg.DrainTimeout)
+			} else {
+				out.Printf("Stopping the previous version after %s with requests still in flight (%d)", d.cfg.DrainTimeout, last)
+			}
+			return nil
+		case <-time.After(d.cfg.DrainInterval):
+		}
+
+		inFlight, err := d.router.InFlight(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !warned {
+				log.Warn("reading in-flight requests from Caddy; waiting out the drain timeout", "err", err)
+				warned = true
+			}
+			last = -1
+			continue
+		}
+		n := 0
+		for _, a := range addrs {
+			n += inFlight[a]
+		}
+		if n == 0 {
+			if waiting {
+				out.Printf("The previous version's requests have finished")
+			}
+			return nil
+		}
+		if !waiting {
+			out.Printf("Waiting up to %s for the previous version's requests to finish (%d in flight)", d.cfg.DrainTimeout, n)
+			waiting = true
+		}
+		last = n
 	}
 }
 

@@ -101,6 +101,44 @@ func (c *Caddy) Probe(ctx context.Context, host, path string) (int, error) {
 	return resp.StatusCode, nil
 }
 
+// InFlight returns how many requests Caddy is proxying to each upstream right
+// now, by dial address (e.g. "app-hello-7:8080"); upstreams with none may be
+// missing.
+//
+// It's what lets a deploy drain the old version: after a route change, Caddy
+// lets requests the old config had already started finish against the old
+// upstream (the PATCH returns as soon as the old config starts shutting down,
+// without waiting for them), and its in-flight counts are kept per address
+// across config changes, so they still show the old upstream after its route
+// is gone.
+func (c *Caddy) InFlight(ctx context.Context) (map[string]int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.AdminURL+"/reverse_proxy/upstreams", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reading upstreams: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("reading upstreams: Caddy answered %s", resp.Status)
+	}
+	var upstreams []struct {
+		Address     string `json:"address"`
+		NumRequests int    `json:"num_requests"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&upstreams); err != nil {
+		return nil, fmt.Errorf("reading upstreams: %w", err)
+	}
+	out := make(map[string]int, len(upstreams))
+	for _, u := range upstreams {
+		// Summed: Caddy can list one address from more than one pool.
+		out[u.Address] += u.NumRequests
+	}
+	return out, nil
+}
+
 type caddyServer struct {
 	Listen         []string       `json:"listen"`
 	Routes         []caddyRoute   `json:"routes"`
