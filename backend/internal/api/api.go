@@ -42,12 +42,14 @@ type Store interface {
 	CurrentDeployment(ctx context.Context, appID int64) (store.Deployment, error)
 	DeploymentLogs(ctx context.Context, deploymentID, afterID int64, limit int) ([]store.LogLine, error)
 	DeploymentLogComplete(ctx context.Context, deploymentID int64) (bool, error)
+	KeptImages(ctx context.Context, appID int64) ([]string, error)
 }
 
 // Deployer starts deploys; in production it's a *deploy.Deployer.
 type Deployer interface {
 	Start(ctx context.Context, appID int64, commitSHA string) (store.Deployment, error)
 	StartLatest(ctx context.Context, appID int64) (store.Deployment, error)
+	Rollback(ctx context.Context, appID, deploymentID int64) (store.Deployment, error)
 }
 
 // Engine reads app containers' output; in production it's an *engine.Client.
@@ -70,6 +72,7 @@ func New(st Store, dep Deployer, eng Engine, appsDomain string) http.Handler {
 	mux.HandleFunc("GET /api/platform/apps/{id}/deployments", a.listDeployments)
 	mux.HandleFunc("POST /api/platform/apps/{id}/deployments", a.createDeployment)
 	mux.HandleFunc("POST /api/platform/apps/{id}/deployments/latest", a.deployLatest)
+	mux.HandleFunc("POST /api/platform/apps/{id}/deployments/{deploymentId}/rollback", a.rollback)
 	mux.HandleFunc("GET /api/platform/apps/{id}/deployments/{deploymentId}/logs", a.deploymentLogs)
 	mux.HandleFunc("GET /api/platform/apps/{id}/logs", a.appLogs)
 	return mux
@@ -109,15 +112,21 @@ type appDetailResponse struct {
 }
 
 type deploymentResponse struct {
-	ID         int64      `json:"id"`
-	AppID      int64      `json:"appId"`
-	CommitSHA  string     `json:"commitSha"`
-	Status     string     `json:"status"`
-	ImageTag   *string    `json:"imageTag"` // null until built
-	Error      *string    `json:"error"`    // null unless failed
-	CreatedAt  time.Time  `json:"createdAt"`
-	StartedAt  *time.Time `json:"startedAt"`
-	FinishedAt *time.Time `json:"finishedAt"`
+	ID        int64   `json:"id"`
+	AppID     int64   `json:"appId"`
+	CommitSHA string  `json:"commitSha"`
+	Status    string  `json:"status"`
+	ImageTag  *string `json:"imageTag"` // null until built
+	Error     *string `json:"error"`    // null unless failed
+	// The deployment whose image this one runs, if it's a rollback.
+	RollbackOf *int64 `json:"rollbackOf"`
+	// Whether the app can be rolled back to this deployment (it was live
+	// before, its image is kept, and it isn't the live version). Only set in
+	// an app's deployment lists; false elsewhere.
+	Rollbackable bool       `json:"rollbackable"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	StartedAt    *time.Time `json:"startedAt"`
+	FinishedAt   *time.Time `json:"finishedAt"`
 }
 
 type errorResponse struct {
@@ -152,15 +161,30 @@ func newDeploymentResponse(d store.Deployment) deploymentResponse {
 	if d.Error != "" {
 		r.Error = &d.Error
 	}
+	if d.RollbackOf != 0 {
+		r.RollbackOf = &d.RollbackOf
+	}
 	return r
 }
 
-func newDeploymentResponses(ds []store.Deployment) []deploymentResponse {
+// deploymentList is an app's deployments, each saying whether it can be
+// rolled back to, given the app's kept images and live version (nil if none).
+func (a *api) deploymentList(ctx context.Context, appID int64, ds []store.Deployment, current *store.Deployment) ([]deploymentResponse, error) {
+	kept, err := a.store.KeptImages(ctx, appID)
+	if err != nil {
+		return nil, err
+	}
+	live := ""
+	if current != nil {
+		live = current.ImageTag
+	}
 	out := make([]deploymentResponse, 0, len(ds)) // [] not null when empty
 	for _, d := range ds {
-		out = append(out, newDeploymentResponse(d))
+		r := newDeploymentResponse(d)
+		r.Rollbackable = store.CheckRollback(d, kept, live) == nil
+		out = append(out, r)
 	}
-	return out
+	return out, nil
 }
 
 // Handlers
@@ -283,10 +307,15 @@ func (a *api) getApp(w http.ResponseWriter, r *http.Request) {
 	if keys == nil {
 		keys = []string{}
 	}
+	list, err := a.deploymentList(ctx, id, deployments, current)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, appDetailResponse{
 		appResponse: newAppResponse(app, current),
 		EnvKeys:     keys,
-		Deployments: newDeploymentResponses(deployments),
+		Deployments: list,
 	})
 }
 
@@ -376,7 +405,17 @@ func (a *api) listDeployments(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, newDeploymentResponses(ds))
+	current, err := a.current(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	list, err := a.deploymentList(r.Context(), id, ds, current)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, list)
 }
 
 type createDeploymentRequest struct {
@@ -413,6 +452,28 @@ func (a *api) deployLatest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	d, err := a.deployer.StartLatest(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, newDeploymentResponse(d))
+}
+
+// rollback rolls the app back to one of its earlier deployments: a new
+// deployment running that one's image, with no build. No body. It also turns
+// the app's auto-deploy off (see store.CreateRollback). 409 with the reason
+// if that deployment can't be rolled back to, or a deploy is in progress.
+func (a *api) rollback(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	target, err := strconv.ParseInt(r.PathValue("deploymentId"), 10, 64)
+	if err != nil || target < 1 {
+		writeJSON(w, http.StatusNotFound, errorResponse{"not found"})
+		return
+	}
+	d, err := a.deployer.Rollback(r.Context(), id, target)
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -483,7 +544,8 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errorResponse{"not found"})
-	case errors.Is(err, store.ErrConflict), errors.Is(err, store.ErrDeployInProgress):
+	case errors.Is(err, store.ErrConflict), errors.Is(err, store.ErrDeployInProgress),
+		errors.Is(err, store.ErrNotRollbackable):
 		writeJSON(w, http.StatusConflict, errorResponse{err.Error()})
 	case errors.Is(err, store.ErrInvalid):
 		writeJSON(w, http.StatusBadRequest, errorResponse{err.Error()})

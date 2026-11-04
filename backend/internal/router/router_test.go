@@ -97,6 +97,42 @@ func TestApplyReportsCaddyErrors(t *testing.T) {
 	}
 }
 
+func TestInFlight(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		// As Caddy answers, including an address listed twice.
+		io.WriteString(w, `[{"address":"app-hello-6:8080","num_requests":2,"fails":0},
+			{"address":"app-hello-7:8080","num_requests":0,"fails":0},
+			{"address":"app-hello-6:8080","num_requests":1,"fails":0}]`)
+	}))
+	defer srv.Close()
+
+	got, err := New(srv.URL, "").InFlight(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/reverse_proxy/upstreams" {
+		t.Errorf("request = %s %s, want GET /reverse_proxy/upstreams", gotMethod, gotPath)
+	}
+	if got["app-hello-6:8080"] != 3 || got["app-hello-7:8080"] != 0 || len(got) != 2 {
+		t.Errorf("in flight = %v, want app-hello-6:8080 3, app-hello-7:8080 0", got)
+	}
+}
+
+func TestInFlightReportsCaddyErrors(t *testing.T) {
+	for name, handler := range map[string]http.HandlerFunc{
+		"status": func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", http.StatusInternalServerError) },
+		"body":   func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "not json") },
+	} {
+		srv := httptest.NewServer(handler)
+		if _, err := New(srv.URL, "").InFlight(t.Context()); err == nil {
+			t.Errorf("%s: InFlight succeeded, want an error", name)
+		}
+		srv.Close()
+	}
+}
+
 func TestProbeSendsHostAndDoesNotFollowRedirects(t *testing.T) {
 	var gotHost, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

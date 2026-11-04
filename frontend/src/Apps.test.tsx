@@ -14,6 +14,8 @@ function deployment(overrides: Partial<Deployment> = {}): Deployment {
     status: 'healthy',
     imageTag: `ops-platform/hello:${SHA}`,
     error: null,
+    rollbackOf: null,
+    rollbackable: false,
     createdAt: new Date(Date.now() - 5 * 60_000).toISOString(),
     startedAt: null,
     finishedAt: null,
@@ -281,6 +283,67 @@ describe('App page', () => {
       autoDeploy: false,
     })
     expect(screen.queryByText('0123456')).not.toBeInTheDocument()
+  })
+
+  it('rolls back to an earlier version, after asking', async () => {
+    let rolledBack = false
+    const live = deployment({ id: 8 })
+    const earlier = deployment({ id: 7, status: 'superseded', rollbackable: true })
+    const rb = deployment({ id: 9, status: 'queued', rollbackOf: 7 })
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        rolledBack
+          ? detail({ autoDeploy: false, currentDeployment: live, deployments: [rb, live, earlier] })
+          : detail({ currentDeployment: live, deployments: [live, earlier] }),
+      ],
+      'POST /api/platform/apps/1/deployments/7/rollback': () => {
+        rolledBack = true
+        return [202, rb]
+      },
+    })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    // Only versions that can be rolled back to have the button.
+    const button = await screen.findByRole('button', { name: 'Roll back to deploy #7' })
+    expect(screen.queryByRole('button', { name: 'Roll back to deploy #8' })).not.toBeInTheDocument()
+
+    // Cancelled: nothing sent.
+    fireEvent.click(button)
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("today's env vars"))
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/deployments/7/rollback')).toHaveLength(0)
+
+    confirm.mockReturnValue(true)
+    fireEvent.click(button)
+    expect(await screen.findByText('rollback of #7')).toBeInTheDocument()
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/deployments/7/rollback')).toHaveLength(1)
+    // Its log opens, auto-deploy says why it's off, and no other rollback
+    // can start while this one runs.
+    expect(FakeEventSource.latest().url).toBe('/api/platform/apps/1/deployments/9/logs')
+    expect(screen.getByText(/Turned off by the rollback to #7/)).toBeInTheDocument()
+    expect(screen.getByRole('checkbox')).not.toBeChecked()
+    expect(screen.getByRole('button', { name: 'Roll back to deploy #7' })).toBeDisabled()
+  })
+
+  it('shows why a rollback was refused', async () => {
+    mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({ deployments: [deployment({ id: 8 }), deployment({ id: 7, status: 'superseded', rollbackable: true })] }),
+      ],
+      'POST /api/platform/apps/1/deployments/7/rollback': () => [
+        409,
+        { error: "can't roll back to this deployment: its image is no longer kept" },
+      ],
+    })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Roll back to deploy #7' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('its image is no longer kept')
   })
 
   it('has no app output to show when nothing is live', async () => {

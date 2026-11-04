@@ -367,6 +367,74 @@ jobs:
           [ "$DEP" != null ] || on_failure
           [ "$(wait_deploy "$DEP")" = healthy ] || on_failure
 
+          # Zero downtime. A visitor keeps requesting hello from here on, and
+          # every request must succeed. First this commit's hello goes live
+          # again ("Deploy latest" deployed main's), for its /slow endpoint.
+          [ "$(deploy "$DEPLOY_SHA")" = healthy ] || on_failure
+          rm -f /tmp/load.stop
+          ( while [ ! -f /tmp/load.stop ]; do
+              curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 -H 'Host: hello.apps.test' http://127.0.0.1/
+              sleep 0.1
+            done ) > /tmp/load.txt &
+          LOAD=$!
+          # A slow request, started on the old version just before a
+          # redeploy (a cached build, a few seconds), is still running at the
+          # switch. It must finish there: the old container is only stopped
+          # once Caddy has no requests in flight to it (up to 15s).
+          curl -fsS --max-time 30 -H 'Host: hello.apps.test' 'http://127.0.0.1/slow?seconds=14' > /tmp/slow.txt &
+          SLOW=$!
+          sleep 1
+          DEP=$(start_deploy "$DEPLOY_SHA")
+          [ "$(wait_deploy "$DEP")" = healthy ] || on_failure
+          wait "$SLOW" || { echo "the slow request was cut off"; on_failure; }
+          grep 'Slow answer' /tmp/slow.txt || on_failure
+          # It really was in flight at the switch (otherwise this proves
+          # nothing), and the old container went once it had finished.
+          curl -sSN --max-time 30 "http://127.0.0.1:8080/api/platform/apps/$APP/deployments/$DEP/logs" > /tmp/drain.log || on_failure
+          grep -F "for the previous version's requests to finish" /tmp/drain.log || { cat /tmp/drain.log; on_failure; }
+          grep -F "The previous version's requests have finished" /tmp/drain.log || { cat /tmp/drain.log; on_failure; }
+          # A broken deploy (BROKEN=1 fails hello's health check) never goes
+          # live, and the old version serves throughout.
+          dash PUT "/api/platform/apps/$APP/env/BROKEN" '{"value":"1"}'
+          [ "$(deploy "$DEPLOY_SHA")" = failed ] || on_failure
+          api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].error' | grep 'health check failed' || on_failure
+          visit hello.apps.test / | grep 'Howdy from the platform' || on_failure
+          dash DELETE "/api/platform/apps/$APP/env/BROKEN"
+          # Rollback, through the dashboard as the app page does it, with the
+          # visitor still requesting. Two versions with different images are
+          # needed ("Deploy latest" may be this same commit): the parent
+          # commit, then this one, then back to the parent's deployment. Its
+          # image runs again with no build, and the version it replaced is
+          # marked rolled back.
+          PARENT_SHA=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${REPO_URL#https://github.com/}/commits/$DEPLOY_SHA" | jq -r '.parents[0].sha')
+          OLD=$(start_deploy "$PARENT_SHA")
+          [ "$(wait_deploy "$OLD")" = healthy ] || on_failure
+          NEW=$(start_deploy "$DEPLOY_SHA")
+          [ "$(wait_deploy "$NEW")" = healthy ] || on_failure
+          api GET "/api/platform/apps/$APP/deployments" | jq -e ".[] | select(.id == $OLD) | .rollbackable" || on_failure
+          RB=$(dash POST "/api/platform/apps/$APP/deployments/$OLD/rollback" | jq -r .id)
+          [ "$RB" != null ] || on_failure
+          [ "$(wait_deploy "$RB")" = healthy ] || on_failure
+          [ "$(deploy_status "$NEW")" = rolled_back ] || on_failure
+          test "$(docker inspect --format '{{.Config.Image}}' "app-hello-$RB")" = "ops-platform/hello:$PARENT_SHA" || on_failure
+          visit hello.apps.test / | grep 'Howdy from the platform' || on_failure
+          curl -sSN --max-time 30 "http://127.0.0.1:8080/api/platform/apps/$APP/deployments/$RB/logs" > /tmp/rollback.log || on_failure
+          grep -F 'reusing its image' /tmp/rollback.log || { cat /tmp/rollback.log; on_failure; }
+          if grep -F 'Building image' /tmp/rollback.log; then echo "the rollback built an image"; on_failure; fi
+          # Auto-deploy is off, so a push doesn't undo it; rolling back to
+          # the version that's now live is refused.
+          dash GET "/api/platform/apps/$APP" | jq -e '.autoDeploy == false' || on_failure
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+            "http://127.0.0.1:8080/api/platform/apps/$APP/deployments/$OLD/rollback")" = 409 || on_failure
+          touch /tmp/load.stop
+          wait "$LOAD"
+          # Every request answered 200, and there were plenty of them.
+          sort /tmp/load.txt | uniq -c
+          test "$(grep -vc '^200$' /tmp/load.txt)" = 0 || on_failure
+          test "$(wc -l < /tmp/load.txt)" -ge 50 || on_failure
+          test "$(docker ps -q --filter label=ops.platform.app=hello | wc -l)" = 1 || on_failure
+
           # A source directory that doesn't exist fails with a clear reason
           # (found mid-stream, so this also checks the reason survives
           # Docker's client).

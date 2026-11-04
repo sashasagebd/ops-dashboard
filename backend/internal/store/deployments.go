@@ -33,8 +33,9 @@ type Deployment struct {
 	AppID      int64            `db:"app_id"`
 	CommitSHA  string           `db:"commit_sha"`
 	Status     DeploymentStatus `db:"status"`
-	ImageTag   string           `db:"image_tag"` // "" until built
-	Error      string           `db:"error"`     // "" unless failed
+	ImageTag   string           `db:"image_tag"`   // "" until built
+	Error      string           `db:"error"`       // "" unless failed
+	RollbackOf int64            `db:"rollback_of"` // the deployment whose image a rollback runs; 0 for a normal deploy
 	CreatedAt  time.Time        `db:"created_at"`
 	StartedAt  *time.Time       `db:"started_at"`
 	FinishedAt *time.Time       `db:"finished_at"`
@@ -42,6 +43,7 @@ type Deployment struct {
 
 const deploymentColumns = `id, app_id, commit_sha, status,
 	COALESCE(image_tag, '') AS image_tag, COALESCE(error, '') AS error,
+	COALESCE(rollback_of, 0) AS rollback_of,
 	created_at, started_at, finished_at`
 
 // CreateDeployment queues a deploy of commitSHA (40 lowercase hex characters)
@@ -206,15 +208,17 @@ func (s *Store) MarkStarting(ctx context.Context, id int64, imageTag string) err
 }
 
 // MarkHealthy makes a starting deployment the app's live one, and in the same
-// transaction marks the previous live one superseded. Either both happen or
-// neither does, so the app never has two live deployments, or none because
-// of a half-finished switch.
+// transaction marks the previous live one superseded (or rolled_back, if the
+// new one is a rollback). Either both happen or neither does, so the app
+// never has two live deployments, or none because of a half-finished switch.
 func (s *Store) MarkHealthy(ctx context.Context, id int64) error {
 	return translate(pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		// Supersede first: the one-healthy-per-app index would otherwise
 		// reject the second healthy row.
 		if _, err := tx.Exec(ctx, `
-			UPDATE deployments SET status = 'superseded'
+			UPDATE deployments
+			SET status = CASE WHEN (SELECT rollback_of FROM deployments WHERE id = $1) IS NULL
+			                  THEN 'superseded' ELSE 'rolled_back' END
 			WHERE status = 'healthy' AND id <> $1
 			  AND app_id = (SELECT app_id FROM deployments WHERE id = $1)`, id); err != nil {
 			return err

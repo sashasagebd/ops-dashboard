@@ -1,6 +1,7 @@
 // Package deploy runs a deployment from start to finish: download the code,
 // build it, start a container, check it's healthy through Caddy, switch the
-// app's route to it, and remove the previous version.
+// app's route to it, let the previous version finish its requests, and
+// remove it.
 //
 // Each deploy is a job in the platform's queue (internal/jobs): the
 // Deployer is its handler, and Run makes one attempt. An attempt can be cut
@@ -19,6 +20,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,6 +50,10 @@ type Store interface {
 	PruneDeploymentLogs(ctx context.Context, appID int64, keep int) (int64, error)
 	RequestDeployment(ctx context.Context, appID int64, commitSHA string) (store.Deployment, bool, error)
 	StartNextDeployment(ctx context.Context, appID int64) (store.Deployment, bool, error)
+	Deployments(ctx context.Context, appID int64, limit int) ([]store.Deployment, error)
+	CreateRollback(ctx context.Context, appID, targetID int64) (store.Deployment, error)
+	StartRollback(ctx context.Context, id int64) error
+	KeptImages(ctx context.Context, appID int64) ([]string, error)
 }
 
 type Source interface {
@@ -60,11 +66,15 @@ type Engine interface {
 	Run(ctx context.Context, spec engine.RunSpec) (string, error)
 	Remove(ctx context.Context, id string) error
 	ManagedContainers(ctx context.Context, app string) ([]engine.ManagedContainer, error)
+	AppImages(ctx context.Context, app string) ([]engine.Image, error)
+	ImageExists(ctx context.Context, ref string) (bool, error)
+	RemoveImage(ctx context.Context, ref string) error
 }
 
 type Router interface {
 	Apply(ctx context.Context, routes []router.Route) error
 	Probe(ctx context.Context, host, path string) (int, error)
+	InFlight(ctx context.Context) (map[string]int, error)
 }
 
 // Config holds the deployer's settings.
@@ -73,6 +83,8 @@ type Config struct {
 	DeployTimeout  time.Duration // one attempt at a deploy, download to switch
 	HealthTimeout  time.Duration // how long a new container gets to answer healthily
 	HealthInterval time.Duration // time between health probes
+	DrainTimeout   time.Duration // how long the old version gets to finish its requests after the switch
+	DrainInterval  time.Duration // time between checks that it has
 }
 
 // Deployer queues deployments and runs them as jobs.
@@ -127,6 +139,19 @@ func (d *Deployer) StartLatest(ctx context.Context, appID int64) (store.Deployme
 		return store.Deployment{}, err
 	}
 	return d.Start(ctx, appID, sha)
+}
+
+// Rollback queues a rollback of an app to one of its earlier deployments: a
+// new deployment that runs that one's image, with no build (see
+// store.CreateRollback, which also turns the app's auto-deploy off). Errors
+// as CreateRollback's.
+func (d *Deployer) Rollback(ctx context.Context, appID, targetID int64) (store.Deployment, error) {
+	dep, err := d.store.CreateRollback(ctx, appID, targetID)
+	if err != nil {
+		return store.Deployment{}, err
+	}
+	d.notify()
+	return dep, nil
 }
 
 // Push deploys a pushed commit: straight away if the app has no deploy in
@@ -226,6 +251,15 @@ func (d *Deployer) Run(ctx context.Context, job store.Job) error {
 // dashboard shows it, and at the end of its log (jobs.Handler).
 func (d *Deployer) GiveUp(ctx context.Context, job store.Job, err error) {
 	reason := publicReason(err, d.cfg.DeployTimeout)
+	// Already live: the deploy succeeded, and only what follows the switch
+	// (routing to it, draining and removing the old version) was cut off.
+	// That isn't a failure to record; the platform's next start, or the next
+	// deploy, re-applies the routes and removes the old container.
+	if dep, err := d.store.Deployment(ctx, job.DeploymentID); err == nil && dep.Status == store.StatusHealthy {
+		d.appendLogLine(ctx, job.DeploymentID, "The new version is live, but finishing the switch from the previous one was cut off: "+reason)
+		d.startNext(ctx, job.DeploymentID)
+		return
+	}
 	d.appendLogLine(ctx, job.DeploymentID, "Deploy failed: "+reason)
 	err = d.store.MarkFailed(ctx, job.DeploymentID, reason)
 	// Already finished (recorded by an earlier call that the platform died
@@ -245,6 +279,7 @@ func permanent(err error) bool {
 	return errors.As(err, &buildErr) || errors.As(err, &healthErr) ||
 		errors.Is(err, source.ErrNotFound) || errors.Is(err, source.ErrTooLarge) ||
 		errors.Is(err, source.ErrDirNotFound) || errors.Is(err, errTimedOut) ||
+		errors.Is(err, ErrImageGone) ||
 		// The app or deployment was deleted, or the deployment finished
 		// some other way.
 		errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrWrongStatus)
@@ -268,7 +303,12 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		if _, err := d.store.PruneDeploymentLogs(ctx, app.ID, keepLogsFor); err != nil {
 			log.Warn("pruning old deploy logs", "err", err)
 		}
-		out.Printf("Deploying %s at %s (attempt %d)", app.RepoURL, shortSHA(dep.CommitSHA), job.Attempts)
+		if dep.RollbackOf != 0 {
+			out.Printf("Rolling back to deployment #%d (%s at %s), reusing its image (attempt %d)",
+				dep.RollbackOf, app.RepoURL, shortSHA(dep.CommitSHA), job.Attempts)
+		} else {
+			out.Printf("Deploying %s at %s (attempt %d)", app.RepoURL, shortSHA(dep.CommitSHA), job.Attempts)
+		}
 		// Building or starting: an earlier attempt was cut off. Its
 		// container, if it got that far, has this deployment's name, so it
 		// goes first; the build is simply redone, mostly from Docker's
@@ -282,9 +322,13 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		// switching the route or removing the old version: finish those.
 		log.Info("deploy already healthy; finishing the route switch")
 		out.Printf("Already healthy; finishing the switch to the new version (attempt %d)", job.Attempts)
-		if err := d.switchTo(ctx, log, out, app.Name, dep.ID); err != nil {
+		if err := d.ApplyRoutes(ctx); err != nil {
 			return err
 		}
+		if err := d.retireOlder(ctx, log, out, app, dep.ID); err != nil {
+			return err
+		}
+		d.pruneImages(ctx, log, out, app)
 		out.Printf("Live at http://%s/", app.Hostname)
 		return nil
 	default:
@@ -294,41 +338,18 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		return nil
 	}
 
-	if err := d.store.MarkBuilding(ctx, dep.ID); err != nil {
-		return err
-	}
-
-	// Download and build. The code streams from GitHub straight into
-	// Docker's build.
-	tag := ImageTag(app.Name, dep.CommitSHA)
-	where := "the repo's root"
-	if app.SourceDir != "" {
-		where = app.SourceDir + "/"
-	}
-	out.Printf("Building image %s from %s", tag, where)
-	src, err := d.source.BuildContext(ctx, app.RepoURL, dep.CommitSHA, app.SourceDir)
-	if err != nil {
-		return err
-	}
 	labels := map[string]string{
 		engine.LabelApp:        app.Name,
 		engine.LabelAppID:      strconv.FormatInt(app.ID, 10),
 		engine.LabelDeployment: strconv.FormatInt(dep.ID, 10),
 	}
-	stream := &streamReader{r: src}
-	err = d.engine.Build(ctx, stream, tag, labels, out.Build)
-	src.Close()
-	if err != nil {
-		// Problems with the code itself (too large, source directory
-		// missing) are found while Docker reads the stream, so Build fails
-		// with whatever Docker made of the cut-off upload. The stream's own
-		// error is the real cause, and its message is one users can act on.
-		if streamErr := stream.Err(); streamErr != nil {
-			return streamErr
-		}
-		return err
+	var tag string
+	if dep.RollbackOf != 0 {
+		tag, err = d.reuseImage(ctx, out, dep)
+	} else {
+		tag, err = d.build(ctx, out, app, dep, labels)
 	}
-	if err := d.store.MarkStarting(ctx, dep.ID, tag); err != nil {
+	if err != nil {
 		return err
 	}
 
@@ -365,13 +386,14 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		return err
 	}
 
-	// Healthy: make it the live deployment (superseding the old one in the
-	// same transaction), then point the app's hostname at it.
+	// Healthy: make it the live deployment (superseding the old one, or
+	// marking it rolled back, in the same transaction), then point the app's
+	// hostname at it.
 	out.Printf("Healthy")
 	if err := d.store.MarkHealthy(ctx, dep.ID); err != nil {
 		return err
 	}
-	if err := d.switchTo(ctx, log, out, app.Name, dep.ID); err != nil {
+	if err := d.ApplyRoutes(ctx); err != nil {
 		// The database says the new deployment is live, but Caddy still
 		// routes to the old container, which is still running, so the
 		// site stays up on the old version. Keeping the old container is
@@ -382,19 +404,148 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		out.Printf("Couldn't update the route yet: the previous version keeps serving until the next route update")
 		return nil
 	}
+	if err := d.retireOlder(ctx, log, out, app, dep.ID); err != nil {
+		return err
+	}
+	d.pruneImages(ctx, log, out, app)
 	log.Info("deploy finished: healthy")
 	out.Printf("Live at http://%s/", app.Hostname)
 	return nil
 }
 
-// switchTo points Caddy at a deployment that's now live, then removes the
-// app's older containers. If the route update fails, nothing is removed.
-func (d *Deployer) switchTo(ctx context.Context, log *slog.Logger, out *deployLog, app string, deploymentID int64) error {
-	if err := d.ApplyRoutes(ctx); err != nil {
-		return err
+// build downloads the deployment's commit and builds its image (the code
+// streams from GitHub straight into Docker's build), moving the deployment
+// from building to starting. It returns the image's tag.
+func (d *Deployer) build(ctx context.Context, out *deployLog, app store.App, dep store.Deployment, labels map[string]string) (string, error) {
+	if err := d.store.MarkBuilding(ctx, dep.ID); err != nil {
+		return "", err
 	}
-	d.removeOlderContainers(context.WithoutCancel(ctx), log, out, app, deploymentID)
-	return nil
+	tag := ImageTag(app.Name, dep.CommitSHA)
+	where := "the repo's root"
+	if app.SourceDir != "" {
+		where = app.SourceDir + "/"
+	}
+	out.Printf("Building image %s from %s", tag, where)
+	src, err := d.source.BuildContext(ctx, app.RepoURL, dep.CommitSHA, app.SourceDir)
+	if err != nil {
+		return "", err
+	}
+	stream := &streamReader{r: src}
+	err = d.engine.Build(ctx, stream, tag, labels, out.Build)
+	src.Close()
+	if err != nil {
+		// Problems with the code itself (too large, source directory
+		// missing) are found while Docker reads the stream, so Build fails
+		// with whatever Docker made of the cut-off upload. The stream's own
+		// error is the real cause, and its message is one users can act on.
+		if streamErr := stream.Err(); streamErr != nil {
+			return "", streamErr
+		}
+		return "", err
+	}
+	if err := d.store.MarkStarting(ctx, dep.ID, tag); err != nil {
+		return "", err
+	}
+	return tag, nil
+}
+
+// ErrImageGone means a rollback's image no longer exists in Docker. The
+// platform only lets an app roll back to images it keeps, so this is an image
+// removed by hand (e.g. docker image prune -a) since.
+var ErrImageGone = errors.New("the image to roll back to no longer exists; deploy its commit instead")
+
+// reuseImage is a rollback's stand-in for build: the image was built by an
+// earlier deployment, so it's only checked to still exist. The deployment
+// moves from queued (or starting, on a retry) to starting.
+func (d *Deployer) reuseImage(ctx context.Context, out *deployLog, dep store.Deployment) (string, error) {
+	ok, err := d.engine.ImageExists(ctx, dep.ImageTag)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", ErrImageGone
+	}
+	if err := d.store.StartRollback(ctx, dep.ID); err != nil {
+		return "", err
+	}
+	out.Printf("Using image %s (no build)", dep.ImageTag)
+	return dep.ImageTag, nil
+}
+
+// pruneImages removes the app's images that are no longer kept: the platform
+// keeps the images of its store.ImagesKept most recent live versions (what a
+// rollback can go back to) and removes the rest, including images that were
+// built but never went live. Called once a deploy has switched over and
+// removed the old containers. Best effort: failures are logged, and the next
+// deploy tries again.
+//
+// It goes by what Docker has (the images labelled with the app's name), not
+// by the database's deployments, so an image that failed to be removed once
+// is simply seen again next time; and it only ever touches the app's own
+// images, under the app's own tag prefix. Removal is never forced, so an
+// image a container still uses stays.
+func (d *Deployer) pruneImages(ctx context.Context, log *slog.Logger, out *deployLog, app store.App) {
+	kept, err := d.store.KeptImages(ctx, app.ID)
+	if err != nil {
+		log.Warn("reading the images to keep", "err", err)
+		return
+	}
+	keep := map[string]bool{}
+	for _, t := range kept {
+		keep[t] = true
+	}
+	// Once this deploy is live it's no longer in progress, so the app's next
+	// one may have started already: its image (built, or about to be) stays.
+	recent, err := d.store.Deployments(ctx, app.ID, 1)
+	if err != nil {
+		log.Warn("reading the app's latest deployment", "err", err)
+		return
+	}
+	if len(recent) == 1 && inProgress(recent[0].Status) {
+		keep[ImageTag(app.Name, recent[0].CommitSHA)] = true
+		if recent[0].ImageTag != "" {
+			keep[recent[0].ImageTag] = true
+		}
+	}
+
+	images, err := d.engine.AppImages(ctx, app.Name)
+	if err != nil {
+		log.Warn("listing the app's images", "err", err)
+		return
+	}
+	prefix := ImageTag(app.Name, "")
+	removed := 0
+	for _, img := range images {
+		var refs []string
+		for _, t := range img.Tags {
+			if strings.HasPrefix(t, prefix) && !keep[t] {
+				refs = append(refs, t)
+			}
+		}
+		if len(img.Tags) == 0 {
+			// Left untagged when a redeploy of the same commit moved its tag
+			// to a newer build.
+			refs = []string{img.ID}
+		}
+		for _, ref := range refs {
+			switch err := d.engine.RemoveImage(ctx, ref); {
+			case errors.Is(err, engine.ErrImageInUse):
+				// A container still uses it; tried again next time.
+			case err != nil:
+				log.Warn("removing an old image", "image", ref, "err", err)
+			default:
+				removed++
+			}
+		}
+	}
+	if removed > 0 {
+		out.Printf("Removed %d old images; the last %d live versions are kept for rollbacks", removed, store.ImagesKept)
+	}
+}
+
+// inProgress reports whether a deployment hasn't finished yet.
+func inProgress(s store.DeploymentStatus) bool {
+	return s == store.StatusQueued || s == store.StatusBuilding || s == store.StatusStarting
 }
 
 func shortSHA(sha string) string { return sha[:min(7, len(sha))] }
@@ -497,27 +648,117 @@ func (d *Deployer) ApplyRoutes(ctx context.Context) error {
 	return d.router.Apply(ctx, routes)
 }
 
-// removeOlderContainers removes the app's containers from deployments before
-// live: the version it replaced, and any left over from earlier failures.
-// Newer ones are left alone: once live is no longer in progress, the app's
-// next deploy may already have started its container. Failures are logged
+// retireOlder stops and removes the app's containers from deployments before
+// live, once Caddy routes to live: the version it replaced, and any left over
+// from earlier failures. It drains them first (see drain). Newer containers
+// are left alone: once live is no longer in progress, the app's next deploy
+// may already have started its container.
+//
+// The only error is being cut off (the platform shutting down, or the attempt
+// running out of time), and then nothing is removed: a retry finds the
+// deployment healthy and comes back here, and failing that, the next deploy
+// or the platform's next start removes them. Other failures are logged
 // rather than failing the deploy, which has succeeded.
-func (d *Deployer) removeOlderContainers(ctx context.Context, log *slog.Logger, out *deployLog, app string, live int64) {
-	containers, err := d.engine.ManagedContainers(ctx, app)
+func (d *Deployer) retireOlder(ctx context.Context, log *slog.Logger, out *deployLog, app store.App, live int64) error {
+	containers, err := d.engine.ManagedContainers(ctx, app.Name)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		log.Error("listing old containers", "err", err)
-		return
+		return nil
 	}
+	var older []engine.ManagedContainer
 	for _, c := range containers {
 		id, err := strconv.ParseInt(c.Labels[engine.LabelDeployment], 10, 64)
-		if err != nil || id >= live {
-			continue
+		if err == nil && id < live {
+			older = append(older, c)
 		}
-		if err := d.engine.Remove(ctx, c.ID); err != nil {
+	}
+	if len(older) == 0 {
+		return nil
+	}
+	if err := d.drain(ctx, log, out, app.Port, older); err != nil {
+		return err
+	}
+	// Not cancelled part-way: once drained, each takes at most its stop
+	// timeout, and stopping only some would leave the rest for a retry that
+	// may not come.
+	rmCtx := context.WithoutCancel(ctx)
+	for _, c := range older {
+		if err := d.engine.Remove(rmCtx, c.ID); err != nil {
 			log.Error("removing old container", "container", c.Name, "err", err)
 			continue
 		}
 		out.Printf("Removed the previous container %s", c.Name)
+	}
+	return nil
+}
+
+// drain waits until Caddy has no requests in flight to any of containers, or
+// DrainTimeout passes.
+//
+// After a route switch, Caddy sends new requests to the new version but lets
+// the ones already started finish against the old one; stopping the old
+// container under them would cut them off. So the old version is stopped only
+// once Caddy's in-flight count for it is zero. The first check comes one
+// interval after the switch, by when any request the old config had just
+// routed has been counted. Bounded, because a client holding a request open
+// (a long poll, a stream) mustn't hold up the deploy forever; and if Caddy
+// can't be asked, it waits the whole timeout, which is slower but safe.
+//
+// The alternative, a fixed wait, is either too short for a slow request or
+// makes every deploy slower than it needs to be.
+func (d *Deployer) drain(ctx context.Context, log *slog.Logger, out *deployLog, port int, containers []engine.ManagedContainer) error {
+	addrs := make([]string, 0, len(containers))
+	for _, c := range containers {
+		addrs = append(addrs, c.Name+":"+strconv.Itoa(port))
+	}
+	timeout := time.NewTimer(d.cfg.DrainTimeout)
+	defer timeout.Stop()
+	last := -1 // in flight at the last check; -1 if Caddy couldn't be asked
+	warned, waiting := false, false
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			if last < 0 {
+				out.Printf("Couldn't check the previous version's requests; stopping it after %s", d.cfg.DrainTimeout)
+			} else {
+				out.Printf("Stopping the previous version after %s with requests still in flight (%d)", d.cfg.DrainTimeout, last)
+			}
+			return nil
+		case <-time.After(d.cfg.DrainInterval):
+		}
+
+		inFlight, err := d.router.InFlight(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !warned {
+				log.Warn("reading in-flight requests from Caddy; waiting out the drain timeout", "err", err)
+				warned = true
+			}
+			last = -1
+			continue
+		}
+		n := 0
+		for _, a := range addrs {
+			n += inFlight[a]
+		}
+		if n == 0 {
+			if waiting {
+				out.Printf("The previous version's requests have finished")
+			}
+			return nil
+		}
+		if !waiting {
+			out.Printf("Waiting up to %s for the previous version's requests to finish (%d in flight)", d.cfg.DrainTimeout, n)
+			waiting = true
+		}
+		last = n
 	}
 }
 
@@ -594,6 +835,8 @@ func publicReason(err error, deployTimeout time.Duration) string {
 		return source.ErrDirNotFound.Error()
 	case errors.Is(err, errTimedOut):
 		return fmt.Sprintf("deploy timed out after %s", deployTimeout)
+	case errors.Is(err, ErrImageGone):
+		return ErrImageGone.Error()
 	case errors.Is(err, jobs.ErrNoAttemptsLeft):
 		return "gave up: " + jobs.ErrNoAttemptsLeft.Error()
 	}

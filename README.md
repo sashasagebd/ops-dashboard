@@ -171,6 +171,20 @@ that isn't.
 One webhook per repo is enough: a push deploys every app registered with
 that repo and branch.
 
+### Deploys and rollbacks
+
+A deploy starts the new version next to the old one and switches traffic
+only once the new one passes its health check; a version that fails it never
+goes live. After the switch, the old version gets up to 15s to finish the
+requests it's serving before it's stopped.
+
+To undo a bad version that did go live, press **Roll back** on an earlier
+deployment on the app's page. That version's image runs again (no build),
+with the app's current env vars, through the same health check and switch.
+Rolling back turns auto-deploy off, so that a push doesn't replace it; turn
+it back on once the fix is pushed. The platform keeps the images of each
+app's last 6 live versions, so a rollback can go back 5 versions.
+
 ### Updating
 
 ```sh

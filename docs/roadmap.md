@@ -5,7 +5,7 @@ platform in [platform-plan.md](platform-plan.md) (P0 onwards, numbered after
 the plan's phases). Each numbered step is one small, reviewed commit. Design
 reasoning lives in [decisions/](decisions/).
 
-_Last updated: 2026-11-03_
+_Last updated: 2026-11-04_
 
 | Milestone | Status |
 |---|---|
@@ -18,18 +18,14 @@ _Last updated: 2026-11-03_
 | P0: Platform foundations | ✅ Done, deployed 2026-11-02 (PR #1) |
 | P1: Manual deploy of one app | ✅ Done, deployed 2026-11-03 |
 | P2: Push-to-deploy, job queue, live logs | ✅ Done, deployed 2026-11-03 (PR #7) |
+| P3: Zero-downtime deploys and rollbacks | 🚧 In progress (plan approved 2026-11-04) |
 
-**Where we left off (2026-11-03):** P0, P1 and P2 are done and deployed.
-Pushing to `main` deploys `examples/hello` with no clicks (GitHub webhook →
-Tailscale Funnel on :8443 → the platform's webhook listener), the build log
-streams live in the dashboard, and a platform killed mid-build picks the
-same deploy up again and finishes it. Each phase lives on one branch with
-one draft PR, merged and deployed at the end.
-**Next:** plan P3 (zero-downtime deploys and rollbacks; see
-[platform-plan.md](platform-plan.md)). Much of P3's first half already
-exists (new container next to the old, health check through Caddy, switch
-only once healthy, the old one kept if the new one fails), so the plan
-should start from what's left: draining the old container, and rollback.
+**Where we left off (2026-11-04):** P0, P1 and P2 are done and deployed.
+Pushing to `main` deploys `examples/hello` with no clicks, the build log
+streams live, and a platform killed mid-build finishes the same deploy after
+it restarts. P3's plan is approved (below); work is on the `platform-p3`
+branch.
+**Next:** 3.2 (rollback) is written; after CI, the server checks of P3's done-when, then merge and deploy.
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -400,6 +396,38 @@ Decisions (approved 2026-11-03), with entries in
 - **SSE, not WebSockets,** for streaming logs: one-way, works through the
   dashboard's plain HTTP proxy, and browsers reconnect on their own.
 
+## P3: Zero-downtime deploys and rollbacks 🚧
+
+Phase 3 of [platform-plan.md](platform-plan.md). Plan approved 2026-11-04.
+
+**Done when** (from the plan): deploying a deliberately broken commit leaves
+the site up, and rollback works from the dashboard.
+
+Already in place from P1/P2: the new container starts next to the old one,
+is health-checked through Caddy on a probe hostname, and the route switches
+only once it's healthy; a failed health check marks the deploy failed and
+the old version keeps serving. What's left: the old container is removed the
+moment the route switches (in-flight requests can be cut off), there's no
+rollback, and built images are never removed.
+
+| Step | What | Status |
+|---|---|---|
+| 3.1 | **Drain the old container, and prove there's no downtime.** First, confirm what Caddy does with in-flight proxied requests on a config change (and how that interacts with the router's 10s client timeout); set an explicit `grace_period` on the `apps` server. After the route switch, wait until Caddy's `GET /reverse_proxy/upstreams` shows no requests in flight to the old upstream (bounded, ~15s), then stop it (SIGTERM, 10s stop timeout). `examples/hello` shuts down gracefully on SIGTERM, and `BROKEN=1` makes its `/healthz` answer 500 (a broken deploy on purpose). CI: requests in a loop against hello during a redeploy, zero failures; a slow request started just before the switch completes; a broken deploy leaves the old version serving. | ✅ `3799b91`, CI green. From Caddy's source: a config change returns once the old config *starts* shutting down (no clash with the 10s timeout), and in-flight counts per upstream survive config changes, so the drain works as planned. `grace_period` **not** set (it's the whole `http` app's setting, not the platform's server, and `--resume` ignores `caddy.json`); the 15s cap plus stopping the container bounds it instead. Drain checks every 250ms. Beyond the plan: a live deployment whose job is given up isn't marked failed (its log says the switch was cut off); `hello` gained `/slow?seconds=N`. Details in [decisions/platform.md](decisions/platform.md) ("Draining the old version"). |
+| 3.2 | **One-click rollback, end to end.** Migration 0008 (`deployments.rollback_of`). A rollback is a new deployment reusing the target's image: queued → starting (no build) → probe → switch → drain; the version it replaces becomes `rolled_back`. Same job kind and one-in-progress rule (409 while a deploy runs). `POST /api/platform/apps/{id}/deployments/{deploymentId}/rollback` → 202; the target must have been live once and still have its image; deployments get `rollbackable`. Engine: image inspect and remove. Image retention: after a successful deploy, keep the live image plus the last 5 previously live per app, remove the rest. UI: a Rollback button (with confirm) on eligible rows, "rollback of #N", a notice that auto-deploy was turned off. CI rolls back through the dashboard (no build lines in its log) and checks the old version is served. Decision entries; server checks of the done-when. | 🔍 Written, awaiting review and CI; then the server checks. Migration 0008 (`rollback_of`, a foreign key on `(app_id, rollback_of)` so the database refuses another app's deployment). `store.CheckRollback` decides what's rollbackable, for both the API flag and `CreateRollback`. Image cleanup goes by what Docker lists for the app (tags not kept, and untagged images left by a redeploy of the same commit); never forced. CI deploys this commit's parent, then this commit, rolls back to the parent while the visitor keeps requesting, and checks the image, the `rolled_back` status, no build, auto-deploy off, and a 409 for rolling back to what's live. Details in [decisions/platform.md](decisions/platform.md) ("How rollbacks and image cleanup work"). |
+
+Decisions (approved 2026-11-04), to be written up in
+[decisions/platform.md](decisions/platform.md) as they land:
+- **A rollback is a new deployment,** not the old row made healthy again:
+  statuses stay forward-only and the history reads truthfully ("#12:
+  rollback of #9").
+- **A rollback uses the app's current env vars.** Values aren't versioned;
+  versioning them is real extra scope. The UI says so.
+- **A rollback turns auto-deploy off and clears a waiting pushed commit,**
+  so a push already queued doesn't undo it as soon as it finishes. The owner
+  turns auto-deploy back on once a fix is pushed.
+- **Five previously live images are kept per app** (plus the live one),
+  which is how far back a rollback can go.
+
 ## Open questions
 
 - **Domain for public apps** (deferred, not blocking P1 or P2). The owner
@@ -420,6 +448,7 @@ Resolved:
 - **P0 plan** approved 2026-10-28.
 - **P1 plan** approved 2026-11-02.
 - **P2 plan** approved 2026-11-03.
+- **P3 plan** approved 2026-11-04.
 - **Docker version on the server** (2026-11-02): 29.8.1, API 1.56; see P1's
   risks for what it means for building.
 - **Discord bot** is already Dockerized (`~/apps/discordbot`: Node/TS with a

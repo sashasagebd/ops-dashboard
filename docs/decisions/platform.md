@@ -951,3 +951,112 @@ doesn't retry, so the push is lost); a `jobs` row per push to serialize
 deploys (the jobs table runs deploys, it doesn't decide which commit; and a
 push isn't a deployment until it starts); checking the signature after
 parsing (does work for unauthenticated requests).
+
+## Phase 3 (approved 2026-11-04)
+
+### A rollback is a new deployment of an old image
+
+**What:** rolling back to deployment #9 creates a new deployment ("#12:
+rollback of #9") that reuses #9's image: no download, no build, but the
+same start, health check, switch and drain as any deploy. The version it
+replaces is marked `rolled_back`.
+**Why:** statuses only move forward (a database rule since P1), so #9
+can't become healthy again; and the history then says what happened, in
+order. It also reuses everything a deploy already guarantees (one deploy in
+progress per app, retries, the old version kept if the new one fails).
+**Alternatives:** making #9 live again (breaks forward-only statuses, and
+the history would show #9 live twice with nothing in between); rebuilding
+#9's commit (slow, and not the same image if a base image has moved).
+
+### A rollback uses today's env vars, and turns auto-deploy off
+
+**What:** a rollback runs the old image with the app's current env vars. It
+also turns auto-deploy off and drops a waiting pushed commit.
+**Why:** env var values aren't versioned, and versioning them is real
+extra scope for little gain. Without turning auto-deploy off, a push
+already waiting (or the next one, which may not be the fix) would undo the
+rollback straight away. The owner turns it back on once the fix is pushed.
+**Alternatives:** versioned config per deployment, as Heroku's releases do
+(more storage and UI for a single user); leaving auto-deploy on (the
+rollback might last seconds).
+
+### Five previous images are kept per app
+
+**What:** after a successful deploy, the platform keeps the live image and
+those of the 5 most recent previously live deployments per app, and
+removes the rest. That's how far back a rollback can go.
+**Why:** every push builds a new image, and nothing removed them; the
+server's disk is 256 GB. Five covers "the last few versions", which is what
+rollbacks are for.
+**Alternatives:** keeping every image (fills the disk); Docker's own prune
+(not per app, and it would also see images the platform doesn't own).
+
+### Draining the old version through Caddy's in-flight counts (3.1, 2026-11-04)
+
+**What:** after the route switches, the deploy waits until Caddy reports no
+requests in flight to the old container, at most 15s, then stops it
+(SIGTERM, then SIGKILL after 10s). Before, it was removed straight after
+the switch.
+**Why:** read from Caddy's source (2.11.7): a config change returns as
+soon as the old config *starts* shutting down, and the old config keeps
+finishing the requests it had already started, against the old upstream,
+however long they take. So removing the old container at once could cut
+those requests off. Caddy counts in-flight requests per upstream address
+in a global table that survives config changes, and
+`GET /reverse_proxy/upstreams` reports it, so the old upstream's count is
+still visible after its route has gone. The first check comes one interval
+(250ms) after the switch, by when any request the old config had just
+routed has been counted. Bounded at 15s, so a client holding a request open
+(a long poll, a stream) can't hold up the deploy; if Caddy can't be asked,
+it waits the whole 15s. A drain cut off by a shutdown hands the job back,
+and the retry, finding the deployment healthy, drains again. If a live
+deployment's job is given up (say it timed out while draining), it isn't
+marked failed; its log says the switch was cut off, and the next deploy or
+platform start removes the old container.
+**Not done:** setting Caddy's `grace_period`. It belongs to the whole
+`http` app, not the `apps` server the platform owns, and `--resume`
+ignores `caddy/caddy.json` once Caddy has saved its config. It's not
+needed: stopping the old container after the 15s cap also ends any request
+still hanging on the old config.
+**Alternatives:** a fixed wait (too short for a slow request, or slower
+than needed for every deploy); relying on the app's SIGTERM handling alone
+(that covers requests the app has, not ones Caddy is still forwarding).
+`examples/hello` shuts down gracefully on SIGTERM, as apps should.
+
+### How rollbacks and image cleanup work (3.2, 2026-11-04)
+
+**What:** the details behind the three rollback entries above.
+- **The database checks what it can.** A rollback's `rollback_of` is a
+  foreign key on `(app_id, rollback_of)`, so it can only name one of the same
+  app's deployments; a check requires a rollback to have its image tag from
+  the start. The one-in-progress index covers rollbacks like any deploy.
+  `CreateRollback` locks the app's row, checks the target, inserts the
+  deployment and its job, and turns auto-deploy off, in one transaction: a
+  refused rollback changes nothing.
+- **What can be rolled back to** is decided in one place
+  (`store.CheckRollback`), used both by the API's `rollbackable` flag and by
+  `CreateRollback`: a deployment that was live before (superseded or rolled
+  back), whose image is among the kept ones, and that isn't the same image as
+  the live version.
+- **A rollback skips the build, not the checks.** It goes queued → starting
+  → healthy: the image is checked to still exist (someone may have pruned it
+  by hand; then it fails at once, saying to deploy the commit instead), and
+  then it's started, health-checked, switched to and drained like any deploy.
+- **Kept images are counted per image, not per deployment:** redeploying a
+  commit, or rolling back to it, reuses its tag. The six most recent distinct
+  images of ever-live deployments are kept.
+- **Cleanup goes by what Docker has.** After each successful deploy, the
+  platform lists the images labelled with the app's name (Build labels every
+  image) and removes the tags under `ops-platform/<app>:` that aren't kept,
+  plus untagged ones (a redeploy of the same commit moves its tag to the new
+  build, since each build's labels differ). The image of a deploy that has
+  already started is kept too. Removal is never forced, so an image a
+  container still uses stays until a later deploy. Going by Docker's list
+  rather than the database's history means an image that failed to be
+  removed is seen again next time, and nothing outside the app's own images
+  is ever touched.
+
+**Alternatives:** recording removed images in the database (another state
+to keep in step with Docker); `docker image prune` (not per app, sees
+images the platform doesn't own); a CHECK that the rollback target was live
+(statuses change after insert; enforced by the locked transaction instead).
