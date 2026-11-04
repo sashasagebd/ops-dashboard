@@ -23,7 +23,8 @@ type fakeStore struct {
 	apps        []store.App
 	env         map[string]string // "appID/KEY" -> value
 	deployments []store.Deployment
-	err         error // if set, every method fails with it
+	kept        []string // KeptImages' answer
+	err         error    // if set, every method fails with it
 
 	mu       sync.Mutex
 	logs     []store.LogLine
@@ -100,6 +101,8 @@ func (f *fakeStore) Deployments(context.Context, int64, int) ([]store.Deployment
 	return f.deployments, f.err
 }
 
+func (f *fakeStore) KeptImages(context.Context, int64) ([]string, error) { return f.kept, f.err }
+
 func (f *fakeStore) Deployment(_ context.Context, id int64) (store.Deployment, error) {
 	for _, d := range f.deployments {
 		if d.ID == id {
@@ -119,9 +122,18 @@ func (f *fakeStore) CurrentDeployment(context.Context, int64) (store.Deployment,
 }
 
 type fakeDeployer struct {
-	err     error
-	started []string
-	latest  string // the branch head StartLatest finds; "" for none
+	err        error
+	started    []string
+	latest     string // the branch head StartLatest finds; "" for none
+	rolledBack []int64
+}
+
+func (f *fakeDeployer) Rollback(_ context.Context, appID, target int64) (store.Deployment, error) {
+	if f.err != nil {
+		return store.Deployment{}, f.err
+	}
+	f.rolledBack = append(f.rolledBack, target)
+	return store.Deployment{ID: 9, AppID: appID, CommitSHA: sha, Status: store.StatusQueued, RollbackOf: target}, nil
 }
 
 func (f *fakeDeployer) StartLatest(ctx context.Context, appID int64) (store.Deployment, error) {
@@ -368,5 +380,62 @@ func TestDeployLatest(t *testing.T) {
 	rec = do(t, h, "POST", "/api/platform/apps/1/deployments/latest", "")
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "branch wasn't found") {
 		t.Errorf("unknown branch: %d %s; want 400 saying so", rec.Code, rec.Body)
+	}
+}
+
+func TestRollback(t *testing.T) {
+	h, st, dep := newTestAPI()
+	img := func(n string) string { return "ops-platform/hello:" + n }
+	st.deployments = []store.Deployment{
+		{ID: 5, AppID: 1, CommitSHA: sha, Status: store.StatusHealthy, ImageTag: img("c"), RollbackOf: 3},
+		{ID: 4, AppID: 1, CommitSHA: sha, Status: store.StatusRolledBack, ImageTag: img("b")},
+		{ID: 3, AppID: 1, CommitSHA: sha, Status: store.StatusSuperseded, ImageTag: img("c")}, // same image as live
+		{ID: 2, AppID: 1, CommitSHA: sha, Status: store.StatusFailed, ImageTag: img("x")},
+		{ID: 1, AppID: 1, CommitSHA: sha, Status: store.StatusSuperseded, ImageTag: img("a")}, // image no longer kept
+	}
+	st.kept = []string{img("c"), img("b")}
+
+	// Each deployment says whether it can be rolled back to, in both lists.
+	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", ""))
+	list := decode[[]deploymentResponse](t, do(t, h, "GET", "/api/platform/apps/1/deployments", ""))
+	for name, ds := range map[string][]deploymentResponse{"app detail": got.Deployments, "deployment list": list} {
+		var rollbackable []int64
+		for _, d := range ds {
+			if d.Rollbackable {
+				rollbackable = append(rollbackable, d.ID)
+			}
+		}
+		if len(rollbackable) != 1 || rollbackable[0] != 4 {
+			t.Errorf("%s: rollbackable %v, want only 4", name, rollbackable)
+		}
+		if ds[0].RollbackOf == nil || *ds[0].RollbackOf != 3 || ds[1].RollbackOf != nil {
+			t.Errorf("%s: rollbackOf = %v, %v; want 3 on the rollback, null otherwise", name, ds[0].RollbackOf, ds[1].RollbackOf)
+		}
+	}
+
+	rec := do(t, h, "POST", "/api/platform/apps/1/deployments/4/rollback", "")
+	if rec.Code != http.StatusAccepted || len(dep.rolledBack) != 1 || dep.rolledBack[0] != 4 {
+		t.Fatalf("rollback: %d %s, rolled back %v; want 202, to 4", rec.Code, rec.Body, dep.rolledBack)
+	}
+	if r := decode[deploymentResponse](t, rec); r.RollbackOf == nil || *r.RollbackOf != 4 || r.Status != "queued" {
+		t.Errorf("response %+v, want a queued rollback of 4", r)
+	}
+
+	for _, tt := range []struct {
+		err      error
+		path     string
+		wantCode int
+		wantBody string
+	}{
+		{fmt.Errorf("%w: its image is no longer kept", store.ErrNotRollbackable), "/api/platform/apps/1/deployments/1/rollback", http.StatusConflict, "no longer kept"},
+		{store.ErrDeployInProgress, "/api/platform/apps/1/deployments/4/rollback", http.StatusConflict, "already in progress"},
+		{store.ErrNotFound, "/api/platform/apps/1/deployments/77/rollback", http.StatusNotFound, "not found"},
+		{nil, "/api/platform/apps/1/deployments/abc/rollback", http.StatusNotFound, "not found"},
+	} {
+		dep.err = tt.err
+		rec := do(t, h, "POST", tt.path, "")
+		if rec.Code != tt.wantCode || !strings.Contains(rec.Body.String(), tt.wantBody) {
+			t.Errorf("POST %s with %v: %d %s, want %d mentioning %q", tt.path, tt.err, rec.Code, rec.Body, tt.wantCode, tt.wantBody)
+		}
 	}
 }

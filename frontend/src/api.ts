@@ -72,7 +72,8 @@ export type HistoryResponse = {
 // which the dashboard forwards /api/platform/ to.
 
 // DeploymentStatus moves forward only: queued → building → starting →
-// healthy or failed; healthy → superseded when a newer one goes live.
+// healthy or failed (a rollback skips building); healthy → superseded when a
+// newer one goes live, or rolled_back when a rollback replaces it.
 export type DeploymentStatus = 'queued' | 'building' | 'starting' | 'healthy' | 'failed' | 'superseded' | 'rolled_back'
 
 // Deployment matches deploymentResponse.
@@ -83,6 +84,8 @@ export type Deployment = {
   status: DeploymentStatus
   imageTag: string | null // null until built
   error: string | null // why it failed; null unless failed
+  rollbackOf: number | null // the deployment whose image a rollback runs
+  rollbackable: boolean // can be rolled back to (only in an app's deployment lists)
   createdAt: string // RFC 3339
   startedAt: string | null
   finishedAt: string | null
@@ -176,6 +179,13 @@ export function deployCommit(appId: number, commitSha: string): Promise<Deployme
 // platform looks up on GitHub.
 export function deployLatest(appId: number): Promise<Deployment> {
   return sendJSON<Deployment>('POST', `/api/platform/apps/${appId}/deployments/latest`)
+}
+
+// rollback rolls the app back to an earlier deployment: a new deployment
+// that runs its image, with no build. It also turns the app's auto-deploy
+// off.
+export function rollback(appId: number, deploymentId: number): Promise<Deployment> {
+  return sendJSON<Deployment>('POST', `/api/platform/apps/${appId}/deployments/${deploymentId}/rollback`)
 }
 
 export function setAutoDeploy(appId: number, autoDeploy: boolean): Promise<PlatformApp> {

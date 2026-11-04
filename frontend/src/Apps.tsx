@@ -8,6 +8,7 @@ import {
   deploymentLogURL,
   fetchApp,
   fetchApps,
+  rollback,
   setAutoDeploy,
   setEnvVar,
   type AppDetail,
@@ -171,8 +172,9 @@ export function AppPage({ id }: { id: number }) {
             <Logs app={app} choice={log} onChoose={setLog} />
             <h3>Deployments</h3>
             <DeploymentsTable
-              deployments={app.deployments}
+              app={app}
               now={checkedAt}
+              onRolledBack={onDeployed}
               shownLog={log?.kind === 'deployment' ? log.id : (app.deployments.at(0)?.id ?? null)}
               onShowLog={(id) => setLog({ kind: 'deployment', id })}
             />
@@ -280,6 +282,12 @@ function AutoDeploy({ app, onDone }: { app: AppDetail; onDone: () => void }) {
         />{' '}
         Deploy automatically on every push to <span className="mono">{app.branch}</span>
       </label>
+      {!app.autoDeploy && rolledBackTo(app) !== null && (
+        <p className="muted">
+          Turned off by the rollback to #{rolledBackTo(app)}, so that a push doesn't replace it. Turn it back on once
+          the fix is pushed.
+        </p>
+      )}
       {app.nextCommitSha !== null && (
         <p className="muted">
           Pushed while a deploy was running: <span className="mono">{shortSHA(app.nextCommitSha)}</span> deploys
@@ -289,6 +297,12 @@ function AutoDeploy({ app, onDone }: { app: AppDetail; onDone: () => void }) {
       <ActionError state={action} />
     </div>
   )
+}
+
+// rolledBackTo is the deployment the app's latest deploy rolled back to, or
+// null if its latest deploy isn't a rollback.
+function rolledBackTo(app: AppDetail): number | null {
+  return app.deployments.at(0)?.rollbackOf ?? null
 }
 
 function EnvVars({ app, onDone }: { app: AppDetail; onDone: () => void }) {
@@ -421,17 +435,31 @@ function Logs({
 }
 
 function DeploymentsTable({
-  deployments,
+  app,
   now,
+  onRolledBack,
   shownLog,
   onShowLog,
 }: {
-  deployments: Deployment[]
+  app: AppDetail
   now: number
+  onRolledBack: (d: Deployment) => void
   shownLog: number | null
   onShowLog: (id: number) => void
 }) {
+  const [action, run] = useAction()
+  const deployments = app.deployments
   if (deployments.length === 0) return <p>No deploys yet.</p>
+  const deploying = deployments.some((d) => IN_PROGRESS.has(d.status))
+
+  const onRollback = (d: Deployment) => {
+    const question =
+      `Roll back to #${d.id} (${shortSHA(d.commitSha)})? Its image runs again, with today's env vars, ` +
+      `and auto-deploy is turned off so that a push doesn't replace it.`
+    if (!window.confirm(question)) return
+    void run(async () => onRolledBack(await rollback(app.id, d.id)))
+  }
+
   return (
     <div className="table-scroll">
       <table>
@@ -444,14 +472,20 @@ function DeploymentsTable({
             <th scope="col">
               <span className="visually-hidden">Log</span>
             </th>
+            <th scope="col">
+              <span className="visually-hidden">Rollback</span>
+            </th>
           </tr>
         </thead>
         <tbody>
           {deployments.map((d) => (
             <tr key={d.id}>
               <td>{d.id}</td>
-              <td className="mono" title={d.commitSha}>
-                {shortSHA(d.commitSha)}
+              <td>
+                <span className="mono" title={d.commitSha}>
+                  {shortSHA(d.commitSha)}
+                </span>
+                {d.rollbackOf !== null && <div className="muted">rollback of #{d.rollbackOf}</div>}
               </td>
               <td>
                 <span className={`badge badge-${STATUS_BADGE[d.status]}`}>{d.status.replace('_', ' ')}</span>
@@ -468,10 +502,23 @@ function DeploymentsTable({
                   Log
                 </button>
               </td>
+              <td>
+                {d.rollbackable && (
+                  <button
+                    type="button"
+                    aria-label={`Roll back to deploy #${d.id}`}
+                    disabled={deploying || action.status === 'busy'}
+                    onClick={() => onRollback(d)}
+                  >
+                    Roll back
+                  </button>
+                )}
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
+      <ActionError state={action} />
     </div>
   )
 }

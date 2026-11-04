@@ -20,6 +20,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +50,10 @@ type Store interface {
 	PruneDeploymentLogs(ctx context.Context, appID int64, keep int) (int64, error)
 	RequestDeployment(ctx context.Context, appID int64, commitSHA string) (store.Deployment, bool, error)
 	StartNextDeployment(ctx context.Context, appID int64) (store.Deployment, bool, error)
+	Deployments(ctx context.Context, appID int64, limit int) ([]store.Deployment, error)
+	CreateRollback(ctx context.Context, appID, targetID int64) (store.Deployment, error)
+	StartRollback(ctx context.Context, id int64) error
+	KeptImages(ctx context.Context, appID int64) ([]string, error)
 }
 
 type Source interface {
@@ -61,6 +66,9 @@ type Engine interface {
 	Run(ctx context.Context, spec engine.RunSpec) (string, error)
 	Remove(ctx context.Context, id string) error
 	ManagedContainers(ctx context.Context, app string) ([]engine.ManagedContainer, error)
+	AppImages(ctx context.Context, app string) ([]engine.Image, error)
+	ImageExists(ctx context.Context, ref string) (bool, error)
+	RemoveImage(ctx context.Context, ref string) error
 }
 
 type Router interface {
@@ -131,6 +139,19 @@ func (d *Deployer) StartLatest(ctx context.Context, appID int64) (store.Deployme
 		return store.Deployment{}, err
 	}
 	return d.Start(ctx, appID, sha)
+}
+
+// Rollback queues a rollback of an app to one of its earlier deployments: a
+// new deployment that runs that one's image, with no build (see
+// store.CreateRollback, which also turns the app's auto-deploy off). Errors
+// as CreateRollback's.
+func (d *Deployer) Rollback(ctx context.Context, appID, targetID int64) (store.Deployment, error) {
+	dep, err := d.store.CreateRollback(ctx, appID, targetID)
+	if err != nil {
+		return store.Deployment{}, err
+	}
+	d.notify()
+	return dep, nil
 }
 
 // Push deploys a pushed commit: straight away if the app has no deploy in
@@ -258,6 +279,7 @@ func permanent(err error) bool {
 	return errors.As(err, &buildErr) || errors.As(err, &healthErr) ||
 		errors.Is(err, source.ErrNotFound) || errors.Is(err, source.ErrTooLarge) ||
 		errors.Is(err, source.ErrDirNotFound) || errors.Is(err, errTimedOut) ||
+		errors.Is(err, ErrImageGone) ||
 		// The app or deployment was deleted, or the deployment finished
 		// some other way.
 		errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrWrongStatus)
@@ -281,7 +303,12 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		if _, err := d.store.PruneDeploymentLogs(ctx, app.ID, keepLogsFor); err != nil {
 			log.Warn("pruning old deploy logs", "err", err)
 		}
-		out.Printf("Deploying %s at %s (attempt %d)", app.RepoURL, shortSHA(dep.CommitSHA), job.Attempts)
+		if dep.RollbackOf != 0 {
+			out.Printf("Rolling back to deployment #%d (%s at %s), reusing its image (attempt %d)",
+				dep.RollbackOf, app.RepoURL, shortSHA(dep.CommitSHA), job.Attempts)
+		} else {
+			out.Printf("Deploying %s at %s (attempt %d)", app.RepoURL, shortSHA(dep.CommitSHA), job.Attempts)
+		}
 		// Building or starting: an earlier attempt was cut off. Its
 		// container, if it got that far, has this deployment's name, so it
 		// goes first; the build is simply redone, mostly from Docker's
@@ -301,6 +328,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		if err := d.retireOlder(ctx, log, out, app, dep.ID); err != nil {
 			return err
 		}
+		d.pruneImages(ctx, log, out, app)
 		out.Printf("Live at http://%s/", app.Hostname)
 		return nil
 	default:
@@ -310,41 +338,18 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		return nil
 	}
 
-	if err := d.store.MarkBuilding(ctx, dep.ID); err != nil {
-		return err
-	}
-
-	// Download and build. The code streams from GitHub straight into
-	// Docker's build.
-	tag := ImageTag(app.Name, dep.CommitSHA)
-	where := "the repo's root"
-	if app.SourceDir != "" {
-		where = app.SourceDir + "/"
-	}
-	out.Printf("Building image %s from %s", tag, where)
-	src, err := d.source.BuildContext(ctx, app.RepoURL, dep.CommitSHA, app.SourceDir)
-	if err != nil {
-		return err
-	}
 	labels := map[string]string{
 		engine.LabelApp:        app.Name,
 		engine.LabelAppID:      strconv.FormatInt(app.ID, 10),
 		engine.LabelDeployment: strconv.FormatInt(dep.ID, 10),
 	}
-	stream := &streamReader{r: src}
-	err = d.engine.Build(ctx, stream, tag, labels, out.Build)
-	src.Close()
-	if err != nil {
-		// Problems with the code itself (too large, source directory
-		// missing) are found while Docker reads the stream, so Build fails
-		// with whatever Docker made of the cut-off upload. The stream's own
-		// error is the real cause, and its message is one users can act on.
-		if streamErr := stream.Err(); streamErr != nil {
-			return streamErr
-		}
-		return err
+	var tag string
+	if dep.RollbackOf != 0 {
+		tag, err = d.reuseImage(ctx, out, dep)
+	} else {
+		tag, err = d.build(ctx, out, app, dep, labels)
 	}
-	if err := d.store.MarkStarting(ctx, dep.ID, tag); err != nil {
+	if err != nil {
 		return err
 	}
 
@@ -381,8 +386,9 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		return err
 	}
 
-	// Healthy: make it the live deployment (superseding the old one in the
-	// same transaction), then point the app's hostname at it.
+	// Healthy: make it the live deployment (superseding the old one, or
+	// marking it rolled back, in the same transaction), then point the app's
+	// hostname at it.
 	out.Printf("Healthy")
 	if err := d.store.MarkHealthy(ctx, dep.ID); err != nil {
 		return err
@@ -401,9 +407,145 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 	if err := d.retireOlder(ctx, log, out, app, dep.ID); err != nil {
 		return err
 	}
+	d.pruneImages(ctx, log, out, app)
 	log.Info("deploy finished: healthy")
 	out.Printf("Live at http://%s/", app.Hostname)
 	return nil
+}
+
+// build downloads the deployment's commit and builds its image (the code
+// streams from GitHub straight into Docker's build), moving the deployment
+// from building to starting. It returns the image's tag.
+func (d *Deployer) build(ctx context.Context, out *deployLog, app store.App, dep store.Deployment, labels map[string]string) (string, error) {
+	if err := d.store.MarkBuilding(ctx, dep.ID); err != nil {
+		return "", err
+	}
+	tag := ImageTag(app.Name, dep.CommitSHA)
+	where := "the repo's root"
+	if app.SourceDir != "" {
+		where = app.SourceDir + "/"
+	}
+	out.Printf("Building image %s from %s", tag, where)
+	src, err := d.source.BuildContext(ctx, app.RepoURL, dep.CommitSHA, app.SourceDir)
+	if err != nil {
+		return "", err
+	}
+	stream := &streamReader{r: src}
+	err = d.engine.Build(ctx, stream, tag, labels, out.Build)
+	src.Close()
+	if err != nil {
+		// Problems with the code itself (too large, source directory
+		// missing) are found while Docker reads the stream, so Build fails
+		// with whatever Docker made of the cut-off upload. The stream's own
+		// error is the real cause, and its message is one users can act on.
+		if streamErr := stream.Err(); streamErr != nil {
+			return "", streamErr
+		}
+		return "", err
+	}
+	if err := d.store.MarkStarting(ctx, dep.ID, tag); err != nil {
+		return "", err
+	}
+	return tag, nil
+}
+
+// ErrImageGone means a rollback's image no longer exists in Docker. The
+// platform only lets an app roll back to images it keeps, so this is an image
+// removed by hand (e.g. docker image prune -a) since.
+var ErrImageGone = errors.New("the image to roll back to no longer exists; deploy its commit instead")
+
+// reuseImage is a rollback's stand-in for build: the image was built by an
+// earlier deployment, so it's only checked to still exist. The deployment
+// moves from queued (or starting, on a retry) to starting.
+func (d *Deployer) reuseImage(ctx context.Context, out *deployLog, dep store.Deployment) (string, error) {
+	ok, err := d.engine.ImageExists(ctx, dep.ImageTag)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", ErrImageGone
+	}
+	if err := d.store.StartRollback(ctx, dep.ID); err != nil {
+		return "", err
+	}
+	out.Printf("Using image %s (no build)", dep.ImageTag)
+	return dep.ImageTag, nil
+}
+
+// pruneImages removes the app's images that are no longer kept: the platform
+// keeps the images of its store.ImagesKept most recent live versions (what a
+// rollback can go back to) and removes the rest, including images that were
+// built but never went live. Called once a deploy has switched over and
+// removed the old containers. Best effort: failures are logged, and the next
+// deploy tries again.
+//
+// It goes by what Docker has (the images labelled with the app's name), not
+// by the database's deployments, so an image that failed to be removed once
+// is simply seen again next time; and it only ever touches the app's own
+// images, under the app's own tag prefix. Removal is never forced, so an
+// image a container still uses stays.
+func (d *Deployer) pruneImages(ctx context.Context, log *slog.Logger, out *deployLog, app store.App) {
+	kept, err := d.store.KeptImages(ctx, app.ID)
+	if err != nil {
+		log.Warn("reading the images to keep", "err", err)
+		return
+	}
+	keep := map[string]bool{}
+	for _, t := range kept {
+		keep[t] = true
+	}
+	// Once this deploy is live it's no longer in progress, so the app's next
+	// one may have started already: its image (built, or about to be) stays.
+	recent, err := d.store.Deployments(ctx, app.ID, 1)
+	if err != nil {
+		log.Warn("reading the app's latest deployment", "err", err)
+		return
+	}
+	if len(recent) == 1 && inProgress(recent[0].Status) {
+		keep[ImageTag(app.Name, recent[0].CommitSHA)] = true
+		if recent[0].ImageTag != "" {
+			keep[recent[0].ImageTag] = true
+		}
+	}
+
+	images, err := d.engine.AppImages(ctx, app.Name)
+	if err != nil {
+		log.Warn("listing the app's images", "err", err)
+		return
+	}
+	prefix := ImageTag(app.Name, "")
+	removed := 0
+	for _, img := range images {
+		var refs []string
+		for _, t := range img.Tags {
+			if strings.HasPrefix(t, prefix) && !keep[t] {
+				refs = append(refs, t)
+			}
+		}
+		if len(img.Tags) == 0 {
+			// Left untagged when a redeploy of the same commit moved its tag
+			// to a newer build.
+			refs = []string{img.ID}
+		}
+		for _, ref := range refs {
+			switch err := d.engine.RemoveImage(ctx, ref); {
+			case errors.Is(err, engine.ErrImageInUse):
+				// A container still uses it; tried again next time.
+			case err != nil:
+				log.Warn("removing an old image", "image", ref, "err", err)
+			default:
+				removed++
+			}
+		}
+	}
+	if removed > 0 {
+		out.Printf("Removed %d old images; the last %d live versions are kept for rollbacks", removed, store.ImagesKept)
+	}
+}
+
+// inProgress reports whether a deployment hasn't finished yet.
+func inProgress(s store.DeploymentStatus) bool {
+	return s == store.StatusQueued || s == store.StatusBuilding || s == store.StatusStarting
 }
 
 func shortSHA(sha string) string { return sha[:min(7, len(sha))] }
@@ -693,6 +835,8 @@ func publicReason(err error, deployTimeout time.Duration) string {
 		return source.ErrDirNotFound.Error()
 	case errors.Is(err, errTimedOut):
 		return fmt.Sprintf("deploy timed out after %s", deployTimeout)
+	case errors.Is(err, ErrImageGone):
+		return ErrImageGone.Error()
 	case errors.Is(err, jobs.ErrNoAttemptsLeft):
 		return "gave up: " + jobs.ErrNoAttemptsLeft.Error()
 	}

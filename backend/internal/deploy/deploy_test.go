@@ -55,6 +55,14 @@ type fakes struct {
 	nextCommit  string  // the commit waiting to deploy next
 	startedNext []int64 // apps StartNextDeployment started a deploy for
 	latest      string  // LatestCommit's answer
+
+	rollbackOf   map[int64]int64  // rollback deployments: the one whose image each runs
+	imageTags    map[int64]string // deployments' image tags, once known
+	kept         []string         // KeptImages' answer
+	recent       []store.Deployment
+	images       []engine.Image // what AppImages lists
+	imageMissing bool           // ImageExists says no
+	imageInUse   map[string]bool
 }
 
 func newFakes() *fakes {
@@ -107,7 +115,39 @@ func (f *fakes) Deployment(_ context.Context, id int64) (store.Deployment, error
 	if !ok {
 		return store.Deployment{}, store.ErrNotFound
 	}
-	return store.Deployment{ID: id, AppID: f.app.ID, CommitSHA: sha, Status: s}, nil
+	return store.Deployment{ID: id, AppID: f.app.ID, CommitSHA: sha, Status: s,
+		RollbackOf: f.rollbackOf[id], ImageTag: f.imageTags[id]}, nil
+}
+
+func (f *fakes) CreateRollback(_ context.Context, appID, targetID int64) (store.Deployment, error) {
+	if f.createErr != nil {
+		return store.Deployment{}, f.createErr
+	}
+	f.setStatus(f.nextID, store.StatusQueued)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rollbackOf == nil {
+		f.rollbackOf = map[int64]int64{}
+	}
+	if f.imageTags == nil {
+		f.imageTags = map[int64]string{}
+	}
+	f.rollbackOf[f.nextID] = targetID
+	f.imageTags[f.nextID] = f.imageTags[targetID]
+	return store.Deployment{ID: f.nextID, AppID: appID, CommitSHA: sha, Status: store.StatusQueued,
+		RollbackOf: targetID, ImageTag: f.imageTags[targetID]}, nil
+}
+
+func (f *fakes) StartRollback(_ context.Context, id int64) error {
+	f.event("starting rollback")
+	f.setStatus(id, store.StatusStarting)
+	return nil
+}
+
+func (f *fakes) KeptImages(context.Context, int64) ([]string, error) { return f.kept, nil }
+
+func (f *fakes) Deployments(context.Context, int64, int) ([]store.Deployment, error) {
+	return f.recent, nil
 }
 
 func (f *fakes) MarkBuilding(_ context.Context, id int64) error {
@@ -243,6 +283,21 @@ func (f *fakes) Run(_ context.Context, spec engine.RunSpec) (string, error) {
 	f.runSpec = spec
 	f.containers = append(f.containers, newContainer)
 	return newContainer.ID, nil
+}
+
+func (f *fakes) AppImages(context.Context, string) ([]engine.Image, error) { return f.images, nil }
+
+func (f *fakes) ImageExists(_ context.Context, ref string) (bool, error) {
+	f.event("image exists? %s", ref)
+	return !f.imageMissing, nil
+}
+
+func (f *fakes) RemoveImage(_ context.Context, ref string) error {
+	f.event("remove image %s", ref)
+	if f.imageInUse[ref] {
+		return engine.ErrImageInUse
+	}
+	return nil
 }
 
 // newContainer is what Run starts for deployment 7, the one under test.
@@ -891,6 +946,137 @@ func TestFinishingADeployStartsTheNextPush(t *testing.T) {
 			t.Error("started the next push while this deploy is still to be retried")
 		}
 	})
+}
+
+// rollbackFakes: deployment 5 was live before 6 (now live); 5's image is
+// still there.
+func rollbackFakes() *fakes {
+	f := newFakes()
+	f.statuses[5] = store.StatusSuperseded
+	f.imageTags = map[int64]string{5: "ops-platform/hello:old5", 6: "ops-platform/hello:" + sha}
+	f.containers = []engine.ManagedContainer{
+		{ID: "old6", Name: "app-hello-6", Labels: map[string]string{engine.LabelDeployment: "6"}},
+	}
+	return f
+}
+
+func TestRollbackReusesTheImage(t *testing.T) {
+	f := rollbackFakes()
+	d := f.deployer()
+	notified := 0
+	d.Notify = func() { notified++ }
+	dep, err := d.Rollback(t.Context(), 1, 5)
+	if err != nil || dep.RollbackOf != 5 || notified != 1 {
+		t.Fatalf("Rollback = %+v, %v, notified %d; want a rollback of 5, queued and notified", dep, err, notified)
+	}
+	if err := d.Run(t.Context(), store.Job{ID: 1, DeploymentID: dep.ID, Attempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No download or build: the old image runs, through the same health
+	// check, switch and drain as any deploy.
+	want := []string{
+		"image exists? ops-platform/hello:old5",
+		"starting rollback",
+		"run app-hello-7",
+		"apply [hello.apps.test->app-hello-6:8080 probe-7.platform.internal->app-hello-7:8080]",
+		"apply [hello.apps.test->app-hello-6:8080]",
+		"healthy",
+		"apply [hello.apps.test->app-hello-7:8080]",
+		"remove old6",
+	}
+	if !slices.Equal(f.events, want) {
+		t.Errorf("events:\n  got  %q\n  want %q", f.events, want)
+	}
+	if f.runSpec.Image != "ops-platform/hello:old5" || f.runSpec.Labels[engine.LabelDeployment] != "7" {
+		t.Errorf("run spec image %q, deployment label %q; want the old image, as deployment 7",
+			f.runSpec.Image, f.runSpec.Labels[engine.LabelDeployment])
+	}
+	if f.statuses[7] != store.StatusHealthy {
+		t.Errorf("status = %s, want healthy", f.statuses[7])
+	}
+	for _, l := range []string{
+		"platform: Rolling back to deployment #5 (https://github.com/o/hello at 0123456), reusing its image (attempt 1)",
+		"platform: Using image ops-platform/hello:old5 (no build)",
+	} {
+		if !slices.Contains(f.logLines, l) {
+			t.Errorf("log %q is missing %q", f.logLines, l)
+		}
+	}
+}
+
+func TestRollbackToAnImageThatsGone(t *testing.T) {
+	f := rollbackFakes()
+	f.imageMissing = true // removed by hand since
+	d := f.deployer()
+	dep, err := d.Rollback(t.Context(), 1, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := store.Job{ID: 1, DeploymentID: dep.ID, Attempts: 1}
+	err = d.Run(t.Context(), job)
+	if !jobs.IsPermanent(err) {
+		t.Fatalf("Run error = %v, want permanent", err)
+	}
+	d.GiveUp(t.Context(), job, err)
+	if f.statuses[7] != store.StatusFailed || f.failReason != ErrImageGone.Error() {
+		t.Errorf("status %s, reason %q; want failed, %q", f.statuses[7], f.failReason, ErrImageGone.Error())
+	}
+	if f.statuses[6] != store.StatusHealthy || len(f.removed) != 0 {
+		t.Errorf("live deployment %s, removed %v; want 6 still live and untouched", f.statuses[6], f.removed)
+	}
+}
+
+func TestRollbackRefusedIsPassedOn(t *testing.T) {
+	f := rollbackFakes()
+	f.createErr = store.ErrDeployInProgress
+	d := f.deployer()
+	notified := 0
+	d.Notify = func() { notified++ }
+	if _, err := d.Rollback(t.Context(), 1, 5); !errors.Is(err, store.ErrDeployInProgress) || notified != 0 {
+		t.Errorf("Rollback during a deploy: %v, notified %d; want ErrDeployInProgress, no wake", err, notified)
+	}
+}
+
+func TestPruneImagesKeepsRecentLiveVersions(t *testing.T) {
+	f := newFakes()
+	tag := func(c string) string { return ImageTag("hello", c) }
+	next := "9999999999999999999999999999999999999999"
+	f.kept = []string{tag(sha), tag("kept1")}
+	// The app's next deploy has started, and its image isn't recorded yet.
+	f.recent = []store.Deployment{{ID: 8, CommitSHA: next, Status: store.StatusBuilding}}
+	f.images = []engine.Image{
+		{ID: "sha256:live", Tags: []string{tag(sha)}},
+		{ID: "sha256:kept", Tags: []string{tag("kept1"), tag("old2")}}, // one image, two commits
+		{ID: "sha256:old", Tags: []string{tag("old1")}},
+		{ID: "sha256:next", Tags: []string{tag(next)}},
+		{ID: "sha256:untagged"},
+		{ID: "sha256:busy", Tags: []string{tag("old3")}},
+		{ID: "sha256:foreign", Tags: []string{"someone/else:1"}}, // not under the app's prefix
+	}
+	f.imageInUse = map[string]bool{tag("old3"): true}
+	if _, err := deploy(t, f, t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	var removed []string
+	for _, e := range f.events {
+		if r, ok := strings.CutPrefix(e, "remove image "); ok {
+			removed = append(removed, r)
+		}
+	}
+	want := []string{tag("old2"), tag("old1"), "sha256:untagged", tag("old3")}
+	if !slices.Equal(removed, want) {
+		t.Errorf("removed images %q,\n want %q", removed, want)
+	}
+	// After the old containers, so none of their images is still in use.
+	if i, j := slices.Index(f.events, "remove stale3"), slices.Index(f.events, "remove image "+tag("old2")); i < 0 || j < i {
+		t.Errorf("events %q: images must go after the old containers", f.events)
+	}
+	// The one still in use isn't counted.
+	if !slices.Contains(f.logLines, "platform: Removed 3 old images; the last 6 live versions are kept for rollbacks") {
+		t.Errorf("log %q: want the count of removed images", f.logLines)
+	}
 }
 
 func TestStartLatest(t *testing.T) {

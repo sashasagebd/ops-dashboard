@@ -1022,3 +1022,41 @@ still hanging on the old config.
 than needed for every deploy); relying on the app's SIGTERM handling alone
 (that covers requests the app has, not ones Caddy is still forwarding).
 `examples/hello` shuts down gracefully on SIGTERM, as apps should.
+
+### How rollbacks and image cleanup work (3.2, 2026-11-04)
+
+**What:** the details behind the three rollback entries above.
+- **The database checks what it can.** A rollback's `rollback_of` is a
+  foreign key on `(app_id, rollback_of)`, so it can only name one of the same
+  app's deployments; a check requires a rollback to have its image tag from
+  the start. The one-in-progress index covers rollbacks like any deploy.
+  `CreateRollback` locks the app's row, checks the target, inserts the
+  deployment and its job, and turns auto-deploy off, in one transaction: a
+  refused rollback changes nothing.
+- **What can be rolled back to** is decided in one place
+  (`store.CheckRollback`), used both by the API's `rollbackable` flag and by
+  `CreateRollback`: a deployment that was live before (superseded or rolled
+  back), whose image is among the kept ones, and that isn't the same image as
+  the live version.
+- **A rollback skips the build, not the checks.** It goes queued → starting
+  → healthy: the image is checked to still exist (someone may have pruned it
+  by hand; then it fails at once, saying to deploy the commit instead), and
+  then it's started, health-checked, switched to and drained like any deploy.
+- **Kept images are counted per image, not per deployment:** redeploying a
+  commit, or rolling back to it, reuses its tag. The six most recent distinct
+  images of ever-live deployments are kept.
+- **Cleanup goes by what Docker has.** After each successful deploy, the
+  platform lists the images labelled with the app's name (Build labels every
+  image) and removes the tags under `ops-platform/<app>:` that aren't kept,
+  plus untagged ones (a redeploy of the same commit moves its tag to the new
+  build, since each build's labels differ). The image of a deploy that has
+  already started is kept too. Removal is never forced, so an image a
+  container still uses stays until a later deploy. Going by Docker's list
+  rather than the database's history means an image that failed to be
+  removed is seen again next time, and nothing outside the app's own images
+  is ever touched.
+
+**Alternatives:** recording removed images in the database (another state
+to keep in step with Docker); `docker image prune` (not per app, sees
+images the platform doesn't own); a CHECK that the rollback target was live
+(statuses change after insert; enforced by the locked transaction instead).

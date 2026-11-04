@@ -25,6 +25,10 @@ var (
 	// ErrLeaseLost: the worker no longer holds the job (its lease ran out
 	// and another worker claimed it, or the job was deleted with its app).
 	ErrLeaseLost = errors.New("job is no longer held by this worker")
+	// ErrNotRollbackable: the app can't be rolled back to that deployment
+	// (it was never live, its image is gone, or it's the live version);
+	// wrapped with which (CheckRollback).
+	ErrNotRollbackable = errors.New("can't roll back to this deployment")
 )
 
 // Postgres error codes (https://www.postgresql.org/docs/current/errcodes-appendix.html).
@@ -59,7 +63,10 @@ func translate(err error) error {
 		}
 		return ErrConflict
 	case foreignKeyViolation:
-		// The only foreign keys point at apps.
+		if pgErr.ConstraintName == "deployments_rollback_of_fkey" {
+			return fmt.Errorf("deployment %w", ErrNotFound)
+		}
+		// The other foreign keys point at apps.
 		return fmt.Errorf("app %w", ErrNotFound)
 	case checkViolation:
 		// The API validates input first with friendlier messages; reaching
