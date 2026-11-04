@@ -83,8 +83,9 @@ func TestRunCreatesLockedDownContainer(t *testing.T) {
 	if hc.Privileged || len(hc.Binds) > 0 || len(hc.PortBindings) > 0 {
 		t.Errorf("privileged/binds/ports = %v, %v, %v; want none", hc.Privileged, hc.Binds, hc.PortBindings)
 	}
-	if hc.RestartPolicy.Name != "unless-stopped" {
-		t.Errorf("restart policy = %q, want unless-stopped", hc.RestartPolicy.Name)
+	// The reconciler restarts apps, not Docker.
+	if hc.RestartPolicy.Name != "no" {
+		t.Errorf("restart policy = %q, want no", hc.RestartPolicy.Name)
 	}
 	if hc.PidsLimit == nil || *hc.PidsLimit != pidsLimit {
 		t.Errorf("pids limit = %v, want %d", hc.PidsLimit, pidsLimit)

@@ -63,6 +63,9 @@ type fakes struct {
 	images       []engine.Image // what AppImages lists
 	imageMissing bool           // ImageExists says no
 	imageInUse   map[string]bool
+
+	caddyRoutes []router.Route // what Routes reports Caddy has
+	onRun       func()         // hook, called as Run starts a container
 }
 
 func newFakes() *fakes {
@@ -278,6 +281,9 @@ func (f *fakes) PruneDeploymentLogs(_ context.Context, _ int64, keep int) (int64
 
 func (f *fakes) Run(_ context.Context, spec engine.RunSpec) (string, error) {
 	f.event("run %s", spec.Name)
+	if f.onRun != nil {
+		f.onRun()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.runSpec = spec
@@ -331,6 +337,12 @@ func (f *fakes) Apply(_ context.Context, routes []router.Route) error {
 	}
 	f.event("apply %s", describe(routes))
 	return nil
+}
+
+func (f *fakes) Routes(context.Context) ([]router.Route, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.caddyRoutes), nil
 }
 
 func (f *fakes) Probe(context.Context, string, string) (int, error) {
@@ -755,15 +767,93 @@ func TestGaveUpAfterRepeatedCrashes(t *testing.T) {
 	}
 }
 
-func TestRemoveOrphansKeepsOnlyLiveDeployments(t *testing.T) {
-	f := newFakes() // deployment 6 is live; containers for 6, 3 and 7 exist
-	f.containers = append(f.containers, newContainer)
-	if err := f.deployer().RemoveOrphans(t.Context()); err != nil {
+func TestSyncRoutesAppliesOnlyWhenCaddyDiffers(t *testing.T) {
+	live := router.Route{Host: "hello.apps.test", Upstream: "app-hello-6:8080"}
+	tests := []struct {
+		name        string
+		caddy       []router.Route
+		wantChanged bool
+	}{
+		{name: "same", caddy: []router.Route{live}},
+		{name: "route deleted", caddy: []router.Route{}, wantChanged: true},
+		{name: "pointing elsewhere", caddy: []router.Route{{Host: "hello.apps.test", Upstream: "app-hello-3:8080"}}, wantChanged: true},
+		{name: "an extra one", caddy: []router.Route{live, {Host: "x.apps.test", Upstream: "y:1"}}, wantChanged: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakes() // deployment 6 is live
+			f.caddyRoutes = tt.caddy
+			changed, err := f.deployer().SyncRoutes(t.Context())
+			if err != nil || changed != tt.wantChanged {
+				t.Fatalf("SyncRoutes = %v, %v; want changed %v", changed, err, tt.wantChanged)
+			}
+			if applied := len(f.applies) > 0; applied != tt.wantChanged {
+				t.Errorf("applied %v, want %v", applied, tt.wantChanged)
+			}
+			if tt.wantChanged && describe(f.applies[0]) != "[hello.apps.test->app-hello-6:8080]" {
+				t.Errorf("applied %s, want the database's table", describe(f.applies[0]))
+			}
+		})
+	}
+}
+
+func TestRecreateRunsTheLiveDeploymentAgain(t *testing.T) {
+	f := newFakes()
+	d := f.deployer()
+	live := store.Deployment{ID: 6, AppID: 1, CommitSHA: sha, Status: store.StatusHealthy, ImageTag: "ops-platform/hello:" + sha}
+	if err := d.Recreate(t.Context(), f.app, live); err != nil {
 		t.Fatal(err)
 	}
-	slices.Sort(f.removed)
-	if !slices.Equal(f.removed, []string{"new", "stale3"}) {
-		t.Errorf("removed %v, want the non-live ones (new, stale3) and not old6", f.removed)
+	// The same container a deploy would start: name, image, env, labels,
+	// limits.
+	spec := f.runSpec
+	if spec.Name != "app-hello-6" || spec.Image != live.ImageTag || spec.Env["TOKEN"] != "s3cret" ||
+		spec.Labels[engine.LabelDeployment] != "6" || spec.Network != "platform-apps" || spec.MemoryBytes != 256<<20 {
+		t.Errorf("run spec = %+v", spec)
+	}
+
+	f.imageMissing = true
+	if err := d.Recreate(t.Context(), f.app, live); !errors.Is(err, ErrImageGone) {
+		t.Errorf("image gone: error = %v, want ErrImageGone", err)
+	}
+}
+
+func TestDeployHoldsTheAppLock(t *testing.T) {
+	f := newFakes()
+	d := f.deployer()
+	// While the deploy runs, the reconciler can't take the app.
+	var duringDeploy bool
+	f.onRun = func() {
+		unlock, ok := d.TryLockApp(f.app.ID)
+		duringDeploy = ok
+		if ok {
+			unlock()
+		}
+	}
+	dep, err := d.Start(t.Context(), 1, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Run(t.Context(), store.Job{DeploymentID: dep.ID, Attempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if duringDeploy {
+		t.Error("TryLockApp succeeded while the app's deploy was running")
+	}
+	// Afterwards it can, and only one holder at a time.
+	unlock, ok := d.TryLockApp(f.app.ID)
+	if !ok {
+		t.Fatal("TryLockApp failed after the deploy")
+	}
+	if _, again := d.TryLockApp(f.app.ID); again {
+		t.Error("the app's lock was taken twice")
+	}
+	unlock()
+	// Another app's lock is its own.
+	if u, ok := d.TryLockApp(2); !ok {
+		t.Error("app 2's lock was taken")
+	} else {
+		u()
 	}
 }
 

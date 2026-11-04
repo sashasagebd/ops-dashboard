@@ -13,7 +13,7 @@ import (
 )
 
 // Labels on every container the platform creates. They're how the platform
-// (and P4's reconciler) tells its own containers apart from everything else
+// (its reconciler above all) tells its own containers apart from everything else
 // on the host, such as the game servers, which it must never touch.
 const (
 	LabelManaged    = "ops.platform.managed" // always "true"
@@ -69,8 +69,11 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) (string, error) {
 		},
 		HostConfig: &container.HostConfig{
 			NetworkMode: container.NetworkMode(spec.Network),
-			// Docker restarts a crashed app until P4's reconciler exists.
-			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyUnlessStopped},
+			// Docker never restarts an app by itself: the platform's
+			// reconciler does (internal/reconcile), so each crash is seen,
+			// recorded with its last output, and backed off if it repeats.
+			// It also starts apps after a reboot.
+			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
 			Resources: container.Resources{
 				Memory:    spec.MemoryBytes,
 				NanoCPUs:  spec.NanoCPUs,

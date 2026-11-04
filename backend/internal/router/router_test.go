@@ -97,6 +97,81 @@ func TestApplyReportsCaddyErrors(t *testing.T) {
 	}
 }
 
+func TestRoutesReadsWhatApplySent(t *testing.T) {
+	// Round trip: whatever Apply sends, Routes reads back the same.
+	var saved []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			saved, _ = io.ReadAll(r.Body)
+			return
+		}
+		if r.URL.Path != serverPath {
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+		w.Write(saved)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	want := []Route{{Host: "hello.apps.test", Upstream: "app-hello-7:8080"}, {Host: "api.apps.test", Upstream: "app-api-3:3000"}}
+	if err := c.Apply(t.Context(), want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Routes(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("Routes = %+v, want %+v", got, want)
+	}
+}
+
+func TestRoutesOddShapesAndMissingServer(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   []Route
+	}{
+		{name: "server missing", status: http.StatusBadRequest, body: `{"error":"invalid traversal path"}`, want: []Route{}},
+		{name: "server null", status: http.StatusOK, body: `null`, want: []Route{}},
+		{name: "no routes key", status: http.StatusOK, body: `{"listen":[":80"]}`, want: []Route{}},
+		{
+			// Edited by hand: a file server, not a proxy. It must not look
+			// like any route the platform wants.
+			name:   "a route Apply never makes",
+			status: http.StatusOK,
+			body:   `{"routes":[{"match":[{"host":["hello.apps.test"]}],"handle":[{"handler":"file_server"}],"terminal":true}]}`,
+			want:   []Route{{Host: "hello.apps.test"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.status)
+				io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+			got, err := New(srv.URL, "").Routes(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(tt.want) || (len(got) > 0 && got[0] != tt.want[0]) {
+				t.Errorf("Routes = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	if _, err := New(srv.URL, "").Routes(t.Context()); err == nil {
+		t.Error("Routes succeeded although Caddy answered 500")
+	}
+}
+
 func TestInFlight(t *testing.T) {
 	var gotMethod, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

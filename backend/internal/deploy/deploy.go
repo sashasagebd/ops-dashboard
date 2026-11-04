@@ -75,6 +75,7 @@ type Router interface {
 	Apply(ctx context.Context, routes []router.Route) error
 	Probe(ctx context.Context, host, path string) (int, error)
 	InFlight(ctx context.Context) (map[string]int, error)
+	Routes(ctx context.Context) ([]router.Route, error)
 }
 
 // Config holds the deployer's settings.
@@ -104,6 +105,11 @@ type Deployer struct {
 	applyMu sync.Mutex
 	mu      sync.Mutex
 	probes  map[int64]router.Route // deployment ID -> its temporary probe route
+
+	// locks holds one lock per app, taken by each deploy attempt for as long
+	// as it runs (drain included) and tried by the reconciler, which leaves
+	// an app alone while its deploy runs (TryLockApp).
+	locks appLocks
 }
 
 // New returns a Deployer.
@@ -253,8 +259,8 @@ func (d *Deployer) GiveUp(ctx context.Context, job store.Job, err error) {
 	reason := publicReason(err, d.cfg.DeployTimeout)
 	// Already live: the deploy succeeded, and only what follows the switch
 	// (routing to it, draining and removing the old version) was cut off.
-	// That isn't a failure to record; the platform's next start, or the next
-	// deploy, re-applies the routes and removes the old container.
+	// That isn't a failure to record; the reconciler re-applies the routes
+	// and removes the old container within seconds.
 	if dep, err := d.store.Deployment(ctx, job.DeploymentID); err == nil && dep.Status == store.StatusHealthy {
 		d.appendLogLine(ctx, job.DeploymentID, "The new version is live, but finishing the switch from the previous one was cut off: "+reason)
 		d.startNext(ctx, job.DeploymentID)
@@ -295,6 +301,8 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		return err
 	}
 	log = log.With("app", app.Name, "commit", dep.CommitSHA)
+	unlock := d.locks.lock(app.ID)
+	defer unlock()
 
 	switch dep.Status {
 	case store.StatusQueued, store.StatusBuilding, store.StatusStarting:
@@ -338,11 +346,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		return nil
 	}
 
-	labels := map[string]string{
-		engine.LabelApp:        app.Name,
-		engine.LabelAppID:      strconv.FormatInt(app.ID, 10),
-		engine.LabelDeployment: strconv.FormatInt(dep.ID, 10),
-	}
+	labels := deploymentLabels(app, dep.ID)
 	var tag string
 	if dep.RollbackOf != 0 {
 		tag, err = d.reuseImage(ctx, out, dep)
@@ -361,15 +365,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 	name := ContainerName(app.Name, dep.ID)
 	out.Printf("Starting container %s (%d MiB memory, %g CPU, %d env vars)",
 		name, app.MemoryLimitBytes>>20, float64(app.CPULimitMillicores)/1000, len(env))
-	containerID, err := d.engine.Run(ctx, engine.RunSpec{
-		Name:        name,
-		Image:       tag,
-		Env:         env,
-		Labels:      labels,
-		Network:     d.cfg.AppsNetwork,
-		MemoryBytes: app.MemoryLimitBytes,
-		NanoCPUs:    int64(app.CPULimitMillicores) * 1_000_000,
-	})
+	containerID, err := d.engine.Run(ctx, d.runSpec(app, dep.ID, tag, env))
 	if err != nil {
 		return err
 	}
@@ -397,9 +393,9 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 		// The database says the new deployment is live, but Caddy still
 		// routes to the old container, which is still running, so the
 		// site stays up on the old version. Keeping the old container is
-		// what makes that safe; the next route update (another deploy, or
-		// the platform's startup) corrects Caddy. Not retried: the deploy
-		// itself has succeeded.
+		// what makes that safe; the reconciler corrects Caddy within
+		// seconds, and only then removes the old container. Not retried:
+		// the deploy itself has succeeded.
 		log.Error("deployment is healthy but switching its route failed; keeping the previous container", "err", err)
 		out.Printf("Couldn't update the route yet: the previous version keeps serving until the next route update")
 		return nil
@@ -449,10 +445,11 @@ func (d *Deployer) build(ctx context.Context, out *deployLog, app store.App, dep
 	return tag, nil
 }
 
-// ErrImageGone means a rollback's image no longer exists in Docker. The
-// platform only lets an app roll back to images it keeps, so this is an image
-// removed by hand (e.g. docker image prune -a) since.
-var ErrImageGone = errors.New("the image to roll back to no longer exists; deploy its commit instead")
+// ErrImageGone means the image a deployment runs no longer exists in Docker,
+// so it can't be rolled back to or recreated. The platform keeps the images
+// of an app's recent live versions, so this is an image removed by hand (e.g.
+// docker image prune -a) since.
+var ErrImageGone = errors.New("the deployment's image no longer exists; deploy its commit instead")
 
 // reuseImage is a rollback's stand-in for build: the image was built by an
 // earlier deployment, so it's only checked to still exist. The deployment
@@ -620,18 +617,47 @@ func (d *Deployer) setProbe(deploymentID int64, r *router.Route) {
 	}
 }
 
-// ApplyRoutes sends Caddy the complete routing table: every app's hostname to
-// its live deployment's container, plus any probe routes for deployments
-// being checked. It's built fresh from the database each time, so it's always
-// safe to call; the platform also calls it at startup, as Caddy may have
-// restarted or missed an update.
+// ApplyRoutes sends Caddy the complete routing table (routeTable). It's built
+// fresh from the database each time, so it's always safe to call.
 func (d *Deployer) ApplyRoutes(ctx context.Context) error {
 	d.applyMu.Lock()
 	defer d.applyMu.Unlock()
-
-	live, err := d.store.LiveApps(ctx)
+	routes, err := d.routeTable(ctx)
 	if err != nil {
 		return err
+	}
+	return d.router.Apply(ctx, routes)
+}
+
+// SyncRoutes is the reconciler's ApplyRoutes: it reads Caddy's routes first
+// and applies the table only if they differ (changed reports whether it did).
+// Every apply makes Caddy rebuild its config, so a check every few seconds
+// mustn't apply when nothing is wrong. Under the same lock as ApplyRoutes, so
+// a deploy's own route change can't land in between the read and the apply.
+func (d *Deployer) SyncRoutes(ctx context.Context) (changed bool, err error) {
+	d.applyMu.Lock()
+	defer d.applyMu.Unlock()
+	want, err := d.routeTable(ctx)
+	if err != nil {
+		return false, err
+	}
+	have, err := d.router.Routes(ctx)
+	if err != nil {
+		return false, err
+	}
+	if sameRoutes(want, have) {
+		return false, nil
+	}
+	return true, d.router.Apply(ctx, want)
+}
+
+// routeTable is what Caddy should route: every app's hostname to its live
+// deployment's container, plus any probe routes for deployments being
+// checked.
+func (d *Deployer) routeTable(ctx context.Context) ([]router.Route, error) {
+	live, err := d.store.LiveApps(ctx)
+	if err != nil {
+		return nil, err
 	}
 	routes := make([]router.Route, 0, len(live))
 	for _, a := range live {
@@ -645,7 +671,115 @@ func (d *Deployer) ApplyRoutes(ctx context.Context) error {
 		routes = append(routes, d.probes[id])
 	}
 	d.mu.Unlock()
-	return d.router.Apply(ctx, routes)
+	return routes, nil
+}
+
+// sameRoutes reports whether two tables route the same, in any order (each
+// host appears once, so order doesn't change where a request goes).
+func sameRoutes(a, b []router.Route) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[router.Route]int, len(a))
+	for _, r := range a {
+		seen[r]++
+	}
+	for _, r := range b {
+		if seen[r] == 0 {
+			return false
+		}
+		seen[r]--
+	}
+	return true
+}
+
+// deploymentLabels are the labels on a deployment's image and container:
+// how the platform recognises its own, and which app and deployment each is.
+func deploymentLabels(app store.App, deploymentID int64) map[string]string {
+	return map[string]string{
+		engine.LabelApp:        app.Name,
+		engine.LabelAppID:      strconv.FormatInt(app.ID, 10),
+		engine.LabelDeployment: strconv.FormatInt(deploymentID, 10),
+	}
+}
+
+// runSpec is the container a deployment runs as, the same whether a deploy
+// starts it or the reconciler recreates it.
+func (d *Deployer) runSpec(app store.App, deploymentID int64, image string, env map[string]string) engine.RunSpec {
+	return engine.RunSpec{
+		Name:        ContainerName(app.Name, deploymentID),
+		Image:       image,
+		Env:         env,
+		Labels:      deploymentLabels(app, deploymentID),
+		Network:     d.cfg.AppsNetwork,
+		MemoryBytes: app.MemoryLimitBytes,
+		NanoCPUs:    int64(app.CPULimitMillicores) * 1_000_000,
+	}
+}
+
+// Recreate creates and starts a live deployment's container again, after it
+// was deleted, for the reconciler (which holds the app's lock). It has the
+// same name as before, so the app's route reaches it with no change, and
+// the app's current env vars, as a rollback does. There's no health check:
+// the app was down already, and the reconciler looks again on its next pass.
+// ErrImageGone if the deployment's image was removed meanwhile.
+func (d *Deployer) Recreate(ctx context.Context, app store.App, dep store.Deployment) error {
+	if dep.ImageTag == "" {
+		return ErrImageGone
+	}
+	ok, err := d.engine.ImageExists(ctx, dep.ImageTag)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrImageGone
+	}
+	env, err := d.store.EnvVars(ctx, app.ID)
+	if err != nil {
+		return err
+	}
+	_, err = d.engine.Run(ctx, d.runSpec(app, dep.ID, dep.ImageTag, env))
+	return err
+}
+
+// TryLockApp takes the app's lock if no deploy of it is running, for the
+// reconciler: ok is false (and nothing is held) if one is. unlock releases
+// it.
+func (d *Deployer) TryLockApp(appID int64) (unlock func(), ok bool) {
+	return d.locks.tryLock(appID)
+}
+
+// appLocks is a lock per app, made on first use. Apps are few and never
+// many, so they're never cleaned up.
+type appLocks struct {
+	mu sync.Mutex
+	m  map[int64]*sync.Mutex
+}
+
+func (l *appLocks) get(appID int64) *sync.Mutex {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.m == nil {
+		l.m = map[int64]*sync.Mutex{}
+	}
+	if l.m[appID] == nil {
+		l.m[appID] = &sync.Mutex{}
+	}
+	return l.m[appID]
+}
+
+func (l *appLocks) lock(appID int64) (unlock func()) {
+	m := l.get(appID)
+	m.Lock()
+	return m.Unlock
+}
+
+func (l *appLocks) tryLock(appID int64) (unlock func(), ok bool) {
+	m := l.get(appID)
+	if !m.TryLock() {
+		return nil, false
+	}
+	return m.Unlock, true
 }
 
 // retireOlder stops and removes the app's containers from deployments before
@@ -656,8 +790,8 @@ func (d *Deployer) ApplyRoutes(ctx context.Context) error {
 //
 // The only error is being cut off (the platform shutting down, or the attempt
 // running out of time), and then nothing is removed: a retry finds the
-// deployment healthy and comes back here, and failing that, the next deploy
-// or the platform's next start removes them. Other failures are logged
+// deployment healthy and comes back here, and failing that, the reconciler
+// removes them (without draining). Other failures are logged
 // rather than failing the deploy, which has succeeded.
 func (d *Deployer) retireOlder(ctx context.Context, log *slog.Logger, out *deployLog, app store.App, live int64) error {
 	containers, err := d.engine.ManagedContainers(ctx, app.Name)
@@ -779,38 +913,6 @@ func (d *Deployer) removeDeploymentContainers(ctx context.Context, out *deployLo
 			return err
 		}
 		out.Printf("Removed container %s, left by an earlier attempt", c.Name)
-	}
-	return nil
-}
-
-// RemoveOrphans removes every platform container that isn't an app's live
-// deployment. It's for startup only, before the job workers start, so no
-// deploy is in flight: any such container was left by a deploy cut off by a
-// crash or restart (its restart policy would otherwise keep it running
-// forever, unrouted; if that deploy's job is retried, it starts a new one). It only
-// ever sees containers with the platform's label, so nothing else on the
-// host is touched. P4's reconciler does this continuously.
-func (d *Deployer) RemoveOrphans(ctx context.Context) error {
-	live, err := d.store.LiveApps(ctx)
-	if err != nil {
-		return err
-	}
-	keep := map[string]bool{}
-	for _, a := range live {
-		keep[strconv.FormatInt(a.DeploymentID, 10)] = true
-	}
-	containers, err := d.engine.ManagedContainers(ctx, "")
-	if err != nil {
-		return err
-	}
-	for _, c := range containers {
-		if keep[c.Labels[engine.LabelDeployment]] {
-			continue
-		}
-		slog.Info("removing orphaned app container", "container", c.Name)
-		if err := d.engine.Remove(ctx, c.ID); err != nil {
-			return err
-		}
 	}
 	return nil
 }

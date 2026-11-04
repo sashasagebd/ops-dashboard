@@ -369,6 +369,10 @@ completely or works alongside it.
 **Alternatives:** no restart policy until Phase 4 (crashes stay down for
 weeks of development).
 
+*Replaced in Phase 4:* the reconciler restarts apps, and new containers get
+restart policy `no` (see "The reconciler restarts crashed apps, not
+Docker").
+
 ### Apps can only reach Caddy
 
 **What:** app containers are on one network, `apps`, shared with Caddy's
@@ -1060,3 +1064,90 @@ than needed for every deploy); relying on the app's SIGTERM handling alone
 to keep in step with Docker); `docker image prune` (not per app, sees
 images the platform doesn't own); a CHECK that the rollback target was live
 (statuses change after insert; enforced by the locked transaction instead).
+
+## Phase 4 (approved 2026-11-04)
+
+### The reconciler restarts crashed apps, not Docker
+
+**What:** new app containers get restart policy `no`; the reconciler starts
+a stopped live container again (crashed, killed, or not started after a
+reboot). Containers from before keep `unless-stopped` until their next
+deploy, and the reconciler leaves one Docker is restarting alone.
+**Why:** one actor, with backoff under the platform's control, and every
+crash seen: the reconciler records why it stopped (exit code, out of
+memory) and its last output lines. With Docker restarting silently, the
+reconciler would only ever see a restart count go up.
+**Cost:** while the platform itself is down, a crashed app stays down; after
+a reboot, apps come back with the platform (seconds after Postgres), not
+with Docker.
+**Alternatives:** keeping Docker's policy with the reconciler as a backup
+(two actors restarting the same container, and crashes go unrecorded);
+Docker's `on-failure:N` (a fixed limit, and still silent).
+
+### Polling every 10s, not Docker's event stream
+
+**What:** a reconcile pass every 10s: Caddy's routes (one GET), then each
+app's containers (a filtered list per app).
+**Why:** Docker's event stream would notice a crash at once, but it needs
+the `EVENTS` proxy group, another Docker permission, to save seconds. A pass
+is cheap, and a poll also catches what events can miss (a platform that was
+down when it happened).
+**Alternatives:** events with a slow poll as a backstop (later, if 10s ever
+matters).
+
+### An in-process lock per app coordinates the reconciler with deploys
+
+**What:** each deploy attempt holds its app's lock for as long as it runs,
+drain included; the reconciler only tries the lock, and skips an app whose
+deploy is running. It reads the app's live deployment only once it holds
+the lock.
+**Why:** a deploy has containers in flight that the reconciler would
+otherwise take for orphans (the new one before it's live, the old one while
+it drains). There's only ever one platform process, which the startup
+cleanup already relied on, so a mutex is enough.
+**Alternatives:** Postgres advisory locks (needed only for several
+platform processes, a non-goal); deciding from job and deployment statuses
+alone (a deployment stops being in progress before its drain ends).
+
+### A deleted live container is recreated directly
+
+**What:** if a live deployment's container is gone, the reconciler creates
+it again from the deployment's image, with the same name and the app's
+current env vars, with no new deployment and no health-check gate.
+**Why:** the name is what Caddy's route points at, so the route works again
+as soon as it's running; the site was down already, so there's nothing for
+a health check to protect, and the next pass looks again. A redeploy would
+rebuild, take minutes and add a deployment nobody asked for.
+**Alternatives:** queuing a redeploy of the same commit; failing the
+deployment and leaving the app down.
+
+### How the reconciler works (4.1, 2026-11-04)
+
+**What:** the details behind the entries above (`internal/reconcile`).
+- **Routes first, and orphans only once routes are right.** A pass starts
+  with Caddy: it reads the routes and re-applies the database's table only
+  if they differ, so a pass when nothing is wrong doesn't make Caddy rebuild
+  its config. Then each app. A container no live deployment owns is removed,
+  but only in a pass whose routes are known to match the database: a deploy
+  whose route switch failed keeps the old version running because Caddy
+  still sends it traffic, and removing it before the routes are fixed would
+  take the site down.
+- **What it does per app:** a stopped live container (`exited`, `created`)
+  is started; a `dead` one is removed and recreated; a missing one is
+  recreated; `restarting` and `paused` are left alone (Docker's own policy
+  at work, or someone's choice).
+- **Crash loops back off:** after a restart, the next waits 10s, doubling
+  to at most 5 minutes; from the third restart its events say
+  "crash-looping". Five minutes of running forgives the past ones.
+- **Events** (`reconciler_events`, kept 30 days) record each fix, a
+  crash's last 20 lines of output, and fixes that failed: once while they
+  keep failing pass after pass, with the error itself in the log only.
+- **Containers of apps that no longer exist** are removed too. The apps are
+  listed again after the containers, so an app registered meanwhile (its
+  first deploy's container just started) isn't taken for a deleted one.
+- **Startup is the first pass,** retried until it succeeds, before the job
+  workers start (as the old startup cleanup was). The platform's restart
+  check in CI now waits for it.
+
+**Alternatives:** applying the routes every pass (a Caddy config rebuild
+every 10s); restarting through a new deployment (a rebuild for a crash).
