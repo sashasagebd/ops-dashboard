@@ -72,8 +72,9 @@ function respond(status: number, json: unknown): Promise<Response> {
 // mockFetch answers successive /api/containers calls with successive
 // [status, body] pairs, repeating the last one. A body can be a function,
 // called per request (e.g. to stamp the current fake time). /api/history
-// calls go to historyMock instead, so they don't use up the sequence. It
-// returns the /api/containers mock.
+// calls go to historyMock instead, so they don't use up the sequence; the
+// platform's API (the sidebar's app list) answers 404. It returns the
+// /api/containers mock.
 function mockFetch(...responses: [number, unknown][]) {
   let call = 0
   const fetchMock = vi.fn((_url: string, _init?: RequestInit) => {
@@ -82,7 +83,11 @@ function mockFetch(...responses: [number, unknown][]) {
   })
   historyMock = vi.fn((_url: string) => respond(...historyReply))
   vi.stubGlobal('fetch', (url: string, init?: RequestInit) =>
-    url.startsWith('/api/history') ? historyMock(url) : fetchMock(url, init),
+    url.startsWith('/api/history')
+      ? historyMock(url)
+      : url === '/api/containers'
+        ? fetchMock(url, init)
+        : respond(404, { error: 'not found' }),
   )
   return fetchMock
 }
@@ -103,6 +108,7 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
   vi.setSystemTime(NOW)
   historyReply = [200, history()]
+  window.location.hash = '#/containers'
 })
 
 afterEach(() => {

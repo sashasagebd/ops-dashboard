@@ -1,149 +1,622 @@
-:root {
-  --text: #1f1d24;
-  --muted: #6b6375;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --up: #1a7f37;
-  --up-bg: #dafbe1;
-  --down: #b42318;
-  --down-bg: #fee4e2;
-  --warn: #7a4b00;
-  --warn-bg: #fff4d6;
-  --bar-ok: #3b6fd8;
-  --bar-warn: #d99a00;
-  --bar-high: #c4320a;
-  --link: #2f5fc4;
+/* Ops Console styles. Plain CSS, no framework: tokens first (colours,
+   spacing, type), then the shell, then shared components, then page bits.
+   Colours are tokens so light and dark are one set of rules; the theme is
+   the system's unless <html data-theme> says otherwise (src/theme.ts). */
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
-
-  font: 16px/1.5 var(--sans);
-  color: var(--text);
-  background: var(--bg);
-  color-scheme: light dark;
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/fonts/inter-latin-wght.woff2') format('woff2');
 }
 
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url('/fonts/jetbrains-mono-latin-wght.woff2') format('woff2');
+}
+
+:root {
+  /* Light. Text colours pass 4.5:1 on both --bg and --surface. */
+  --bg: #f6f7f9;
+  --surface: #fff;
+  --surface-2: #f0f2f5;
+  --border: #e3e6eb;
+  --text: #16181d;
+  --muted: #5b6270;
+  --faint: #6e7581;
+  --accent: #3358d4;
+  --accent-text: #fff;
+  --link: #2b52c2;
+  --up: #12784a;
+  --up-bg: #e1f4e8;
+  --warn: #855600;
+  --warn-bg: #fff2d1;
+  --down: #b42318;
+  --down-bg: #fde8e6;
+  --info: #2b52c2;
+  --info-bg: #e6edfb;
+  --bar-ok: var(--accent);
+  --bar-warn: #c98a00;
+  --bar-high: #c4320a;
+  --shadow: 0 1px 2px rgb(16 24 40 / 0.05);
+  --log-bg: #14161b;
+  --log-text: #d7dae0;
+
+  --sans: 'Inter', system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  --radius: 12px;
+  --radius-sm: 8px;
+
+  font: 14px/1.5 var(--sans);
+  font-feature-settings: 'cv11', 'ss01';
+  color: var(--text);
+  background: var(--bg);
+  color-scheme: light;
+}
+
+/* Dark: the system's, unless light was chosen; or chosen outright. The same
+   values twice, since CSS can't share a block between the two selectors
+   without a media query around one of them. */
 @media (prefers-color-scheme: dark) {
-  :root {
-    --text: #ecebef;
-    --muted: #a39dac;
-    --bg: #16151a;
-    --border: #2e2c34;
-    --up: #6fdd8b;
-    --up-bg: #0f2e19;
-    --down: #ff8a80;
-    --down-bg: #3a1411;
-    --warn: #ffd27a;
-    --warn-bg: #3a2a08;
-    --bar-ok: #7aa2ff;
-    --bar-warn: #ffc247;
-    --bar-high: #ff8a80;
+  :root:not([data-theme='light']) {
+    --bg: #111318;
+    --surface: #181b22;
+    --surface-2: #22262f;
+    --border: #2b2f3a;
+    --text: #eceef2;
+    --muted: #a3a9b5;
+    --faint: #8d93a0;
+    --accent: #5b7cfa;
     --link: #8fb0ff;
+    --up: #5fd394;
+    --up-bg: #123222;
+    --warn: #f5c35b;
+    --warn-bg: #3a2d0c;
+    --down: #ff8c80;
+    --down-bg: #3d1714;
+    --info: #8fb0ff;
+    --info-bg: #1b2747;
+    --bar-warn: #ffc247;
+    --bar-high: #ff8c80;
+    --shadow: none;
+    --log-bg: #0c0e12;
+    color-scheme: dark;
   }
+}
+
+:root[data-theme='dark'] {
+  --bg: #111318;
+  --surface: #181b22;
+  --surface-2: #22262f;
+  --border: #2b2f3a;
+  --text: #eceef2;
+  --muted: #a3a9b5;
+  --faint: #8d93a0;
+  --accent: #5b7cfa;
+  --link: #8fb0ff;
+  --up: #5fd394;
+  --up-bg: #123222;
+  --warn: #f5c35b;
+  --warn-bg: #3a2d0c;
+  --down: #ff8c80;
+  --down-bg: #3d1714;
+  --info: #8fb0ff;
+  --info-bg: #1b2747;
+  --bar-warn: #ffc247;
+  --bar-high: #ff8c80;
+  --shadow: none;
+  --log-bg: #0c0e12;
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
 }
 
 body {
   margin: 0;
+  background: var(--bg);
 }
 
-main {
-  max-width: 960px;
-  margin: 0 auto;
-  padding: 24px 16px;
+a {
+  color: var(--link);
+  text-underline-offset: 2px;
 }
 
-/* Title on the left, page links on the right; wraps on phones. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* ---------- Shell ---------- */
+
+.shell {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.topbar {
+  display: none;
+}
+
+.sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 20px 12px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 8px;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
+.brand-name {
+  display: block;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.brand-sub {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav-label {
+  padding: 0 10px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.nav-link:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.nav-link[aria-current='page'] {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.nav-link svg {
+  flex: none;
+}
+
+.sidebar-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 0 4px;
+}
+
+.platform-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.dot {
+  flex: none;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.dot-up {
+  background: var(--up);
+}
+
+.dot-down {
+  background: var(--down);
+}
+
+.dot-warn {
+  background: var(--warn);
+}
+
+.content {
+  min-width: 0;
+  max-width: 1200px;
+  width: 100%;
+  padding: 28px 36px 56px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.scrim {
+  display: none;
+}
+
+/* Phones and small tablets: a top bar, and the sidebar slides over the page
+   from the menu button. */
+@media (max-width: 860px) {
+  .shell {
+    display: block;
+  }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 8px 8px 12px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .topbar .brand-sub {
+    display: none;
+  }
+
+  .sidebar {
+    position: fixed;
+    z-index: 30;
+    top: 0;
+    left: 0;
+    width: min(280px, 85vw);
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition:
+      transform 0.2s ease,
+      visibility 0.2s;
+  }
+
+  .sidebar.open {
+    transform: none;
+    visibility: visible;
+  }
+
+  .sidebar-brand {
+    display: none;
+  }
+
+  .scrim {
+    display: block;
+    position: fixed;
+    z-index: 25;
+    inset: 0;
+    background: rgb(0 0 0 / 0.4);
+  }
+
+  .content {
+    padding: 18px 16px 40px;
+    gap: 18px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar {
+    transition: none;
+  }
+}
+
+/* ---------- Page header ---------- */
+
 .page-header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.crumbs {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.crumbs a {
+  color: var(--muted);
+}
+
+.page-header-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px 16px;
+}
+
+.page-header-text {
+  min-width: 0;
+}
+
+.page-title {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin: 0 0 16px;
+  gap: 8px 12px;
 }
 
 h1 {
-  font-size: 1.5rem;
-  margin: 0;
+  font-size: 26px;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: -0.015em;
 }
 
-.toggle {
-  display: inline-flex;
-}
-
-.toggle button {
-  font: inherit;
-  font-size: 0.875rem;
-  padding: 2px 10px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-}
-
-.toggle button:first-child {
-  border-radius: 6px 0 0 6px;
-}
-
-.toggle button:last-child {
-  border-left: none;
-  border-radius: 0 6px 6px 0;
-}
-
-.toggle button[aria-pressed='true'] {
-  color: var(--text);
-  background: var(--border);
-}
-
-h2 {
-  font-size: 1.125rem;
-  margin: 24px 0 12px;
-}
-
-.muted {
+.page-subtitle {
+  margin-top: 6px;
   color: var(--muted);
 }
 
-/* Three across on a laptop, stacked on a phone. */
-.tiles {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  font-size: 13px;
+}
+
+.meta li {
+  overflow-wrap: anywhere;
+}
+
+/* ---------- Layout helpers ---------- */
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.stack-tight {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
   gap: 12px;
 }
 
-.tile {
-  padding: 12px 16px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-
-.tile p,
-.tile h3 {
-  margin: 0;
-}
-
-.tile-label {
-  color: var(--muted);
-  font-size: 0.875rem;
-  font-weight: 500;
-}
-
-.tile-value {
-  font-size: 1.5rem;
+.section-title {
+  font-size: 15px;
   font-weight: 600;
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
+  gap: 16px;
+}
+
+/* ---------- Cards ---------- */
+
+.card {
+  min-width: 0;
+  padding: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.card-head h2 {
+  font-size: 14.5px;
+  font-weight: 600;
+}
+
+.card-head a {
+  font-size: 13px;
+}
+
+.card-intro {
+  margin-bottom: 12px;
+}
+
+.card-note {
+  margin-top: 10px;
+}
+
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* An app in the Overview and Apps grids. */
+.app-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.app-card-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.app-card-name {
+  margin-right: 4px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.app-card-name:hover {
+  color: var(--link);
+  text-decoration: underline;
+}
+
+.app-card-links {
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.app-card-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.app-card-facts dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.app-card-facts dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+/* ---------- Stats: server tiles and app metrics ---------- */
+
+.tiles,
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
+  gap: 16px;
+}
+
+.tile {
+  min-width: 0;
+  padding: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.tile-label,
+.stat-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.tile-value,
+.stat-value {
+  margin-top: 2px;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
 }
 
-.tile-detail {
+.stat-value.muted {
+  font-size: 15px;
+  font-weight: 500;
+  padding: 7px 0;
+}
+
+.tile-detail,
+.stat-detail {
+  font-size: 12.5px;
   color: var(--muted);
-  font-size: 0.875rem;
 }
 
 .bar {
   height: 6px;
   margin-top: 10px;
   border-radius: 999px;
-  background: var(--border);
+  background: var(--surface-2);
   overflow: hidden;
 }
 
@@ -164,53 +637,63 @@ h2 {
   background: var(--bar-high);
 }
 
-table {
+/* Trend lines. The SVG stretches to the box CSS gives it (see Sparkline). */
+.sparkline {
+  display: inline-block;
+  width: 64px;
+  height: 18px;
+  overflow: visible;
+}
+
+.sparkline path {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sparkline-line {
+  stroke-width: 1.6;
+}
+
+/* Each minute's peak, faint behind the average, so short spikes still show. */
+.sparkline-peaks {
+  stroke-width: 1;
+  stroke-opacity: 0.35;
+}
+
+.tile-trend,
+.stat-trend {
+  display: block;
   width: 100%;
-  border-collapse: collapse;
+  height: 36px;
+  margin-top: 10px;
 }
 
-th,
-td {
-  text-align: left;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
+/* Line then number, right-aligned. The number gets a minimum width so the
+   lines in a column start at the same place. */
+.cell-trend {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
-th {
-  color: var(--muted);
-  font-weight: 500;
-  font-size: 0.875rem;
+.cell-trend > span {
+  min-width: 4.5em;
 }
 
-.table-scroll {
-  overflow-x: auto;
-}
-
-/* Numbers line up by digit when they're right-aligned and fixed-width. */
-.num {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
-.banner {
-  margin: 0 0 16px;
-  padding: 8px 12px;
-  border-radius: 6px;
-  color: var(--warn);
-  background: var(--warn-bg);
-}
-
-.mono {
-  font-family: var(--mono);
-  font-size: 0.875rem;
-}
+/* ---------- Badges ---------- */
 
 .badge {
-  display: inline-block;
-  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
   border-radius: 999px;
-  font-size: 0.8125rem;
-  font-weight: 500;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .badge-up {
@@ -228,6 +711,16 @@ th {
   background: var(--warn-bg);
 }
 
+.badge-info {
+  color: var(--info);
+  background: var(--info-bg);
+}
+
+.badge-neutral {
+  color: var(--muted);
+  background: var(--surface-2);
+}
+
 /* State and health badges side by side, wrapping on narrow screens. */
 .badges {
   display: inline-flex;
@@ -235,97 +728,134 @@ th {
   gap: 4px;
 }
 
-/* Trend lines. The SVG stretches to the box CSS gives it (see Sparkline). */
-.sparkline {
-  display: inline-block;
-  width: 64px;
-  height: 18px;
-  overflow: visible;
-}
+/* ---------- Tabs ---------- */
 
-.sparkline path {
-  fill: none;
-  stroke: var(--bar-ok);
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.sparkline-line {
-  stroke-width: 1.5;
-}
-
-/* Each minute's peak, faint behind the average, so short spikes still show. */
-.sparkline-peaks {
-  stroke-width: 1;
-  stroke-opacity: 0.35;
-}
-
-.tile-trend {
-  display: block;
-  width: 100%;
-  height: 32px;
-  margin-top: 8px;
-}
-
-/* Line then number, right-aligned. The number gets a minimum width so the
-   lines in a column start at the same place. */
-.cell-trend {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.cell-trend > span {
-  min-width: 4.5em;
-}
-
-/* Page links in the header. */
-.nav {
+.tabs {
   display: flex;
-  gap: 16px;
+  gap: 4px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  scrollbar-width: none;
 }
 
-a {
-  color: var(--link);
-}
-
-.nav a {
+.tab {
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
   color: var(--muted);
-  text-decoration: none;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
-.nav a[aria-current='page'] {
+.tab:hover {
+  color: var(--text);
+}
+
+.tab[aria-selected='true'] {
   color: var(--text);
   font-weight: 600;
+  border-bottom-color: var(--accent);
 }
 
-/* The trend period toggle, above the containers page's first section. */
-.page-tools {
+@media (max-width: 860px) {
+  .tabs {
+    margin: 0 -16px;
+    padding: 0 8px;
+  }
+}
+
+/* ---------- Tables and lists ---------- */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+th:first-child,
+td:first-child {
+  padding-left: 0;
+}
+
+th:last-child,
+td:last-child {
+  padding-right: 0;
+}
+
+tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+th {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+tr.selected td {
+  background: var(--surface-2);
+}
+
+tr.selected td:first-child {
+  box-shadow: inset 3px 0 var(--accent);
+  padding-left: 10px;
+}
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+/* Numbers line up by digit when they're right-aligned and fixed-width. */
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.row-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 6px;
 }
 
-h3 {
-  font-size: 1rem;
-  margin: 20px 0 8px;
+.list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border);
 }
 
-h4 {
-  font-size: 0.9375rem;
-  margin: 16px 0 4px;
+.list li:first-child {
+  border-top: 0;
+  padding-top: 0;
 }
 
-.badge-neutral {
-  color: var(--muted);
-  background: var(--border);
+.list-main {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
-/* Label/value pairs on an app's page. */
+.env-list {
+  margin-bottom: 14px;
+  max-width: 560px;
+}
+
+/* Label/value pairs. */
 .facts {
   display: grid;
   grid-template-columns: max-content 1fr;
-  gap: 4px 16px;
+  gap: 8px 16px;
   margin: 0;
 }
 
@@ -338,6 +868,91 @@ h4 {
   overflow-wrap: anywhere;
 }
 
+/* The reconciler's events: one per line, a crash's output folded under it. */
+.events li {
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+}
+
+.events li:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.event-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+}
+
+.event-message {
+  flex: 1 1 200px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.event-time {
+  margin-left: auto;
+  font-size: 12.5px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.events details {
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+.event-output {
+  margin: 6px 0 0;
+  padding: 10px;
+  max-height: 16rem;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--log-text);
+  background: var(--log-bg);
+  border-radius: var(--radius-sm);
+}
+
+/* ---------- Logs ---------- */
+
+.log-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.log {
+  margin: 0;
+  padding: 12px 14px;
+  max-height: 32rem;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--log-text);
+  background: var(--log-bg);
+  border-radius: var(--radius-sm);
+}
+
+.log-platform {
+  color: #8fb0ff;
+}
+
+.log-stderr {
+  color: #ffb4a8;
+}
+
+/* ---------- Forms and buttons ---------- */
+
 input,
 button {
   font: inherit;
@@ -345,20 +960,58 @@ button {
 }
 
 input {
-  padding: 4px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: transparent;
+  min-height: 38px;
   max-width: 100%;
-  box-sizing: border-box;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
 }
 
-button {
-  padding: 4px 12px;
+input[type='checkbox'] {
+  min-height: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+button,
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 14px;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  font-size: 13.5px;
+  text-decoration: none;
   cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+
+button.small {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 12.5px;
 }
 
 button:disabled {
@@ -366,16 +1019,63 @@ button:disabled {
   opacity: 0.5;
 }
 
-/* The register form: one field per row. */
+/* Pressed-state toggles: the theme switch, the trend period. */
+.segmented {
+  display: inline-flex;
+  padding: 3px;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.segmented button {
+  flex: 1;
+  min-height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.segmented button:hover:not(:disabled) {
+  background: none;
+  color: var(--text);
+}
+
+.segmented button[aria-pressed='true'] {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.12);
+}
+
+.icon-button {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+/* The register form: one field per row, two short ones side by side. */
 .form {
   display: grid;
-  gap: 12px;
-  max-width: 480px;
+  gap: 14px;
+  max-width: 560px;
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 14px;
 }
 
 .field {
   display: grid;
-  gap: 2px;
+  gap: 4px;
 }
 
 .field > span:first-child {
@@ -383,7 +1083,7 @@ button:disabled {
 }
 
 .field-hint {
-  font-size: 0.8125rem;
+  font-size: 12.5px;
 }
 
 /* A row of inputs and a button (deploy, env vars), wrapping on phones. */
@@ -394,30 +1094,61 @@ button:disabled {
   gap: 8px;
 }
 
-.env-list {
-  list-style: none;
-  padding: 0;
-  margin: 0 0 12px;
+.form-inline .grow {
+  flex: 1 1 320px;
 }
 
-.env-list li {
+.form-inline .grow input {
+  width: 100%;
+}
+
+.suffix-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.check {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  max-width: 480px;
-  padding: 4px 0;
-  border-bottom: 1px solid var(--border);
+  gap: 10px;
 }
 
-.deploy-error,
+/* ---------- Text ---------- */
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 12.5px;
+}
+
+.strong {
+  font-weight: 600;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.error-text,
 .action-error {
   color: var(--down);
-  font-size: 0.875rem;
 }
 
 .action-error {
   flex-basis: 100%;
-  margin: 0;
+  font-size: 13px;
+}
+
+.banner {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  color: var(--warn);
+  background: var(--warn-bg);
 }
 
 /* Read by screen readers, not shown. */
@@ -428,44 +1159,4 @@ button:disabled {
   overflow: hidden;
   clip-path: inset(50%);
   white-space: nowrap;
-}
-
-/* The push-to-deploy switch, under the deploy form. */
-.auto-deploy {
-  margin-top: 8px;
-}
-
-.auto-deploy p {
-  margin: 4px 0 0;
-  font-size: 0.875rem;
-}
-
-/* The reconciler's events: one per line, a crash's output folded under it. */
-.events {
-  list-style: none;
-  padding: 0;
-  margin: 0 0 12px;
-}
-
-.events li {
-  padding: 6px 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.events details {
-  margin-top: 4px;
-  font-size: 0.875rem;
-}
-
-.event-output {
-  margin: 4px 0 0;
-  padding: 8px;
-  max-height: 16rem;
-  overflow: auto;
-  font-family: var(--mono);
-  font-size: 0.8125rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  border: 1px solid var(--border);
-  border-radius: 4px;
 }

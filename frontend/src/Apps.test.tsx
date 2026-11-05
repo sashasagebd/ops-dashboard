@@ -140,23 +140,24 @@ describe('Apps page', () => {
     window.location.hash = '#/apps'
     render(<App />)
 
-    const rows = await screen.findAllByRole('row')
-    expect(within(rows[1]).getByRole('link', { name: 'hello' })).toHaveAttribute('href', '#/apps/1')
-    expect(within(rows[1]).getByRole('link', { name: 'hello.apps.test' })).toHaveAttribute(
-      'href',
-      'http://hello.apps.test/',
-    )
-    expect(within(rows[1]).getByText('not deployed')).toBeInTheDocument()
-    expect(within(rows[2]).getByText('0123456')).toBeInTheDocument()
+    const hello = within(await screen.findByRole('article', { name: 'hello' }))
+    const api = within(screen.getByRole('article', { name: 'api' }))
+    expect(hello.getByRole('link', { name: 'hello' })).toHaveAttribute('href', '#/apps/1')
+    expect(hello.getByRole('link', { name: 'hello.apps.test' })).toHaveAttribute('href', 'http://hello.apps.test/')
+    expect(hello.getByText('not deployed')).toBeInTheDocument()
+    expect(hello.getByText('Not deployed')).toHaveClass('badge-neutral')
+    expect(api.getByText('0123456')).toBeInTheDocument()
+    expect(api.getByText('Live')).toHaveClass('badge-up')
     // A public app's public address too, over HTTPS.
-    expect(within(rows[2]).getByRole('link', { name: 'api.example.com' })).toHaveAttribute(
-      'href',
-      'https://api.example.com/',
-    )
+    expect(api.getByText('Public')).toBeInTheDocument()
+    expect(api.getByRole('link', { name: 'api.example.com' })).toHaveAttribute('href', 'https://api.example.com/')
     // Last-hour requests: none known for hello, 57 for api.
-    expect(within(rows[1]).getByText('—')).toBeInTheDocument()
-    expect(within(rows[2]).getByText('57')).toBeInTheDocument()
+    expect(hello.getByText('—')).toBeInTheDocument()
+    expect(api.getByText('57')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Apps' })).toHaveAttribute('aria-current', 'page')
+    // The sidebar lists them too.
+    const sidebar = within(screen.getByRole('navigation', { name: 'Main' }))
+    expect(sidebar.getByRole('link', { name: 'api' })).toHaveAttribute('href', '#/apps/2')
   })
 
   it('registers an app as JSON and opens it', async () => {
@@ -255,13 +256,19 @@ describe('App page', () => {
     window.location.hash = '#/apps/1'
     render(<App />)
 
-    expect(await screen.findByRole('heading', { name: 'hello' })).toBeInTheDocument()
-    expect(screen.getByText('GREETING')).toBeInTheDocument()
-    expect(screen.getByText('TOKEN')).toBeInTheDocument()
-    expect(screen.getByText('failed')).toHaveClass('badge-down')
+    expect(await screen.findByRole('heading', { name: 'hello', level: 1 })).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByText('/examples/hello', { exact: false })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Deployments' }))
+    expect(window.location.hash).toBe('#/apps/1/deployments')
+    expect(await screen.findByText('failed')).toHaveClass('badge-down')
     expect(screen.getByText('healthy')).toHaveClass('badge-up')
     expect(screen.getByText('build failed: npm ci returned 1')).toBeInTheDocument()
-    expect(screen.getByText('/examples/hello', { exact: false })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Settings' }))
+    expect(await screen.findByText('GREETING')).toBeInTheDocument()
+    expect(screen.getByText('TOKEN')).toBeInTheDocument()
   })
 
   it('deploys a commit and refreshes straight away', async () => {
@@ -276,7 +283,7 @@ describe('App page', () => {
         return [202, deployment({ id: 8, status: 'queued' })]
       },
     })
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/deployments'
     render(<App />)
     await screen.findByText('No deploys yet.')
 
@@ -292,9 +299,12 @@ describe('App page', () => {
     expect(JSON.parse(sent(fetchMock, 'POST', '/api/platform/apps/1/deployments')[0][1]?.body as string)).toEqual({
       commitSha: SHA,
     })
-    // While it's in progress, another deploy can't be started.
+    // While it's in progress, another deploy can't be started, from here or
+    // the header.
     expect(screen.getByText('A deploy is in progress.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Deploy' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Deploy latest' })).toBeDisabled()
+    expect(screen.getByText('Deploying')).toHaveClass('badge-warn')
     // Its log opens, to watch it live.
     expect(FakeEventSource.latest().url).toBe('/api/platform/apps/1/deployments/8/logs')
   })
@@ -309,11 +319,11 @@ describe('App page', () => {
         }),
       ],
     })
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/deployments'
     render(<App />)
 
     // The latest by default.
-    expect(await screen.findByRole('button', { name: 'Deploy #8' })).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByRole('button', { name: "Show deploy #8's log" })).toHaveAttribute('aria-pressed', 'true')
     const deployLog = FakeEventSource.latest()
     expect(deployLog.url).toBe('/api/platform/apps/1/deployments/8/logs')
     deployLog.open()
@@ -326,8 +336,9 @@ describe('App page', () => {
     expect(deployLog.readyState).toBe(FakeEventSource.CLOSED) // the one it replaced
     expect(screen.getByRole('button', { name: "Show deploy #7's log" })).toHaveAttribute('aria-pressed', 'true')
 
-    // The live container's output.
-    fireEvent.click(screen.getByRole('button', { name: 'App output' }))
+    // The live container's output, on its own tab.
+    fireEvent.click(screen.getByRole('tab', { name: 'Logs' }))
+    await vi.waitFor(() => expect(FakeEventSource.latest().url).toBe('/api/platform/apps/1/logs'))
     const output = FakeEventSource.latest()
     expect(output.url).toBe('/api/platform/apps/1/logs')
     output.open()
@@ -343,8 +354,10 @@ describe('App page', () => {
     window.location.hash = '#/apps/1'
     render(<App />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Deploy latest from main' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Deploy latest' }))
+    // Its log opens, on the Deployments tab.
     await vi.waitFor(() => expect(FakeEventSource.latest().url).toBe('/api/platform/apps/1/deployments/9/logs'))
+    expect(window.location.hash).toBe('#/apps/1/deployments')
     expect(sent(fetchMock, 'POST', '/api/platform/apps/1/deployments/latest')).toHaveLength(1)
   })
 
@@ -357,7 +370,7 @@ describe('App page', () => {
         return [200, app({ autoDeploy: auto })]
       },
     })
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/settings'
     render(<App />)
 
     const box = await screen.findByRole('checkbox', { name: 'Deploy automatically on every push to main' })
@@ -386,10 +399,10 @@ describe('App page', () => {
       },
     })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/settings'
     render(<App />)
 
-    expect(await screen.findByText('no, tailnet only')).toBeInTheDocument()
+    expect(await screen.findByText(/No, tailnet only/)).toBeInTheDocument()
     const input = screen.getByRole('textbox', { name: 'Public name' })
     const makePublic = screen.getByRole('button', { name: 'Make public' })
     // Not one part of a hostname: can't be sent.
@@ -410,12 +423,12 @@ describe('App page', () => {
     expect(JSON.parse(sent(fetchMock, 'PATCH', '/api/platform/apps/1')[1][1]?.body as string)).toEqual({
       publicName: '',
     })
-    expect(await screen.findByText('no, tailnet only')).toBeInTheDocument()
+    expect(await screen.findByText(/No, tailnet only/)).toBeInTheDocument()
   })
 
   it("says public hostnames aren't set up without a public domain", async () => {
     mockFetch({ 'GET /api/platform/apps/1': () => [200, detail({ publicDomain: null })] })
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/settings'
     render(<App />)
     expect(await screen.findByText(/Public hostnames aren't set up on this server/)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Make public' })).not.toBeInTheDocument()
@@ -439,7 +452,7 @@ describe('App page', () => {
       },
     })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/deployments'
     render(<App />)
 
     // Only versions that can be rolled back to have the button.
@@ -455,12 +468,14 @@ describe('App page', () => {
     fireEvent.click(button)
     expect(await screen.findByText('rollback of #7')).toBeInTheDocument()
     expect(sent(fetchMock, 'POST', '/api/platform/apps/1/deployments/7/rollback')).toHaveLength(1)
-    // Its log opens, auto-deploy says why it's off, and no other rollback
-    // can start while this one runs.
+    // Its log opens, no other rollback can start while this one runs, and
+    // the header and settings say why auto-deploy is off.
     expect(FakeEventSource.latest().url).toBe('/api/platform/apps/1/deployments/9/logs')
-    expect(screen.getByText(/Turned off by the rollback to #7/)).toBeInTheDocument()
-    expect(screen.getByRole('checkbox')).not.toBeChecked()
     expect(screen.getByRole('button', { name: 'Roll back to deploy #7' })).toBeDisabled()
+    expect(screen.getByText('Auto-deploy off: rolled back to #7')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: 'Settings' }))
+    expect(await screen.findByText(/Turned off by the rollback to #7/)).toBeInTheDocument()
+    expect(screen.getByRole('checkbox')).not.toBeChecked()
   })
 
   it('shows why a rollback was refused', async () => {
@@ -475,7 +490,7 @@ describe('App page', () => {
       ],
     })
     vi.spyOn(window, 'confirm').mockReturnValue(true)
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/deployments'
     render(<App />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Roll back to deploy #7' }))
@@ -509,7 +524,7 @@ describe('App page', () => {
       },
     })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/database'
     render(<App />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Add a database' }))
@@ -530,7 +545,7 @@ describe('App page', () => {
         detail({ currentDeployment: deployment(), database: { name: 'ops-db-hello', createdAt: created, state: 'running' } }),
       ],
     })
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/database'
     render(<App />)
     expect(await screen.findByText('running')).toHaveClass('badge-up')
     expect(screen.queryByText(/Deploy the app to start using it/)).not.toBeInTheDocument()
@@ -561,7 +576,7 @@ describe('App page', () => {
         return [202, { ...done, id: 2, status: 'queued', file: null, sizeBytes: null }]
       },
     })
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/database'
     render(<App />)
 
     expect(await screen.findByText('hello-20261104-120000.dump')).toBeInTheDocument()
@@ -583,7 +598,7 @@ describe('App page', () => {
         detail({ database: { name: 'ops-db-hello', createdAt: new Date().toISOString(), state: 'creating' } }),
       ],
     })
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/database'
     render(<App />)
     await screen.findByText('being created')
     expect(screen.queryByRole('button', { name: 'Back up now' })).not.toBeInTheDocument()
@@ -611,9 +626,13 @@ describe('App page', () => {
     render(<App />)
 
     // The latest values, and the hour's totals.
+    const card = (name: string) => within(screen.getByRole('region', { name }))
     expect(await screen.findByText('2.5%')).toBeInTheDocument()
-    expect(screen.getByText('20 MiB of 256 MiB')).toBeInTheDocument()
-    expect(await screen.findByText('42 in the last hour, 1 5xx, p95 23.5 ms')).toBeInTheDocument()
+    expect(card('Memory').getByText('20 MiB')).toBeInTheDocument()
+    expect(card('Memory').getByText('of 256 MiB')).toBeInTheDocument()
+    expect(await screen.findByText('42')).toBeInTheDocument()
+    expect(card('Requests (1h)').getByText('1 5xx')).toBeInTheDocument()
+    expect(card('Response time (p95)').getByText('23.5 ms')).toBeInTheDocument()
     expect(screen.getByRole('img', { name: /hello requests a minute, last hour: average 21\/min, peak 30\/min/ })).toBeInTheDocument()
   })
 
@@ -621,17 +640,18 @@ describe('App page', () => {
     mockFetch({ 'GET /api/platform/apps/1': () => [200, detail()] })
     window.location.hash = '#/apps/1'
     render(<App />)
-    expect(await screen.findByText(/counted once a minute/)).toBeInTheDocument()
-    expect(screen.getAllByText('no data yet')).toHaveLength(2) // CPU and memory
+    expect(await screen.findAllByText(/counted once a minute/)).toHaveLength(2) // requests and p95
+    expect(screen.getAllByText('no data yet')).toHaveLength(4)
   })
 
   it('has no app output to show when nothing is live', async () => {
     mockFetch({
       'GET /api/platform/apps/1': () => [200, detail({ deployments: [deployment({ status: 'failed' })] })],
     })
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/logs'
     render(<App />)
-    expect(await screen.findByRole('button', { name: 'App output' })).toBeDisabled()
+    expect(await screen.findByText("Nothing is live, so there's no app output.")).toBeInTheDocument()
+    expect(FakeEventSource.instances).toHaveLength(0)
   })
 
   it('sets and removes env vars without ever reading a value back', async () => {
@@ -648,7 +668,7 @@ describe('App page', () => {
       },
     })
     vi.spyOn(window, 'confirm').mockReturnValue(true)
-    window.location.hash = '#/apps/1'
+    window.location.hash = '#/apps/1/settings'
     render(<App />)
     await screen.findByText('OLD')
 
@@ -678,9 +698,64 @@ describe('navigation', () => {
     mockFetch({ 'GET /api/platform/apps': () => [200, []] })
     window.location.hash = '#/nope'
     render(<App />)
-    expect(screen.getByText('No such page.')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'No such page' })).toBeInTheDocument()
 
     window.location.hash = '#/apps'
     expect(await screen.findByText('No apps yet.')).toBeInTheDocument()
+  })
+
+  it("opens the app's tab named in the URL, and moves between tabs with the arrow keys", async () => {
+    mockFetch({ 'GET /api/platform/apps/1': () => [200, detail()] })
+    window.location.hash = '#/apps/1/database'
+    render(<App />)
+
+    const database = await screen.findByRole('tab', { name: 'Database' })
+    expect(database).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel')).toHaveAccessibleName('Database')
+    // One tab stop: only the selected tab is in the tab order.
+    expect(database).toHaveAttribute('tabindex', '0')
+    expect(screen.getByRole('tab', { name: 'Logs' })).toHaveAttribute('tabindex', '-1')
+
+    fireEvent.keyDown(database, { key: 'ArrowRight' })
+    await vi.waitFor(() => expect(window.location.hash).toBe('#/apps/1/settings'))
+    expect(await screen.findByRole('tab', { name: 'Settings' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tab', { name: 'Settings' })).toHaveFocus()
+    // Past the last one, back to the first.
+    fireEvent.keyDown(screen.getByRole('tab', { name: 'Settings' }), { key: 'ArrowRight' })
+    await vi.waitFor(() => expect(window.location.hash).toBe('#/apps/1'))
+  })
+})
+
+describe('theme switch', () => {
+  afterEach(() => {
+    localStorage.clear()
+    delete document.documentElement.dataset.theme
+  })
+
+  it("follows the system's theme until another is chosen, and remembers the choice", async () => {
+    mockFetch({ 'GET /api/platform/apps': () => [200, []] })
+    window.location.hash = '#/apps'
+    const { unmount } = render(<App />)
+
+    const theme = within(screen.getByRole('group', { name: 'Theme' }))
+    expect(theme.getByRole('button', { name: 'System' })).toHaveAttribute('aria-pressed', 'true')
+    expect(document.documentElement.dataset.theme).toBeUndefined()
+
+    fireEvent.click(theme.getByRole('button', { name: 'Dark' }))
+    expect(document.documentElement.dataset.theme).toBe('dark')
+    expect(localStorage.getItem('ops-theme')).toBe('dark')
+
+    // Still dark next time.
+    unmount()
+    render(<App />)
+    expect(within(screen.getByRole('group', { name: 'Theme' })).getByRole('button', { name: 'Dark' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+
+    // Back to the system's: nothing stored, nothing forced.
+    fireEvent.click(within(screen.getByRole('group', { name: 'Theme' })).getByRole('button', { name: 'System' }))
+    expect(document.documentElement.dataset.theme).toBeUndefined()
+    expect(localStorage.getItem('ops-theme')).toBeNull()
   })
 })
