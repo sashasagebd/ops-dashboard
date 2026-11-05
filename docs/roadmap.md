@@ -20,9 +20,9 @@ _Last updated: 2026-11-04_
 | P2: Push-to-deploy, job queue, live logs | ✅ Done, deployed 2026-11-03 (PR #7) |
 | P3: Zero-downtime deploys and rollbacks | ✅ Done, deployed 2026-11-04 (PR #9) |
 | P4: Reconciliation and crash recovery | ✅ Done, deployed 2026-11-04 (PR #11) |
-| P5: Databases for apps, observability, public hostnames | 🚧 In progress (plan approved 2026-11-04) |
+| P5: Databases for apps, observability, public hostnames | ✅ Done, deployed 2026-11-05 |
 
-**Where we left off (2026-11-04):** P0 to P4 are done and deployed.
+**Where we left off (2026-11-05):** P0 to P5 are done and deployed.
 Pushing to `main` deploys `examples/hello` with no clicks, the build log
 streams live, and a platform killed mid-build finishes the same deploy after
 it restarts. Deploys have no downtime (the old version drains before it's
@@ -31,12 +31,14 @@ previous versions can be rolled back to from the dashboard, with no build.
 A reconciler keeps what runs in line with the database every 10s: a killed
 or deleted app container, a lost route, or a whole-server reboot all come
 back on their own, each fix shown as an event in the dashboard.
-P5's plan is approved (below); work is on the `platform-p5` branch. The
-domain is bought: `sashasagebd.com` (Cloudflare Registrar).
-**Next:** merge P5 and deploy it, then the server checks of P5's done-when
-(5.1 to 5.4 are done, CI green). The Cloudflare tunnel `homelab` exists
-(inactive until the server runs `cloudflared`); its route is added once it
-connects.
+Apps can have their own Postgres (backed up daily to `~/backups`), show CPU,
+memory and request metrics, and be made public on `sashasagebd.com` through
+Cloudflare Tunnel with one setting; `hello` is live at
+`https://hello.sashasagebd.com`. The webhook comes in at
+`hooks.sashasagebd.com`; Tailscale Funnel is off.
+**Next:** the owner writes the pokewordle backend, then deploys it on the
+platform (register it, add a database, public name `api`). After that, the
+next phase of [platform-plan.md](platform-plan.md), to be planned.
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -55,7 +57,9 @@ Notes for resuming:
   8.3 MiB, Postgres 67 MiB (warm cache), Caddy 52 MiB. After P3's server
   checks: platform 8.7 MiB, Postgres 69 MiB, Caddy 56 MiB, hello 1.7 MiB.
   After P4's reboot (measured 30s after boot): platform 18.7 MiB, Postgres
-  65 MiB, Caddy 51 MiB, hello 7.2 MiB. **Caddy:** each route update rebuilds
+  65 MiB, Caddy 51 MiB, hello 7.2 MiB. After P5's server checks: platform
+  9.7 MiB, Postgres 72 MiB, Caddy 16 MiB, cloudflared 17 MiB, hello
+  2.2 MiB, hello's database 46 MiB. **Caddy:** each route update rebuilds
   its config, and Go holds freed memory until it needs to return it; it caps
   itself near its 128 MiB limit (`GOMEMLIMIT`, ~115 MiB). Since P4 the
   reconciler only applies routes when Caddy's differ, so an idle platform
@@ -524,7 +528,7 @@ Decisions (approved 2026-11-04), with entries in
   next pass checks again. A redeploy would rebuild, take minutes and clutter
   the history.
 
-## P5: Databases for apps, observability, public hostnames 🚧
+## P5: Databases for apps, observability, public hostnames ✅
 
 Phase 5 of [platform-plan.md](platform-plan.md), adjusted. Plan approved
 2026-11-04.
@@ -552,9 +556,39 @@ makes desired state real, which a database fits.
 | 5.1 | **Databases for apps.** "Add a database" on an app's page: one per app, created once; its password encrypted like env vars. The reconciler creates and keeps it running: a `postgres:18.6` container (its own memory limit) with its data on a named volume, on an internal Docker network of the app's own that only its database and its containers join (never `platform-apps`, so other apps can't reach it). A recreated container finds its data on the volume. App containers get `DATABASE_URL` from the next deploy. No new Docker permissions (a container create makes its volume; `IMAGES` pulls, `NETWORKS` creates the network); database containers are the one exception to "no mounts", a named volume only, never a host path. Deleting a database isn't in P5, and the platform never removes a volume. `examples/hello` gets a `/visits` counter in its database; CI checks the count survives a redeploy, a `docker rm -f` of the database container and a rollback, and that another app can't reach it. | ✅ `ca49e4a`, CI green. Migration 0010 (`app_databases`, and a `database_created` event kind). Beyond the plan: `provisioned_at` records the database's first creation, so the reconciler tells "not created yet" (event `database_created`) from "its container was deleted" (`recreated`, data kept) without the Docker volumes permission; the dashboard shows "being created" until then, and "Deploy the app to start using it" while the live version predates the database. The platform's `DATABASE_URL` replaces a user env var of that name. Names derived: `ops-db-<app>` for the container, volume, network and hostname. **Not checked in CI: a rollback with the database** (CI's only other image of hello is the parent commit's, without `/visits`); rollbacks start containers through the same code as deploys, which unit tests cover. CI also checks the password appears in neither the API nor a deploy log. Details in [decisions/platform.md](decisions/platform.md) ("How app databases work"). |
 | 5.2 | **Backups.** A daily `pg_dump` per database, as a job in the queue (retried, survives restarts), plus "Back up now". Run in a short-lived `postgres:18.6` container on the app's database network, writing into a volume compose defines as a bind of `BACKUP_DIR` (`~/backups`), so the platform never names a host path; files owned by the owner's user, not root. Keep 7 daily per app. The last backup's time and size on the app page. Restore is a documented manual `pg_restore`; CI backs up, drops hello's table, restores, and checks the count is back. | ✅ `402b27d`, CI green. Migration 0011 (`backups`; jobs get `backup_id` and a check that each kind has exactly its own input). `jobs.Kinds` dispatches jobs by kind. Beyond the plan: compose only creates a volume a service uses, so the platform mounts `platform-backups` read-only and checks each dump's size there (proof it landed); dumps go to a hidden partial file renamed when complete; the backup container is always removed (it holds the password). **Needs on the server before deploying:** `mkdir -p ~/backups` and `BACKUP_DIR=/home/sasha/backups` in `.env` (compose refuses to start without it). Details in [decisions/platform.md](decisions/platform.md) ("How backups work"). |
 | 5.3 | **Per-app metrics.** CPU and memory: the dashboard's history also keeps a series per platform app (`app:<name>`, by the container's app label), surviving deploys, shown as sparklines on the app page. Requests: the platform turns on Caddy's per-host metrics, reads them from the admin API every minute, and keeps 24h per app in memory (requests per minute, the 5xx share, p95 latency), on the app page and as last-hour requests on the Apps list. CI sends hello known requests and checks the counts. | ✅ `2e24bf6`, CI green. CPU and memory: the dashboard's Docker client now keeps labels; `/api/history` has `apps` (each summing the app's own containers, not its database or backups). Requests: `internal/metrics` with a small parser for Caddy's Prometheus text (no new dependency), p95 estimated like `histogram_quantile`, a Caddy restart's reset handled, minutes without a reading are gaps. The reconciler keeps per-host metrics on (logged, not an event). API: `GET /apps/{id}/metrics?window=1h|24h`, `requestsLastHour` on apps. UI: a Metrics section (CPU, memory, requests, 5xx, p95) on the app page, requests in the last hour on the Apps list. Details in [decisions/platform.md](decisions/platform.md) ("How per-app metrics work"). |
-| 5.4 | **Public hostnames through Cloudflare Tunnel.** A `cloudflared` service in compose that reaches Caddy over a network of its own (no published port, no port forwarding). Each app gets an optional public hostname (e.g. `api.sashasagebd.com`) alongside its tailnet one; apps without one stay tailnet-only, and the dashboard and the platform's API stay tailnet-only. The GitHub webhook moves to `hooks.sashasagebd.com` and Tailscale Funnel is turned off. The owner does the Cloudflare side (the tunnel and its token) from exact steps. Server checks of the done-when. | ✅ `179dc14`, CI green; server checks pending. Migration 0012 (`apps.public_name`). Caddy gets a second server, `public` on :8080, the only one the tunnel reaches (`cloudflared` shares the `tunnel` network with Caddy alone): public apps' routes and `hooks.`, then a 404; both servers in one PATCH. Beyond the plan: the tailnet server refuses the tunnel's subnet (403), since `cloudflared` can connect to any port Caddy listens on and a route to `caddy:80` would otherwise expose tailnet-only apps. Public on the app page ("Public access": a name, confirmed; routes change at once). `cloudflared` 2026.10.7 behind the `tunnel` compose profile, from a token. The webhook's published port is gone. Request metrics are now per app (tailnet and public hostnames summed). CI checks through Caddy's public server from the tunnel network: the webhook, an app made public and private again, 404 for tailnet hostnames, 403 on the tailnet server, nothing else reachable. Details in [decisions/platform.md](decisions/platform.md) ("How public hostnames work"). |
+| 5.4 | **Public hostnames through Cloudflare Tunnel.** A `cloudflared` service in compose that reaches Caddy over a network of its own (no published port, no port forwarding). Each app gets an optional public hostname (e.g. `api.sashasagebd.com`) alongside its tailnet one; apps without one stay tailnet-only, and the dashboard and the platform's API stay tailnet-only. The GitHub webhook moves to `hooks.sashasagebd.com` and Tailscale Funnel is turned off. The owner does the Cloudflare side (the tunnel and its token) from exact steps. Server checks of the done-when. | ✅ `179dc14`, CI green, deployed 2026-11-05. Migration 0012 (`apps.public_name`). Caddy gets a second server, `public` on :8080, the only one the tunnel reaches (`cloudflared` shares the `tunnel` network with Caddy alone): public apps' routes and `hooks.`, then a 404; both servers in one PATCH. Beyond the plan: the tailnet server refuses the tunnel's subnet (403), since `cloudflared` can connect to any port Caddy listens on and a route to `caddy:80` would otherwise expose tailnet-only apps. Public on the app page ("Public access": a name, confirmed; routes change at once). `cloudflared` 2026.10.7 behind the `tunnel` compose profile, from a token. The webhook's published port is gone. Request metrics are now per app (tailnet and public hostnames summed). CI checks through Caddy's public server from the tunnel network: the webhook, an app made public and private again, 404 for tailnet hostnames, 403 on the tailnet server, nothing else reachable. Details in [decisions/platform.md](decisions/platform.md) ("How public hostnames work"). |
 
-Decisions (approved 2026-11-04), to be written up in
+Verified on the server (2026-11-05, Docker 29.8.1): every done-when point.
+- **Setup:** migrations 10–12 applied on deploy. `.env` gained
+  `BACKUP_DIR` (and the owner's uid/gid), `PUBLIC_DOMAIN`, the tunnel token
+  and `COMPOSE_PROFILES=tunnel`. `cloudflared` registered four connections
+  (Seattle) running read-only with no capabilities. Funnel turned off;
+  the dashboard stays tailnet-only on 443. hello redeployed with "Deploy
+  latest" first (the merge had deployed it on the old platform).
+- **Cloudflare:** the tunnel `homelab` (remotely managed), one route:
+  `*.sashasagebd.com` → `http://caddy:8080`. The dashboard accepted the
+  wildcard and made its DNS record, so new public names need no Cloudflare
+  change. Tunnels are now under Networking → Tunnels (moved from Zero Trust
+  in 2026), and the setup wizard can't continue until a connector connects,
+  so the route was added after the deploy. An unknown name
+  (`nothing-here.`) gets Caddy's 404.
+- **Public hostname:** hello made public as `hello`; it answered at
+  `https://hello.sashasagebd.com` from the server and from a phone off Wi-Fi
+  and Tailscale. A request to it with a tailnet `Host` header is refused by
+  Cloudflare itself (403) before it reaches the tunnel.
+- **Webhook:** GitHub's URL changed to
+  `https://hooks.sashasagebd.com/webhooks/github`; a redelivery got 200.
+- **Database:** added to hello and deployed; `/visits` counted up (3, 4)
+  through the public hostname.
+- **Backup:** "Back up now" wrote `~/backups/hello/hello-20261105-021455.dump`
+  (1.6 KB), owned by `sasha`; `pg_restore --list` reads it (7 entries,
+  gzip). The full drop-and-restore is CI's.
+- **Metrics:** CPU, memory and requests show on hello's page.
+- Not checked on the server: a reboot with the tunnel (it has
+  `restart: unless-stopped` like the rest, and reconnects outbound on its
+  own), and the daily scheduled backup (it runs within 24h of the last).
+
+Decisions (approved 2026-11-04), written up in
 [decisions/platform.md](decisions/platform.md) as they land:
 - **One Postgres container per app,** not one shared instance with a
   database per app: isolation (one app can't exhaust another's connections
