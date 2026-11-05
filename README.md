@@ -265,6 +265,26 @@ docker exec -i ops-db-hello pg_restore --clean --if-exists -U app -d app \
 It runs inside the database's container (`docker exec`), where Postgres
 trusts its local user, so the password, which is never shown, isn't needed.
 
+### Stopping and deleting apps
+
+On an app's Settings tab:
+
+- **Stop** takes it offline: its container is removed (freeing its memory),
+  its addresses stop answering, and pushes don't deploy it. Its database
+  keeps running, and nothing else is lost. **Start** runs the live version
+  again, with no build.
+- **Delete** (type the app's name to confirm) removes the app, its
+  containers and images, its routes, and its history, env vars and events.
+  Its code on GitHub isn't touched. The platform can't remove Docker
+  volumes, so an app's database data stays, as do its backups; the
+  dashboard shows the commands to remove them for good:
+  ```sh
+  docker volume rm ops-db-<app>
+  rm -r ~/backups/<app>
+  ```
+  Remove the volume before registering another app with the same name:
+  its database would find the old data, and refuse the new password.
+
 ### Metrics
 
 Each app's page shows its last hour: CPU and memory (all of the app's

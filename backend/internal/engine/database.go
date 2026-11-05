@@ -51,6 +51,15 @@ func (c *Client) EnsureNetwork(ctx context.Context, name string, labels map[stri
 	return nil
 }
 
+// RemoveNetwork removes the network called name (an app's database network,
+// once the app is deleted). One that's already gone isn't an error.
+func (c *Client) RemoveNetwork(ctx context.Context, name string) error {
+	if _, err := c.api.NetworkRemove(ctx, name, client.NetworkRemoveOptions{}); err != nil && !cerrdefs.IsNotFound(err) {
+		return fmt.Errorf("removing network: %w", err)
+	}
+	return nil
+}
+
 // Pull pulls ref (a public image, pinned by tag) unless Docker has it
 // already, waiting for the pull to finish.
 func (c *Client) Pull(ctx context.Context, ref string) error {

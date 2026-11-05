@@ -2,6 +2,7 @@ import { useCallback, useState, type FormEvent, type ReactNode } from 'react'
 import {
   appLogURL,
   createDatabase,
+  deleteApp,
   deleteEnvVar,
   deployCommit,
   deployLatest,
@@ -13,13 +14,16 @@ import {
   setAutoDeploy,
   setEnvVar,
   setPublicName,
+  startApp,
   startBackup,
+  stopApp,
   type AppDetail,
   type Deployment,
   type Series,
 } from './api'
 import { BACKUP_BADGE, DATABASE_BADGE, IN_PROGRESS, shortSHA, STATUS_BADGE } from './appFormat'
 import { AppBadges, AppLink, EventsList, PublicLink } from './appParts'
+import { setFlash } from './flash'
 import { formatBytes, formatCPU, formatDuration, formatFileSize } from './format'
 import { LogViewer } from './LogViewer'
 import { appHref, type AppTab } from './route'
@@ -120,7 +124,12 @@ function AppHeader({ app, now, onDeployed }: { app: AppDetail; now: number; onDe
       }
       subtitle={
         <ul className="meta">
-          {live !== null && (
+          {app.stopped && (
+            <li>
+              Not running: <a href={appHref(app.id, 'settings')}>start it from Settings</a>
+            </li>
+          )}
+          {live !== null && !app.stopped && (
             <li>
               <span className="mono">{shortSHA(live.commitSha)}</span> live since{' '}
               {formatDuration(now - Date.parse(live.finishedAt ?? live.createdAt))} ago
@@ -154,7 +163,13 @@ function AppHeader({ app, now, onDeployed }: { app: AppDetail; now: number; onDe
       }
       actions={
         <>
-          <button type="button" className="primary" onClick={onLatest} disabled={deploying || action.status === 'busy'}>
+          <button
+            type="button"
+            className="primary"
+            onClick={onLatest}
+            disabled={app.stopped || deploying || action.status === 'busy'}
+            title={app.stopped ? 'Start the app first' : undefined}
+          >
             Deploy latest
           </button>
           <ActionError state={action} />
@@ -676,8 +691,115 @@ function SettingsTab({ app, onDone }: { app: AppDetail; onDone: () => void }) {
       <Card title="Environment variables">
         <EnvVars app={app} onDone={onDone} />
       </Card>
+      <Card title="Stop or start">
+        <StopStart app={app} onDone={onDone} />
+      </Card>
+      <Card title="Delete this app" className="card-danger">
+        <DeleteApp app={app} />
+      </Card>
     </div>
   )
+}
+
+// StopStart takes the app offline and back: stopping removes its container
+// (freeing its memory) and its routes; starting runs the live version again.
+function StopStart({ app, onDone }: { app: AppDetail; onDone: () => void }) {
+  const [action, run] = useAction()
+  const deploying = app.deployments.some((d) => IN_PROGRESS.has(d.status))
+  const onStop = () => {
+    const question =
+      `Stop ${app.name}? Its container is removed and its addresses stop answering until you start it again. ` +
+      `Pushes don't deploy it meanwhile. Its database keeps running.`
+    if (!window.confirm(question)) return
+    void run(async () => {
+      await stopApp(app.id)
+      onDone()
+    })
+  }
+  const onStart = () => {
+    void run(async () => {
+      await startApp(app.id)
+      onDone()
+    })
+  }
+  return app.stopped ? (
+    <>
+      <p className="muted card-intro">
+        Stopped: not running, not reachable, and pushes don't deploy it. Starting runs the live version again, with no
+        build.
+      </p>
+      <button type="button" className="primary" onClick={onStart} disabled={action.status === 'busy'}>
+        Start
+      </button>
+      <ActionError state={action} />
+    </>
+  ) : (
+    <>
+      <p className="muted card-intro">
+        Running. Stop it to take it offline and free its memory, without losing anything: its settings, history and
+        database stay.
+      </p>
+      <div className="form-inline">
+        <button type="button" onClick={onStop} disabled={deploying || action.status === 'busy'}>
+          Stop
+        </button>
+        {deploying && <span className="muted">Wait for the deploy in progress to finish.</span>}
+        <ActionError state={action} />
+      </div>
+    </>
+  )
+}
+
+// DeleteApp deletes the app once its name is typed. The platform can't remove
+// Docker volumes, so a database's data stays on the server: the Apps page
+// says how to remove it (flash.ts).
+function DeleteApp({ app }: { app: AppDetail }) {
+  const [typed, setTyped] = useState('')
+  const [action, run] = useAction()
+  const onSubmit = (e: FormEvent) => {
+    e.preventDefault()
+    void run(async () => {
+      const deleted = await deleteApp(app.id)
+      setFlash(deletedNotice(deleted.name, deleted.databaseVolume))
+      window.location.assign('#/apps')
+    })
+  }
+  return (
+    <form className="form" onSubmit={onSubmit}>
+      <p className="muted">
+        Removes the app, its containers and images, its routes, and its deploy history, logs, env vars and events. Its
+        code on GitHub isn't touched.
+        {app.database !== null &&
+          ` Its database's data (the ${app.database.name} volume) and its backups stay on the server, for you to remove by hand.`}{' '}
+        This can't be undone.
+      </p>
+      <label className="field">
+        <span>
+          Type <span className="mono">{app.name}</span> to confirm
+        </span>
+        <input value={typed} onChange={(e) => setTyped(e.target.value)} autoComplete="off" spellCheck={false} />
+      </label>
+      <div>
+        <button type="submit" className="danger" disabled={typed !== app.name || action.status === 'busy'}>
+          Delete {app.name}
+        </button>
+      </div>
+      <ActionError state={action} />
+    </form>
+  )
+}
+
+function deletedNotice(name: string, volume: string | null) {
+  if (volume === null) return { title: `Deleted ${name}.`, lines: [], commands: [] }
+  return {
+    title: `Deleted ${name}. Its database's data is still on the server.`,
+    lines: [
+      `The platform can't remove Docker volumes, so the data stays in the ${volume} volume, and backups in ~/backups/${name}/. ` +
+        `To remove them for good, run these on the server. Do this before registering another app called ${name}: ` +
+        `its database would otherwise find the old data, and refuse its new password.`,
+    ],
+    commands: [`docker volume rm ${volume}`, `rm -r ~/backups/${name}`],
+  }
 }
 
 // AutoDeploy is the push-to-deploy switch, and the pushed commit waiting for

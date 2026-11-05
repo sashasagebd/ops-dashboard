@@ -36,7 +36,8 @@ memory and request metrics, and be made public on `sashasagebd.com` through
 Cloudflare Tunnel with one setting; `hello` is live at
 `https://hello.sashasagebd.com`. The webhook comes in at
 `hooks.sashasagebd.com`; Tailscale Funnel is off.
-**Next:** the frontend redesign (UI below), written and awaiting review and CI. The pokewordle
+**Next:** stopping and deleting apps (L below), written and awaiting
+review and CI. The frontend redesign (UI below) is merged (PR #15). The pokewordle
 backend is a separate project; once it exists, deploying it is registering
 it, adding a database and the public name `api`. Phase 6 (preview
 environments, a stretch goal) is paused at the owner's call (2026-11-05).
@@ -611,7 +612,7 @@ Decisions (approved 2026-11-04), written up in
   `api.pokewordle.sashasagebd.com`): Cloudflare's free certificate covers
   the bare domain and one level of subdomains only.
 
-## UI: Frontend redesign 🔍
+## UI: Frontend redesign ✅
 
 Plan approved 2026-11-05 (owner: "ops console" direction, tabs on the app
 page, plain CSS; mocked up first, then done as one step at the owner's
@@ -641,6 +642,29 @@ What changed:
   page draws (an inline script in `index.html`), so dark doesn't flash light.
 - No backend change; no new dependencies. Tests were moved to the new
   layout, plus tests for the URL's tab, keyboard tabs and the theme switch.
+
+## L: Stopping and deleting apps 🔍
+
+Asked for 2026-11-05: apps had no way to be taken offline or removed. The
+owner chose to leave a deleted app's database volume for removal by hand
+rather than give the platform Docker's `VOLUMES` permission.
+
+- **Stop / Start** on an app's Settings tab. Stop removes its container and
+  routes (memory freed, addresses off), keeps its live version, database,
+  settings and history; no deploys or rollbacks meanwhile (pushes say "the
+  app is stopped"); refused mid-deploy. Start runs the live version again
+  from its image. The reconciler leaves a stopped app stopped.
+- **Delete** (type the name to confirm): the app's rows (cascade), routes,
+  containers (database's too), images and database network. Its database
+  volume and backups stay; the Apps page then shows the commands to remove
+  them, and warns to remove the volume before reusing the name. Refused
+  mid-deploy or mid-backup.
+- Migration 0013 (`apps.stopped`). API: `POST /apps/{id}/stop`, `/start`,
+  `DELETE /apps/{id}`; apps have `stopped`. Engine: `RemoveNetwork` (the
+  `NETWORKS` group the proxy already allows). Tests: store (database), the
+  deployer's order of work, the reconciler, the API, the webhook, the UI.
+  Details in [decisions/platform.md](decisions/platform.md) ("Stopping and
+  deleting apps").
 
 ## Open questions
 

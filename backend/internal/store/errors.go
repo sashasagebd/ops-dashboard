@@ -19,6 +19,9 @@ var (
 	// ErrDeployInProgress: the app already has a deployment queued, building
 	// or starting (the deployments_one_in_progress_per_app index).
 	ErrDeployInProgress = errors.New("a deploy of this app is already in progress")
+	// ErrAppStopped: the app is stopped, so nothing can be deployed to it
+	// (or rolled back) until it's started again.
+	ErrAppStopped = errors.New("the app is stopped; start it first")
 	// ErrWrongStatus: the deployment isn't in a status that allows the
 	// change, e.g. marking a failed deployment healthy.
 	ErrWrongStatus = errors.New("deployment is not in a status that allows this")

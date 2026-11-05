@@ -107,6 +107,7 @@ export type PlatformApp = {
   cpuLimitMillicores: number // 1000 = one core
   sourceDir: string // folder in the repo with the Dockerfile; '' is the root
   autoDeploy: boolean // pushes to branch deploy it
+  stopped: boolean // stopped on purpose: not running, not reachable, no deploys
   nextCommitSha: string | null // a pushed commit waiting for the deploy in progress
   createdAt: string
   currentDeployment: Deployment | null // the live one; null if nothing is live
@@ -279,6 +280,28 @@ export function startBackup(appId: number): Promise<Backup> {
 // tailnet-only again with ''.
 export function setPublicName(appId: number, publicName: string): Promise<PlatformApp> {
   return sendJSON<PlatformApp>('PATCH', `/api/platform/apps/${appId}`, { publicName })
+}
+
+// stopApp takes the app offline: its container is removed (its memory freed)
+// and its addresses stop answering. Its database keeps running.
+export function stopApp(appId: number): Promise<PlatformApp> {
+  return sendJSON<PlatformApp>('POST', `/api/platform/apps/${appId}/stop`)
+}
+
+// startApp runs the app's live version again, with no build.
+export function startApp(appId: number): Promise<PlatformApp> {
+  return sendJSON<PlatformApp>('POST', `/api/platform/apps/${appId}/start`)
+}
+
+// DeletedApp matches deletedResponse: what deleting left on the server for
+// the owner to remove by hand, if they want.
+export type DeletedApp = {
+  name: string
+  databaseVolume: string | null // its database's data, a Docker volume; null if it had no database
+}
+
+export function deleteApp(appId: number): Promise<DeletedApp> {
+  return sendJSON<DeletedApp>('DELETE', `/api/platform/apps/${appId}`)
 }
 
 export function setAutoDeploy(appId: number, autoDeploy: boolean): Promise<PlatformApp> {

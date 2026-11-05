@@ -75,6 +75,9 @@ func (s *Store) CreateRollback(ctx context.Context, appID, targetID int64) (d De
 		if err := lockApp(ctx, tx, appID); err != nil {
 			return err
 		}
+		if err := appStopped(ctx, tx, appID); err != nil {
+			return err
+		}
 		rows, _ := tx.Query(ctx,
 			"SELECT "+deploymentColumns+" FROM deployments WHERE id = $1 AND app_id = $2", targetID, appID)
 		target, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[Deployment])
