@@ -36,9 +36,10 @@ memory and request metrics, and be made public on `sashasagebd.com` through
 Cloudflare Tunnel with one setting; `hello` is live at
 `https://hello.sashasagebd.com`. The webhook comes in at
 `hooks.sashasagebd.com`; Tailscale Funnel is off.
-**Next:** the owner writes the pokewordle backend, then deploys it on the
-platform (register it, add a database, public name `api`). After that, the
-next phase of [platform-plan.md](platform-plan.md), to be planned.
+**Next:** the frontend redesign (UI below), written and awaiting review and CI. The pokewordle
+backend is a separate project; once it exists, deploying it is registering
+it, adding a database and the public name `api`. Phase 6 (preview
+environments, a stretch goal) is paused at the owner's call (2026-11-05).
 
 Notes for resuming:
 - **Workflow:** the owner wants fewer, larger steps (P1 was regrouped from 9
@@ -609,6 +610,37 @@ Decisions (approved 2026-11-04), written up in
   Public names stay one level deep (`api.sashasagebd.com`, not
   `api.pokewordle.sashasagebd.com`): Cloudflare's free certificate covers
   the bare domain and one level of subdomains only.
+
+## UI: Frontend redesign 🔍
+
+Plan approved 2026-11-05 (owner: "ops console" direction, tabs on the app
+page, plain CSS; mocked up first, then done as one step at the owner's
+request, since it's frontend only).
+
+**Goal:** a dashboard that looks finished at first sight (portfolio), and an
+app page that's easy to find your way around (it was one long scroll of
+nine sections).
+
+What changed:
+- **A shell:** a sidebar with Overview, Containers, Apps, the apps with a
+  status dot each, a System / Light / Dark theme switch and whether the
+  platform answers; on phones a top bar with a menu button.
+- **An Overview home** (`#/`): server tiles, every app as a card, recent
+  events and the busiest containers. Containers moved to `#/containers`.
+- **Apps as cards**, with status, public and tailnet addresses, live commit,
+  last-hour requests and auto-deploy.
+- **The app page in tabs** (`#/apps/{id}/{tab}`, kept in the URL): a header
+  that stays (status, addresses, auto-deploy, a waiting push, Deploy
+  latest), then Overview (metric cards, live version, events, about),
+  Deployments (deploy a commit, the table, the chosen deploy's log), Logs
+  (live output), Database (database and backups), Settings (public access,
+  push to deploy, env vars). Arrow keys move between tabs (ARIA tabs).
+- **Look:** cool greys, one blue accent, green/amber/red status, Inter and
+  JetBrains Mono (self-hosted, OFL), light and dark from one set of tokens.
+- **The theme switch** is remembered per browser and applied before the
+  page draws (an inline script in `index.html`), so dark doesn't flash light.
+- No backend change; no new dependencies. Tests were moved to the new
+  layout, plus tests for the URL's tab, keyboard tabs and the theme switch.
 
 ## Open questions
 
