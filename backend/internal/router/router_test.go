@@ -227,3 +227,62 @@ func TestProbeSendsHostAndDoesNotFollowRedirects(t *testing.T) {
 		t.Errorf("status = %d, want 302 (not followed)", status)
 	}
 }
+
+func TestSyncMetrics(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		wantChanged bool
+	}{
+		{name: "never set", status: http.StatusOK, body: "null", wantChanged: true},
+		{name: "path missing", status: http.StatusBadRequest, body: `{"error":"invalid traversal path"}`, wantChanged: true},
+		{name: "on but not per host", status: http.StatusOK, body: `{}`, wantChanged: true},
+		{name: "already per host", status: http.StatusOK, body: `{"per_host":true}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var posted string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/config/apps/http/metrics" {
+					http.Error(w, "wrong path", http.StatusNotFound)
+					return
+				}
+				if r.Method == http.MethodPost {
+					b, _ := io.ReadAll(r.Body)
+					posted = string(b)
+					return
+				}
+				w.WriteHeader(tt.status)
+				io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+
+			changed, err := New(srv.URL, "").SyncMetrics(t.Context())
+			if err != nil || changed != tt.wantChanged {
+				t.Fatalf("SyncMetrics = %v, %v; want changed %v", changed, err, tt.wantChanged)
+			}
+			if tt.wantChanged && posted != `{"per_host":true}` {
+				t.Errorf("posted %q, want per_host on", posted)
+			}
+			if !tt.wantChanged && posted != "" {
+				t.Errorf("posted %q although it was already on", posted)
+			}
+		})
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.Error(w, "no", http.StatusNotFound)
+			return
+		}
+		io.WriteString(w, "# HELP x\nx 1\n")
+	}))
+	defer srv.Close()
+	got, err := New(srv.URL, "").Metrics(t.Context())
+	if err != nil || string(got) != "# HELP x\nx 1\n" {
+		t.Errorf("Metrics = %q, %v", got, err)
+	}
+}

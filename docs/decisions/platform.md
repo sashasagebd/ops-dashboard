@@ -1258,3 +1258,52 @@ distroless, and it would need to reach every app's database network); a
 cron container in compose (outside the queue: no retries, no record, no
 "Back up now"); writing dumps through the platform (a second copy of every
 byte through a 128 MiB container).
+
+### The platform owns Caddy's `apps.http.metrics`
+
+**What:** besides its `apps` server, the platform sets one more piece of
+Caddy's config: `apps.http.metrics`, with `per_host` on, so Caddy counts
+requests per hostname. The reconciler keeps it on (it only writes if it's
+off).
+**Why:** per-host counts are how each app's traffic is told apart, and
+Caddy only offers them at this level: the per-server `metrics` setting,
+inside the platform's own server, still works but is deprecated, with a
+warning on every config load. Caddy gives a host its own series only if a
+route matches it, so a made-up `Host` header can't grow its memory.
+**Alternatives:** the deprecated per-server setting (works today, a warning
+every load, gone some day); counting in the apps (each app's own job, and
+apps the platform doesn't control); access logs (parsing every request's
+log line for a count).
+
+### Request metrics in memory, 24 hours
+
+**What:** the platform reads Caddy's metrics every minute and keeps, per
+app, 24 hours of requests per minute, 5xx responses and the p95 response
+time, in memory. They reset when the platform restarts.
+**Why:** they matter mostly "now" and "since this morning"; keeping them
+would need a table, writes every minute and pruning. The dashboard's own
+CPU and memory history works the same way.
+**Alternatives:** Postgres (durable, for numbers that don't need to be);
+Prometheus and Grafana (two more services for one chart).
+
+### How per-app metrics work (5.3, 2026-11-04)
+
+**What:** the details behind the two entries above.
+- **CPU and memory come from the dashboard,** which already samples every
+  container. It also records a series per platform app, keyed by the
+  container's `ops.platform.app` label and summing the app's own containers
+  (not its database or a backup): during a deploy it briefly has two, and
+  both are its usage. An app's container is renamed with every deploy, so
+  only the app's series carries on across them. `/api/history` returns
+  these under `apps`.
+- **Requests come from Caddy's request-duration histogram,** whose counts
+  by status code give requests and 5xx, and whose buckets give the p95,
+  estimated like Prometheus's `histogram_quantile` (linear within the
+  bucket). A small parser reads the few lines needed from Caddy's
+  Prometheus text output, rather than taking on Prometheus's library.
+- **Running totals become per-minute numbers:** each reading's difference
+  from the last. The first reading after the platform starts is only a
+  baseline. A total lower than before means Caddy restarted; the new total
+  is then all there is. A minute with no reading (Caddy or the platform
+  down) is a gap, never a zero.
+- **Health probes don't count:** they use their own probe hostnames.

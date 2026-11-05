@@ -39,6 +39,7 @@ function app(overrides: Partial<PlatformApp> = {}): PlatformApp {
     nextCommitSha: null,
     createdAt: '2026-11-01T00:00:00Z',
     currentDeployment: null,
+    requestsLastHour: null,
     ...overrides,
   }
 }
@@ -65,7 +66,18 @@ type Handler = (init: RequestInit | undefined) => [number, unknown]
 // apart from the Apps page's events, which are none unless a test says.
 // It returns the mock, whose calls show what was sent.
 function mockFetch(routes: Record<string, Handler>) {
-  const all: Record<string, Handler> = { 'GET /api/platform/events': () => [200, []], ...routes }
+  const all: Record<string, Handler> = {
+    'GET /api/platform/events': () => [200, []],
+    'GET /api/history?window=1h': () => [
+      200,
+      { start: new Date().toISOString(), stepSeconds: 60, host: {}, containers: {}, apps: {} },
+    ],
+    'GET /api/platform/apps/1/metrics?window=1h': () => [
+      200,
+      { start: new Date().toISOString(), stepSeconds: 60, requests: [], errors: [], p95Ms: [] },
+    ],
+    ...routes,
+  }
   const fetchMock = vi.fn((url: string, init?: RequestInit) => {
     const handler = all[`${init?.method ?? 'GET'} ${url}`]
     const [status, body] = handler ? handler(init) : [404, { error: 'not found' }]
@@ -100,7 +112,7 @@ describe('Apps page', () => {
     mockFetch({
       'GET /api/platform/apps': () => [
         200,
-        [app(), app({ id: 2, name: 'api', hostname: 'api.apps.test', currentDeployment: deployment() })],
+        [app(), app({ id: 2, name: 'api', hostname: 'api.apps.test', currentDeployment: deployment(), requestsLastHour: 57 })],
       ],
     })
     window.location.hash = '#/apps'
@@ -114,6 +126,9 @@ describe('Apps page', () => {
     )
     expect(within(rows[1]).getByText('not deployed')).toBeInTheDocument()
     expect(within(rows[2]).getByText('0123456')).toBeInTheDocument()
+    // Last-hour requests: none known for hello, 57 for api.
+    expect(within(rows[1]).getByText('—')).toBeInTheDocument()
+    expect(within(rows[2]).getByText('57')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Apps' })).toHaveAttribute('aria-current', 'page')
   })
 
@@ -496,6 +511,42 @@ describe('App page', () => {
     render(<App />)
     await screen.findByText('being created')
     expect(screen.queryByRole('button', { name: 'Back up now' })).not.toBeInTheDocument()
+  })
+
+  it("shows the app's CPU, memory and requests", async () => {
+    mockFetch({
+      'GET /api/platform/apps/1': () => [200, detail()],
+      'GET /api/history?window=1h': () => [
+        200,
+        {
+          start: new Date().toISOString(),
+          stepSeconds: 60,
+          host: {},
+          containers: {},
+          apps: { hello: { cpuPercent: [1, 2.5], cpuPercentMax: [2, 4], memoryBytes: [10 * 1024 * 1024, 20 * 1024 * 1024] } },
+        },
+      ],
+      'GET /api/platform/apps/1/metrics?window=1h': () => [
+        200,
+        { start: new Date().toISOString(), stepSeconds: 60, requests: [null, 30, 12], errors: [null, 1, 0], p95Ms: [null, 23.5, null] },
+      ],
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    // The latest values, and the hour's totals.
+    expect(await screen.findByText('2.5%')).toBeInTheDocument()
+    expect(screen.getByText('20 MiB of 256 MiB')).toBeInTheDocument()
+    expect(await screen.findByText('42 in the last hour, 1 5xx, p95 23.5 ms')).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: /hello requests a minute, last hour: average 21\/min, peak 30\/min/ })).toBeInTheDocument()
+  })
+
+  it('says when there are no metrics yet', async () => {
+    mockFetch({ 'GET /api/platform/apps/1': () => [200, detail()] })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    expect(await screen.findByText(/counted once a minute/)).toBeInTheDocument()
+    expect(screen.getAllByText('no data yet')).toHaveLength(2) // CPU and memory
   })
 
   it('has no app output to show when nothing is live', async () => {

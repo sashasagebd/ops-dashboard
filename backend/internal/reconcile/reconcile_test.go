@@ -143,6 +143,8 @@ func (f *fakes) Recreate(_ context.Context, app store.App, dep store.Deployment)
 	return nil
 }
 
+func (f *fakes) SyncMetrics(context.Context) (bool, error) { return false, nil }
+
 func (f *fakes) SyncRoutes(context.Context) (bool, error) {
 	if f.routesDiff {
 		f.actions = append(f.actions, "apply routes")

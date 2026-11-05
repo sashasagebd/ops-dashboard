@@ -23,4 +23,8 @@ type Container struct {
 	// container that has never stopped has no FinishedAt.
 	StartedAt  time.Time
 	FinishedAt time.Time
+
+	// Labels are the container's Docker labels: how the dashboard tells the
+	// deploy platform's app containers apart (see the monitor's app series).
+	Labels map[string]string
 }

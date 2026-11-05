@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -142,6 +143,79 @@ func (c *Caddy) Routes(ctx context.Context) ([]Route, error) {
 		out = append(out, route)
 	}
 	return out, nil
+}
+
+// metricsPath is Caddy's HTTP metrics setting. It belongs to Caddy's whole
+// HTTP app, not the server the platform owns, but per-host metrics can only
+// be turned on there (the per-server setting is deprecated): the one path
+// outside its own server the platform writes (see docs/decisions/platform.md).
+const metricsPath = "/config/apps/http/metrics"
+
+// SyncMetrics makes sure Caddy counts requests per host, which is how the
+// platform tells apps' traffic apart, changing the setting only if it's off
+// (changed reports whether it did). Caddy only gives a host its own label if
+// a route matches it, so a made-up Host header can't add new series.
+func (c *Caddy) SyncMetrics(ctx context.Context) (changed bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.AdminURL+metricsPath, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("reading metrics config: %w", err)
+	}
+	var current *struct {
+		PerHost bool `json:"per_host"`
+	}
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		err = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&current)
+	case resp.StatusCode >= 500:
+		err = fmt.Errorf("reading metrics config: Caddy answered %s", resp.Status)
+	}
+	resp.Body.Close()
+	if err != nil {
+		return false, err
+	}
+	if current != nil && current.PerHost {
+		return false, nil
+	}
+	// POST sets the object whether or not it exists yet.
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, c.AdminURL+metricsPath,
+		strings.NewReader(`{"per_host":true}`))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = c.HTTPClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("turning on per-host metrics: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return false, fmt.Errorf("turning on per-host metrics: Caddy answered %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	return true, nil
+}
+
+// Metrics returns Caddy's metrics, in Prometheus's text format, from its
+// admin API.
+func (c *Caddy) Metrics(ctx context.Context) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.AdminURL+"/metrics", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reading metrics: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("reading metrics: Caddy answered %s", resp.Status)
+	}
+	// A few hosts' histograms are tens of KiB; the cap is for safety only.
+	return io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 }
 
 // InFlight returns how many requests Caddy is proxying to each upstream right

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/metrics"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
@@ -194,7 +195,7 @@ func newTestAPI() (http.Handler, *fakeStore, *fakeDeployer) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Hostname: "hello.apps.test", Port: 8080}}
 	dep := &fakeDeployer{}
-	return New(st, dep, &fakeEngine{}, nil, "apps.test"), st, dep
+	return New(st, dep, &fakeEngine{}, nil, nil, "apps.test"), st, dep
 }
 
 // do sends a request; a non-empty body is sent as JSON.
@@ -373,7 +374,7 @@ func TestInternalErrorsAreGeneric(t *testing.T) {
 
 func TestListAppsEmptyIsArray(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
-	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, nil, "apps.test"), "GET", "/api/platform/apps", "")
+	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, nil, nil, "apps.test"), "GET", "/api/platform/apps", "")
 	if strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Errorf("body = %s, want []", rec.Body)
 	}
@@ -511,7 +512,7 @@ func TestDatabase(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test", Port: 8080}}
 	eng := &fakeEngine{}
-	h := New(st, &fakeDeployer{}, eng, nil, "apps.test")
+	h := New(st, &fakeDeployer{}, eng, nil, nil, "apps.test")
 
 	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"database":null`) {
 		t.Errorf("no database yet: body %s, want database null", rec.Body)
@@ -580,7 +581,7 @@ func TestBackups(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello"}}
 	bk := &fakeBackups{}
-	h := New(st, &fakeDeployer{}, &fakeEngine{}, bk, "apps.test")
+	h := New(st, &fakeDeployer{}, &fakeEngine{}, bk, nil, "apps.test")
 
 	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"backups":[]`) {
 		t.Errorf("no backups yet: %s, want backups []", rec.Body)
@@ -615,9 +616,60 @@ func TestBackups(t *testing.T) {
 	}
 
 	// Backups not set up on this platform: a clear 409.
-	off := New(st, &fakeDeployer{}, &fakeEngine{}, nil, "apps.test")
+	off := New(st, &fakeDeployer{}, &fakeEngine{}, nil, nil, "apps.test")
 	if rec := do(t, off, "POST", "/api/platform/apps/1/backups", ""); rec.Code != http.StatusConflict ||
 		!strings.Contains(rec.Body.String(), "BACKUP_DIR") {
 		t.Errorf("backups off: %d %s, want 409 pointing at BACKUP_DIR", rec.Code, rec.Body)
+	}
+}
+
+type fakeRequests struct{}
+
+func (fakeRequests) Window(host string, window time.Duration) metrics.Series {
+	one, five, p := 1.0, 5.0, 0.0234567
+	s := metrics.Series{Start: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC), Step: time.Minute}
+	if host == "hello.apps.test" {
+		s.Requests = []*float64{nil, &five}
+		s.Errors = []*float64{nil, &one}
+		s.P95 = []*float64{nil, &p}
+	}
+	return s
+}
+
+func (fakeRequests) Total(host string, _ time.Duration) (float64, bool) {
+	if host == "hello.apps.test" {
+		return 5.4, true
+	}
+	return 0, false
+}
+
+func TestRequestMetrics(t *testing.T) {
+	st := &fakeStore{env: map[string]string{}}
+	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test"}, {ID: 2, Name: "new", Hostname: "new.apps.test"}}
+	h := New(st, &fakeDeployer{}, &fakeEngine{}, nil, fakeRequests{}, "apps.test")
+
+	rec := do(t, h, "GET", "/api/platform/apps/1/metrics", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	// Seconds become milliseconds, rounded to one decimal; gaps are null.
+	want := `{"start":"2026-11-04T12:00:00Z","stepSeconds":60,"requests":[null,5],"errors":[null,1],"p95Ms":[null,23.5]}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Errorf("body = %s\nwant   %s", got, want)
+	}
+	if rec := do(t, h, "GET", "/api/platform/apps/1/metrics?window=24h", ""); rec.Code != http.StatusOK {
+		t.Errorf("24h: %d", rec.Code)
+	}
+	if rec := do(t, h, "GET", "/api/platform/apps/1/metrics?window=7d", ""); rec.Code != http.StatusBadRequest {
+		t.Errorf("7d: %d, want 400", rec.Code)
+	}
+	if rec := do(t, h, "GET", "/api/platform/apps/9/metrics", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("missing app: %d, want 404", rec.Code)
+	}
+
+	// Last-hour requests on the apps list (rounded), null without readings.
+	list := decode[[]appResponse](t, do(t, h, "GET", "/api/platform/apps", ""))
+	if list[0].RequestsLastHour == nil || *list[0].RequestsLastHour != 5 || list[1].RequestsLastHour != nil {
+		t.Errorf("requestsLastHour = %v, %v; want 5, null", list[0].RequestsLastHour, list[1].RequestsLastHour)
 	}
 }

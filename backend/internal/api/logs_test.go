@@ -119,7 +119,7 @@ func newLogsTestAPI(t *testing.T) (http.Handler, *fakeStore, *fakeEngine) {
 		{ID: "c6", Labels: map[string]string{engine.LabelDeployment: "6"}},
 		{ID: "c7", Labels: map[string]string{engine.LabelDeployment: "7"}},
 	}}
-	return New(st, &fakeDeployer{}, eng, nil, "apps.test"), st, eng
+	return New(st, &fakeDeployer{}, eng, nil, nil, "apps.test"), st, eng
 }
 
 // stream makes a GET with optional Last-Event-ID and returns the response.

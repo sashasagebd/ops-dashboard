@@ -80,6 +80,7 @@ type Router interface {
 	Probe(ctx context.Context, host, path string) (int, error)
 	InFlight(ctx context.Context) (map[string]int, error)
 	Routes(ctx context.Context) ([]router.Route, error)
+	SyncMetrics(ctx context.Context) (changed bool, err error)
 }
 
 // Config holds the deployer's settings.
@@ -657,6 +658,15 @@ func (d *Deployer) SyncRoutes(ctx context.Context) (changed bool, err error) {
 		return false, nil
 	}
 	return true, d.router.Apply(ctx, want)
+}
+
+// SyncMetrics makes sure Caddy counts requests per host (for the dashboard's
+// request metrics), for the reconciler. Under the same lock as route
+// updates: both change Caddy's config.
+func (d *Deployer) SyncMetrics(ctx context.Context) (changed bool, err error) {
+	d.applyMu.Lock()
+	defer d.applyMu.Unlock()
+	return d.router.SyncMetrics(ctx)
 }
 
 // routeTable is what Caddy should route: every app's hostname to its live

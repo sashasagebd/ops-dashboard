@@ -375,6 +375,8 @@ func (f *fakes) Routes(context.Context) ([]router.Route, error) {
 	return slices.Clone(f.caddyRoutes), nil
 }
 
+func (f *fakes) SyncMetrics(context.Context) (bool, error) { return false, nil }
+
 func (f *fakes) Probe(context.Context, string, string) (int, error) {
 	f.mu.Lock()
 	n := f.probes

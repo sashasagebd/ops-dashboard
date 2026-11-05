@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
 	"regexp"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/deploy"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/metrics"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
@@ -57,6 +59,13 @@ type Backups interface {
 	Start(ctx context.Context, appID int64) (store.Backup, error)
 }
 
+// Requests is apps' recent request numbers, by hostname; in production it's
+// a *metrics.Collector, or nil in tests that don't need it.
+type Requests interface {
+	Window(host string, window time.Duration) metrics.Series
+	Total(host string, window time.Duration) (float64, bool)
+}
+
 // errBackupsOff answers "Back up now" on a platform without backups set up.
 var errBackupsOff = errors.New("backups aren't set up on this server (see BACKUP_DIR in the README)")
 
@@ -75,8 +84,8 @@ type Engine interface {
 
 // New returns the platform API's handler. Apps get the hostname
 // <name>.<appsDomain>.
-func New(st Store, dep Deployer, eng Engine, bk Backups, appsDomain string) http.Handler {
-	a := &api{store: st, deployer: dep, engine: eng, backups: bk, appsDomain: appsDomain}
+func New(st Store, dep Deployer, eng Engine, bk Backups, req Requests, appsDomain string) http.Handler {
+	a := &api{store: st, deployer: dep, engine: eng, backups: bk, requests: req, appsDomain: appsDomain}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/platform/apps", a.listApps)
 	mux.HandleFunc("POST /api/platform/apps", a.createApp)
@@ -93,6 +102,7 @@ func New(st Store, dep Deployer, eng Engine, bk Backups, appsDomain string) http
 	mux.HandleFunc("GET /api/platform/events", a.listEvents)
 	mux.HandleFunc("POST /api/platform/apps/{id}/database", a.createDatabase)
 	mux.HandleFunc("POST /api/platform/apps/{id}/backups", a.createBackup)
+	mux.HandleFunc("GET /api/platform/apps/{id}/metrics", a.appMetrics)
 	return mux
 }
 
@@ -100,7 +110,8 @@ type api struct {
 	store      Store
 	deployer   Deployer
 	engine     Engine
-	backups    Backups // nil if backups aren't set up
+	backups    Backups  // nil if backups aren't set up
+	requests   Requests // nil: no request numbers
 	appsDomain string
 }
 
@@ -122,6 +133,19 @@ type appResponse struct {
 	NextCommitSHA      *string             `json:"nextCommitSha"` // a pushed commit waiting for the deploy in progress
 	CreatedAt          time.Time           `json:"createdAt"`
 	CurrentDeployment  *deploymentResponse `json:"currentDeployment"` // null if nothing is live
+	// Requests to its hostname in the last hour, from Caddy; null if there
+	// are no readings (the platform just started, or Caddy can't be read).
+	RequestsLastHour *int64 `json:"requestsLastHour"`
+}
+
+// metricsResponse is a window of an app's request numbers, one value per
+// step from start, oldest first; null where there was no reading.
+type metricsResponse struct {
+	Start       time.Time  `json:"start"`
+	StepSeconds int        `json:"stepSeconds"`
+	Requests    []*float64 `json:"requests"`
+	Errors      []*float64 `json:"errors"` // 5xx responses
+	P95Ms       []*float64 `json:"p95Ms"`  // 95th percentile response time; null also when there were no requests
 }
 
 type appDetailResponse struct {
@@ -197,6 +221,18 @@ type deploymentResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+// appResponse is newAppResponse with the app's last-hour requests.
+func (a *api) appResponse(app store.App, current *store.Deployment) appResponse {
+	r := newAppResponse(app, current)
+	if a.requests != nil {
+		if n, ok := a.requests.Total(app.Hostname, time.Hour); ok {
+			v := int64(math.Round(n))
+			r.RequestsLastHour = &v
+		}
+	}
+	return r
 }
 
 func newAppResponse(a store.App, current *store.Deployment) appResponse {
@@ -283,7 +319,7 @@ func (a *api) listApps(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, err)
 			return
 		}
-		out = append(out, newAppResponse(app, current))
+		out = append(out, a.appResponse(app, current))
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -413,7 +449,7 @@ func (a *api) getApp(w http.ResponseWriter, r *http.Request) {
 		backups = append(backups, newBackupResponse(b))
 	}
 	writeJSON(w, http.StatusOK, appDetailResponse{
-		appResponse: newAppResponse(app, current),
+		appResponse: a.appResponse(app, current),
 		EnvKeys:     keys,
 		Deployments: list,
 		Events:      newEventResponses(events),
@@ -449,7 +485,7 @@ func (a *api) updateApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, newAppResponse(app, current))
+	writeJSON(w, http.StatusOK, a.appResponse(app, current))
 }
 
 type setEnvVarRequest struct {
@@ -681,6 +717,49 @@ func (a *api) database(ctx context.Context, app store.App) (*databaseResponse, e
 		}
 	}
 	return r, nil
+}
+
+// metricsWindows are the windows GET .../metrics serves, as the dashboard's
+// history does.
+var metricsWindows = map[string]time.Duration{"1h": time.Hour, "24h": 24 * time.Hour}
+
+// appMetrics is the app's request numbers over the last hour or day
+// (?window=1h|24h, default 1h), one value a minute.
+func (a *api) appMetrics(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	param := r.URL.Query().Get("window")
+	if param == "" {
+		param = "1h"
+	}
+	window, ok := metricsWindows[param]
+	if !ok {
+		badRequest(w, "window: 1h or 24h")
+		return
+	}
+	app, err := a.store.App(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	if a.requests == nil {
+		writeJSON(w, http.StatusNotFound, errorResponse{"not found"})
+		return
+	}
+	s := a.requests.Window(app.Hostname, window)
+	p95 := make([]*float64, len(s.P95))
+	for i, v := range s.P95 {
+		if v != nil {
+			ms := math.Round(*v*1000*10) / 10 // ms, one decimal
+			p95[i] = &ms
+		}
+	}
+	writeJSON(w, http.StatusOK, metricsResponse{
+		Start: s.Start, StepSeconds: int(s.Step / time.Second),
+		Requests: s.Requests, Errors: s.Errors, P95Ms: p95,
+	})
 }
 
 // current returns an app's live deployment, or nil if it has none.

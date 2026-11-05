@@ -45,11 +45,12 @@ func NewClient(host string) (*Client, error) {
 // No API version is pinned in the path; these fields are the same in every
 // version.
 type apiContainer struct {
-	ID     string   `json:"Id"`
-	Names  []string `json:"Names"`
-	Image  string   `json:"Image"`
-	State  string   `json:"State"`
-	Status string   `json:"Status"`
+	ID     string            `json:"Id"`
+	Names  []string          `json:"Names"`
+	Image  string            `json:"Image"`
+	State  string            `json:"State"`
+	Status string            `json:"Status"`
+	Labels map[string]string `json:"Labels"`
 }
 
 // apiInspect is the subset of `GET /containers/{id}/json` we use. Docker
@@ -105,6 +106,7 @@ func (c *Client) ListContainers(ctx context.Context) ([]Container, error) {
 			Health:     health,
 			StartedAt:  inspect.State.StartedAt,
 			FinishedAt: inspect.State.FinishedAt,
+			Labels:     rc.Labels,
 		})
 	}
 	return containers, nil

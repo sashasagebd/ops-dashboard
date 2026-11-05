@@ -28,6 +28,7 @@ import (
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/jobs"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/metrics"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/reconcile"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/router"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
@@ -160,6 +161,10 @@ func run(addr string) error {
 	} else {
 		slog.Info("backups are off: BACKUP_VOLUME isn't set")
 	}
+	// Apps' request numbers, read from Caddy every minute, 24h kept in
+	// memory.
+	requests := metrics.New(caddy, time.Minute, 24*time.Hour)
+
 	handlers := jobs.Kinds{"deploy": deployer}
 	if backuper != nil {
 		handlers["backup"] = backuper
@@ -212,6 +217,7 @@ func run(addr string) error {
 		if backuper != nil {
 			wg.Go(func() { backuper.RunScheduler(ctx) })
 		}
+		wg.Go(func() { requests.Run(ctx) })
 		runner.Run(ctx) // returns at once if ctx is already done
 		wg.Wait()
 	}()
@@ -220,7 +226,7 @@ func run(addr string) error {
 	// platform started up fully.
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: newHandler(api.New(st, deployer, dockerClient, backups, appsDomain)),
+		Handler: newHandler(api.New(st, deployer, dockerClient, backups, requests, appsDomain)),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,

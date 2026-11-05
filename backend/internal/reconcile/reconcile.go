@@ -54,6 +54,7 @@ type Deployer interface {
 	Recreate(ctx context.Context, app store.App, dep store.Deployment) error
 	RunDatabase(ctx context.Context, app store.App, db store.Database) error
 	SyncRoutes(ctx context.Context) (changed bool, err error)
+	SyncMetrics(ctx context.Context) (changed bool, err error)
 }
 
 // Config holds the reconciler's settings.
@@ -154,6 +155,14 @@ func (r *Reconciler) Pass(ctx context.Context) error {
 		slog.Info("re-applied Caddy's routes: they didn't match the database")
 		r.event(ctx, store.NewEvent{Kind: store.EventRoutesReapplied,
 			Message: "Caddy's routes didn't match the database (a route was missing or changed); re-applied them"})
+	}
+
+	// Per-host request metrics on, for the dashboard. Set once; this only
+	// acts if Caddy lost its config. Not an event: nothing was broken.
+	if changed, err := r.deployer.SyncMetrics(ctx); err != nil {
+		errs = append(errs, err)
+	} else if changed {
+		slog.Info("turned on Caddy's per-host request metrics")
 	}
 
 	apps, err := r.store.Apps(ctx)

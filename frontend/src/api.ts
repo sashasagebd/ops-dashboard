@@ -66,6 +66,9 @@ export type HistoryResponse = {
   stepSeconds: number
   host: HostHistory
   containers: Record<string, ContainerHistory> // by container name
+  // The deploy platform's apps, by app name: each sums its containers, which
+  // change name with every deploy.
+  apps: Record<string, ContainerHistory>
 }
 
 // Platform types match the response types in backend/internal/api/api.go,
@@ -107,6 +110,7 @@ export type PlatformApp = {
   nextCommitSha: string | null // a pushed commit waiting for the deploy in progress
   createdAt: string
   currentDeployment: Deployment | null // the live one; null if nothing is live
+  requestsLastHour: number | null // from Caddy; null without readings yet
 }
 
 // AppDetail matches appDetailResponse.
@@ -174,6 +178,16 @@ export type NewApp = {
   cpuLimitMillicores?: number
 }
 
+// AppMetrics matches metricsResponse: an app's request numbers, one value
+// per step from start, oldest first, null where there was no reading.
+export type AppMetrics = {
+  start: string
+  stepSeconds: number
+  requests: Series
+  errors: Series // 5xx responses
+  p95Ms: Series // 95th percentile response time; null also with no requests
+}
+
 // LogLine matches logLineResponse: one line of a deploy's log (the
 // platform's stage messages, or Docker's build output) or of an app's output.
 // It's the data of each message in a log stream (Server-Sent Events).
@@ -209,6 +223,11 @@ export function fetchApps(signal?: AbortSignal): Promise<PlatformApp[]> {
 
 export function fetchApp(id: number, signal?: AbortSignal): Promise<AppDetail> {
   return getJSON<AppDetail>(`/api/platform/apps/${id}`, signal)
+}
+
+// fetchAppMetrics is an app's request numbers over the last hour or day.
+export function fetchAppMetrics(appId: number, window: HistoryWindow, signal?: AbortSignal): Promise<AppMetrics> {
+  return getJSON<AppMetrics>(`/api/platform/apps/${appId}/metrics?window=${window}`, signal)
 }
 
 // fetchEvents is the reconciler's most recent events, for every app.

@@ -8,29 +8,36 @@ import {
   deployLatest,
   deploymentLogURL,
   fetchApp,
+  fetchAppMetrics,
   fetchApps,
   fetchEvents,
+  fetchHistory,
   rollback,
   setAutoDeploy,
   setEnvVar,
   startBackup,
   type AppDetail,
   type Backup,
+  type Series,
   type Deployment,
   type DeploymentStatus,
   type EventKind,
   type PlatformApp,
   type PlatformEvent,
 } from './api'
-import { formatBytes, formatDuration, formatFileSize } from './format'
+import { formatBytes, formatCPU, formatDuration, formatFileSize } from './format'
 import { LogViewer } from './LogViewer'
 import { appHref } from './route'
+import { seriesMax } from './series'
+import { Sparkline } from './Sparkline'
 import { usePolling, type PollState } from './usePolling'
 
 const APPS_REFRESH_MS = 10_000
 // Often enough to follow a deploy through its stages (building, starting,
 // healthy), which take seconds to minutes each.
 const APP_REFRESH_MS = 3_000
+// Metrics change once a minute (a step), so there's no point asking often.
+const METRICS_REFRESH_MS = 30_000
 
 const STATUS_BADGE: Record<DeploymentStatus, string> = {
   queued: 'warn',
@@ -103,6 +110,7 @@ function AppsTable({ apps }: { apps: PlatformApp[] }) {
             <th scope="col">Name</th>
             <th scope="col">Address</th>
             <th scope="col">Live</th>
+            <th scope="col">Requests (1h)</th>
           </tr>
         </thead>
         <tbody>
@@ -121,6 +129,7 @@ function AppsTable({ apps }: { apps: PlatformApp[] }) {
                   <span className="mono">{shortSHA(a.currentDeployment.commitSha)}</span>
                 )}
               </td>
+              <td>{a.requestsLastHour === null ? <span className="muted">—</span> : a.requestsLastHour}</td>
             </tr>
           ))}
         </tbody>
@@ -203,6 +212,8 @@ export function AppPage({ id }: { id: number }) {
           <>
             <h2>{app.name}</h2>
             <AppSummary app={app} />
+            <h3>Metrics</h3>
+            <Metrics app={app} />
             <h3>Deploy</h3>
             <DeployForm app={app} onDeployed={onDeployed} />
             <AutoDeploy app={app} onDone={refresh} />
@@ -348,6 +359,90 @@ function AutoDeploy({ app, onDone }: { app: AppDetail; onDone: () => void }) {
 // null if its latest deploy isn't a rollback.
 function rolledBackTo(app: AppDetail): number | null {
   return app.deployments.at(0)?.rollbackOf ?? null
+}
+
+// Metrics is the app's last hour: CPU and memory from the dashboard's own
+// history (summed over its containers, which change name each deploy), and
+// requests from the platform (counted by Caddy).
+function Metrics({ app }: { app: AppDetail }) {
+  const history = usePolling(useCallback((signal: AbortSignal) => fetchHistory('1h', signal), []), METRICS_REFRESH_MS)
+  const requests = usePolling(
+    useCallback((signal: AbortSignal) => fetchAppMetrics(app.id, '1h', signal), [app.id]),
+    METRICS_REFRESH_MS,
+  )
+  const usage = history.status === 'ok' ? history.data.apps[app.name] : undefined
+  const req = requests.status === 'ok' ? requests.data : undefined
+  return (
+    <dl className="facts">
+      <dt>CPU</dt>
+      <dd className="cell-trend">
+        {usage ? (
+          <>
+            <Sparkline
+              values={usage.cpuPercent}
+              peaks={usage.cpuPercentMax}
+              max={Math.max(1, seriesMax(usage.cpuPercentMax))}
+              label={`${app.name} CPU, last hour`}
+              format={formatCPU}
+            />
+            <span>{formatCPU(last(usage.cpuPercent))}</span>
+          </>
+        ) : (
+          <span className="muted">no data yet</span>
+        )}
+      </dd>
+      <dt>Memory</dt>
+      <dd className="cell-trend">
+        {usage ? (
+          <>
+            <Sparkline
+              values={usage.memoryBytes}
+              max={app.memoryLimitBytes}
+              label={`${app.name} memory, last hour`}
+              format={formatBytes}
+            />
+            <span>
+              {formatBytes(last(usage.memoryBytes))} of {formatBytes(app.memoryLimitBytes)}
+            </span>
+          </>
+        ) : (
+          <span className="muted">no data yet</span>
+        )}
+      </dd>
+      <dt>Requests</dt>
+      <dd className="cell-trend">
+        {req && req.requests.some((v) => v !== null) ? (
+          <>
+            <Sparkline
+              values={req.requests}
+              max={Math.max(1, seriesMax(req.requests))}
+              label={`${app.name} requests a minute, last hour`}
+              format={(v) => `${Math.round(v)}/min`}
+            />
+            <span>
+              {sum(req.requests)} in the last hour, {sum(req.errors)} 5xx
+              {last(req.p95Ms) !== null && `, p95 ${last(req.p95Ms)} ms`}
+            </span>
+          </>
+        ) : (
+          <span className="muted">no data yet (counted once a minute)</span>
+        )}
+      </dd>
+    </dl>
+  )
+}
+
+// last is a series' newest value that isn't a gap, or null.
+function last(values: Series): number | null {
+  for (let i = values.length - 1; i >= 0; i--) {
+    const v = values[i]
+    if (v !== null) return v
+  }
+  return null
+}
+
+function sum(values: Series): number {
+  return values.reduce<number>((total, v) => total + (v ?? 0), 0)
 }
 
 // Database is the app's own Postgres: a button to add one, or what it is and

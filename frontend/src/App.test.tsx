@@ -48,6 +48,7 @@ function history(overrides: Partial<HistoryResponse> = {}): HistoryResponse {
     stepSeconds: 60,
     host: { cpuPercent: [], cpuPercentMax: [], memoryBytes: [], diskUsedBytes: [] },
     containers: {},
+    apps: {},
     ...overrides,
   }
 }

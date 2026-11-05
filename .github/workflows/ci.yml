@@ -582,6 +582,32 @@ jobs:
           docker exec -i ops-db-hello pg_restore --clean --if-exists -U app -d app < "$BACKUP_DIR/hello/$FILE" || on_failure
           test "$(count_visit)" = $((N + 1)) || on_failure
 
+          # Metrics. CPU and memory: the dashboard's history has a series
+          # for hello the app (its containers summed), apart from its
+          # containers.
+          for i in $(seq 1 30); do
+            curl -fsS 'http://127.0.0.1:8080/api/history?window=1h' | jq -e '.apps.hello.memoryBytes | map(select(. != null)) | length > 0' > /dev/null && break
+            [ "$i" = 30 ] && { curl -sS 'http://127.0.0.1:8080/api/history?window=1h' | jq '.apps'; on_failure; }
+            sleep 2
+          done
+          # Requests: the platform has turned on Caddy's per-host metrics,
+          # reads them once a minute, and counts hello's requests apart from
+          # everyone else's. Known requests are sent; the hour's count rises
+          # by at least that many within two readings.
+          docker run --rm --network dashboard_caddy-admin curlimages/curl:8.11.1 -fsS \
+            http://10.203.0.2:2019/config/apps/http/metrics | jq -e '.per_host == true' || on_failure
+          requests() { dash GET "/api/platform/apps/$APP/metrics?window=1h" | jq '[.requests[] | select(. != null)] | add // 0'; }
+          BEFORE=$(requests)
+          for i in $(seq 1 40); do
+            curl -fsS -o /dev/null -H 'Host: hello.apps.test' http://127.0.0.1/ || on_failure
+          done
+          for i in $(seq 1 75); do
+            [ "$(requests)" -ge $((BEFORE + 40)) ] && break
+            [ "$i" = 75 ] && { echo "requests: $BEFORE before, $(requests) after"; on_failure; }
+            sleep 2
+          done
+          dash GET /api/platform/apps | jq -e '.[] | select(.name == "hello") | .requestsLastHour >= 40' || on_failure
+
           # A source directory that doesn't exist fails with a clear reason
           # (found mid-stream, so this also checks the reason survives
           # Docker's client).

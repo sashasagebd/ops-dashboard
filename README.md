@@ -217,6 +217,15 @@ docker exec -i ops-db-hello pg_restore --clean --if-exists -U app -d app \
 It runs inside the database's container (`docker exec`), where Postgres
 trusts its local user, so the password, which is never shown, isn't needed.
 
+### Metrics
+
+Each app's page shows its last hour: CPU and memory (all of the app's
+containers together, so the line carries on across deploys), and requests
+per minute, 5xx responses and the 95th-percentile response time, counted by
+Caddy, which sees every request. The Apps list shows each app's requests in
+the last hour. Request numbers are read once a minute and kept for 24 hours
+in memory, so they start afresh when the platform restarts.
+
 ### Crash recovery
 
 Every 10 seconds the platform compares what should be running (in its
