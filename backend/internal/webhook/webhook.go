@@ -190,8 +190,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "auto-deploy is off"})
 			continue
 		}
+		if app.Stopped {
+			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "the app is stopped"})
+			continue
+		}
 		dep, started, err := h.deployer.Push(ctx, app.ID, push.After)
 		switch {
+		case errors.Is(err, store.ErrAppStopped): // stopped since the list was read
+			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "the app is stopped"})
 		case err != nil:
 			slog.Error("webhook: deploying a push", "app", app.Name, "commit", push.After, "err", err)
 			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "internal error; see the platform's logs"})

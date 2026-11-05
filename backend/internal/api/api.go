@@ -77,6 +77,9 @@ type Deployer interface {
 	StartLatest(ctx context.Context, appID int64) (store.Deployment, error)
 	Rollback(ctx context.Context, appID, deploymentID int64) (store.Deployment, error)
 	ApplyRoutes(ctx context.Context) error
+	StopApp(ctx context.Context, appID int64) (store.App, error)
+	StartApp(ctx context.Context, appID int64) (store.App, error)
+	DeleteApp(ctx context.Context, appID int64) (store.DeletedApp, error)
 }
 
 // Engine reads app containers' output; in production it's an *engine.Client.
@@ -100,6 +103,9 @@ func New(st Store, dep Deployer, eng Engine, bk Backups, req Requests, appsDomai
 	mux.HandleFunc("POST /api/platform/apps", a.createApp)
 	mux.HandleFunc("GET /api/platform/apps/{id}", a.getApp)
 	mux.HandleFunc("PATCH /api/platform/apps/{id}", a.updateApp)
+	mux.HandleFunc("DELETE /api/platform/apps/{id}", a.deleteApp)
+	mux.HandleFunc("POST /api/platform/apps/{id}/stop", a.stopApp)
+	mux.HandleFunc("POST /api/platform/apps/{id}/start", a.startApp)
 	mux.HandleFunc("PUT /api/platform/apps/{id}/env/{key}", a.setEnvVar)
 	mux.HandleFunc("DELETE /api/platform/apps/{id}/env/{key}", a.deleteEnvVar)
 	mux.HandleFunc("GET /api/platform/apps/{id}/deployments", a.listDeployments)
@@ -141,6 +147,7 @@ type appResponse struct {
 	CPULimitMillicores int                 `json:"cpuLimitMillicores"`
 	SourceDir          string              `json:"sourceDir"`     // "" is the repo's root
 	AutoDeploy         bool                `json:"autoDeploy"`    // pushes to Branch deploy it
+	Stopped            bool                `json:"stopped"`       // stopped on purpose: not running, not routed, no deploys
 	NextCommitSHA      *string             `json:"nextCommitSha"` // a pushed commit waiting for the deploy in progress
 	CreatedAt          time.Time           `json:"createdAt"`
 	CurrentDeployment  *deploymentResponse `json:"currentDeployment"` // null if nothing is live
@@ -262,7 +269,7 @@ func newAppResponse(a store.App, current *store.Deployment) appResponse {
 	r := appResponse{
 		ID: a.ID, Name: a.Name, RepoURL: a.RepoURL, Branch: a.Branch, Hostname: a.Hostname,
 		Port: a.Port, HealthCheckPath: a.HealthCheckPath, MemoryLimitBytes: a.MemoryLimitBytes,
-		CPULimitMillicores: a.CPULimitMillicores, SourceDir: a.SourceDir, AutoDeploy: a.AutoDeploy,
+		CPULimitMillicores: a.CPULimitMillicores, SourceDir: a.SourceDir, AutoDeploy: a.AutoDeploy, Stopped: a.Stopped,
 		CreatedAt: a.CreatedAt,
 	}
 	if a.NextCommitSHA != "" {
@@ -551,6 +558,65 @@ func (a *api) updateApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a.appResponse(app, current))
+}
+
+// stopApp stops the app: its container is removed and its routes go; its
+// database keeps running. 409 while a deploy runs.
+func (a *api) stopApp(w http.ResponseWriter, r *http.Request) {
+	a.lifecycle(w, r, a.deployer.StopApp)
+}
+
+// startApp runs the app's live version again (no build) and restores its
+// routes.
+func (a *api) startApp(w http.ResponseWriter, r *http.Request) {
+	a.lifecycle(w, r, a.deployer.StartApp)
+}
+
+func (a *api) lifecycle(w http.ResponseWriter, r *http.Request, change func(context.Context, int64) (store.App, error)) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	app, err := change(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	current, err := a.current(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.appResponse(app, current))
+}
+
+// deletedResponse is what deleting an app left behind for the owner to
+// remove by hand, if they want: the database's volume (the platform can't
+// remove volumes), null if it had no database. Backups stay too.
+type deletedResponse struct {
+	Name           string  `json:"name"`
+	DatabaseVolume *string `json:"databaseVolume"`
+}
+
+// deleteApp deletes the app and everything the platform holds for it, apart
+// from its database's data and its backups. 409 while a deploy or a backup
+// runs.
+func (a *api) deleteApp(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	deleted, err := a.deployer.DeleteApp(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	res := deletedResponse{Name: deleted.App.Name}
+	if deleted.HadDatabase {
+		v := deploy.DatabaseName(deleted.App.Name)
+		res.DatabaseVolume = &v
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 type setEnvVarRequest struct {
@@ -892,7 +958,7 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeJSON(w, http.StatusNotFound, errorResponse{"not found"})
 	case errors.Is(err, store.ErrConflict), errors.Is(err, store.ErrDeployInProgress),
 		errors.Is(err, store.ErrNotRollbackable), errors.Is(err, store.ErrNoDatabase),
-		errors.Is(err, store.ErrBackupInProgress):
+		errors.Is(err, store.ErrBackupInProgress), errors.Is(err, store.ErrAppStopped):
 		writeJSON(w, http.StatusConflict, errorResponse{err.Error()})
 	case errors.Is(err, store.ErrInvalid):
 		writeJSON(w, http.StatusBadRequest, errorResponse{err.Error()})

@@ -1406,3 +1406,57 @@ repo (more files and a login, for routes that can't do harm anyway); a
   Cloudflare, which nothing else joins). CI can't run it (no token), so it
   sends requests to Caddy's public server from a container on the tunnel
   network, and checks what that network can't reach.
+
+## Stopping and deleting apps (2026-11-05)
+
+### Stop keeps everything but the container; the database keeps running
+
+**What:** stopping an app marks it stopped, removes its routes and its
+container, and drops a waiting push. Its live deployment stays live (it's
+what Start runs again, from its image, no build), and so do its database,
+settings and history. While stopped, no deploy or rollback can start;
+stopping is refused mid-deploy. The reconciler treats a stopped app as
+having nothing live: a leftover container is removed, nothing is
+restarted.
+**Why:** the point is to free an app's memory and take it offline without
+losing anything. Keeping the database running keeps backups going and
+makes Start quick; databases are small next to the game servers. The
+"stopped" flag is desired state, like everything else the reconciler
+acts on, so a stop survives restarts and a reboot.
+**Alternatives:** `docker stop` the container and leave it (the reconciler
+would restart it, and a stopped container still holds its name); stopping
+the database too (no backups meanwhile, and a slower start); a deployment
+status for "stopped" (it would break the one-live-deployment rule, and
+Start would have nothing to go back to).
+
+### Deleting an app leaves its data: the platform can't remove volumes
+
+**What:** deleting an app removes its row (deployments, logs, jobs, env
+vars, events and its database's and backups' records cascade), then its
+routes, every container (its database's too), its images and its
+database's network. The database's volume and its backup files stay; the
+dashboard shows the two commands to remove them. Refused mid-deploy and
+mid-backup.
+**Why:** the platform has no Docker `VOLUMES` permission, on purpose: with
+it, a bug or a slip could destroy any volume on the host, the game
+servers' included. A deleted app's data costs some disk until removed by
+hand, which is the safer failure. Backups stay as the way back from a
+mistaken delete. The dashboard asks for the app's name to be typed.
+**Alternatives:** enabling the proxy's `VOLUMES` group (removes the data
+in one click, and lets the platform remove any volume); a soft delete
+(the app's name stays taken, and hidden rows are clutter for a home
+server).
+**Known gap:** registering a new app with a deleted one's name finds the
+old volume, whose Postgres keeps the old password, so its database won't
+accept the new one. The deletion notice says to remove the volume first.
+
+### No deploys while stopped, enforced under the app's row lock
+
+**What:** creating a deployment (manual, pushed, waiting, or a rollback)
+locks the app's row and inserts only if the app isn't stopped
+(`ErrAppStopped`); stopping and deleting lock the same row, then check for
+a deploy in progress.
+**Why:** whichever takes the lock first wins and the other sees what it
+did, so a deploy can't start just as the app stops (and leave a container
+running for a stopped app), the same way pushes and deploys already take
+turns. Checking in Go first would leave that window open.

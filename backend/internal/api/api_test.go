@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -183,6 +184,31 @@ type fakeDeployer struct {
 	rolledBack []int64
 
 	routesApplied int
+	lifecycle     []string // stop, start and delete calls, in order
+}
+
+func (f *fakeDeployer) StopApp(_ context.Context, appID int64) (store.App, error) {
+	if f.err != nil {
+		return store.App{}, f.err
+	}
+	f.lifecycle = append(f.lifecycle, fmt.Sprintf("stop %d", appID))
+	return store.App{ID: appID, Name: "hello", Hostname: "hello.apps.test", Stopped: true}, nil
+}
+
+func (f *fakeDeployer) StartApp(_ context.Context, appID int64) (store.App, error) {
+	if f.err != nil {
+		return store.App{}, f.err
+	}
+	f.lifecycle = append(f.lifecycle, fmt.Sprintf("start %d", appID))
+	return store.App{ID: appID, Name: "hello", Hostname: "hello.apps.test"}, nil
+}
+
+func (f *fakeDeployer) DeleteApp(_ context.Context, appID int64) (store.DeletedApp, error) {
+	if f.err != nil {
+		return store.DeletedApp{}, f.err
+	}
+	f.lifecycle = append(f.lifecycle, fmt.Sprintf("delete %d", appID))
+	return store.DeletedApp{App: store.App{ID: appID, Name: "hello"}, HadDatabase: appID == 1}, nil
 }
 
 func (f *fakeDeployer) ApplyRoutes(context.Context) error {
@@ -427,6 +453,47 @@ func TestAutoDeploySwitch(t *testing.T) {
 	}
 	if rec := do(t, h, "PATCH", "/api/platform/apps/9", `{"autoDeploy":true}`); rec.Code != http.StatusNotFound {
 		t.Errorf("missing app: status %d, want 404", rec.Code)
+	}
+}
+
+func TestStopStartAndDelete(t *testing.T) {
+	h, _, dep := newTestAPI()
+
+	rec := do(t, h, "POST", "/api/platform/apps/1/stop", "")
+	if rec.Code != http.StatusOK || !decode[appResponse](t, rec).Stopped {
+		t.Errorf("stop: %d %s, want the app, stopped", rec.Code, rec.Body)
+	}
+	rec = do(t, h, "POST", "/api/platform/apps/1/start", "")
+	if rec.Code != http.StatusOK || decode[appResponse](t, rec).Stopped {
+		t.Errorf("start: %d %s, want the app, running", rec.Code, rec.Body)
+	}
+	// Deleting reports the database volume left behind (app 1 had one in
+	// the fake); none for an app without a database.
+	rec = do(t, h, "DELETE", "/api/platform/apps/1", "")
+	if got := strings.TrimSpace(rec.Body.String()); rec.Code != http.StatusOK ||
+		got != `{"name":"hello","databaseVolume":"ops-db-hello"}` {
+		t.Errorf("delete: %d %s", rec.Code, got)
+	}
+	rec = do(t, h, "DELETE", "/api/platform/apps/2", "")
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"name":"hello","databaseVolume":null}` {
+		t.Errorf("delete without a database: %s", got)
+	}
+	if !slices.Equal(dep.lifecycle, []string{"stop 1", "start 1", "delete 1", "delete 2"}) {
+		t.Errorf("calls = %q", dep.lifecycle)
+	}
+
+	// Refusals say why, as 409s.
+	for _, err := range []error{store.ErrDeployInProgress, store.ErrBackupInProgress, store.ErrAppStopped} {
+		dep.err = err
+		for _, req := range [][2]string{{"POST", "/api/platform/apps/1/stop"}, {"DELETE", "/api/platform/apps/1"}} {
+			if rec := do(t, h, req[0], req[1], ""); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), err.Error()) {
+				t.Errorf("%s %s with %v: %d %s, want 409 with the reason", req[0], req[1], err, rec.Code, rec.Body)
+			}
+		}
+	}
+	dep.err = store.ErrNotFound
+	if rec := do(t, h, "POST", "/api/platform/apps/9/start", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("missing app: %d, want 404", rec.Code)
 	}
 }
 

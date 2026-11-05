@@ -69,6 +69,7 @@ func newTestWebhook() (http.Handler, *fakeStore, *fakeDeployer) {
 		{ID: 3, Name: "staging", RepoURL: "https://github.com/owner/repo", Branch: "staging", AutoDeploy: true},
 		{ID: 4, Name: "paused", RepoURL: "https://github.com/owner/repo", Branch: "main", AutoDeploy: false},
 		{ID: 5, Name: "other", RepoURL: "https://github.com/owner/other", Branch: "main", AutoDeploy: true},
+		{ID: 6, Name: "parked", RepoURL: "https://github.com/owner/repo", Branch: "main", AutoDeploy: true, Stopped: true},
 	}}
 	dep := &fakeDeployer{busy: map[int64]bool{}}
 	return New(secret, st, dep), st, dep
@@ -114,7 +115,7 @@ func TestPushDeploysMatchingApps(t *testing.T) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
 	// The repo matches whatever its case or ".git"; another branch, another
-	// repo, or auto-deploy off doesn't deploy.
+	// repo, auto-deploy off, or a stopped app doesn't deploy.
 	if want := []string{"0123456 to 1", "0123456 to 2"}; !slices.Equal(dep.pushed, want) {
 		t.Errorf("pushed %q, want %q", dep.pushed, want)
 	}
@@ -122,7 +123,8 @@ func TestPushDeploysMatchingApps(t *testing.T) {
 	for _, a := range res.Apps {
 		got = append(got, a.App+": "+a.Result)
 	}
-	want := []string{"web: deploying", "api: deploys next, after the deploy in progress", "paused: auto-deploy is off"}
+	want := []string{"web: deploying", "api: deploys next, after the deploy in progress", "paused: auto-deploy is off",
+		"parked: the app is stopped"}
 	if !slices.Equal(got, want) {
 		t.Errorf("results %q, want %q", got, want)
 	}
