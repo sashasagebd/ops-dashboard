@@ -13,8 +13,9 @@ import (
 // deployment.
 type Job struct {
 	ID           int64  `db:"id"`
-	Kind         string `db:"kind"`
-	DeploymentID int64  `db:"deployment_id"`
+	Kind         string `db:"kind"`          // "deploy" or "backup"
+	DeploymentID int64  `db:"deployment_id"` // a deploy's; 0 for a backup
+	BackupID     int64  `db:"backup_id"`     // a backup's; 0 for a deploy
 	// Attempts counts claims, this one included: 1 on the first run.
 	Attempts int `db:"attempts"`
 }
@@ -38,7 +39,8 @@ func (s *Store) ClaimJob(ctx context.Context, worker string, lease time.Duration
 			LIMIT 1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, kind, deployment_id, attempts`,
+		RETURNING id, kind, COALESCE(deployment_id, 0) AS deployment_id,
+			COALESCE(backup_id, 0) AS backup_id, attempts`,
 		worker, lease.Seconds())
 	job, err = pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[Job])
 	if errors.Is(err, pgx.ErrNoRows) {

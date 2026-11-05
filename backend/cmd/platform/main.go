@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/api"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/backup"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/deploy"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
@@ -141,6 +142,29 @@ func run(addr string) error {
 		DrainTimeout:   15 * time.Second,
 		DrainInterval:  250 * time.Millisecond,
 	}, st, github, dockerClient, caddy)
+	// Backups of app databases, on when compose gives the platform the backup
+	// volume (BACKUP_VOLUME; the host directory behind it is BACKUP_DIR). It's
+	// mounted read-only at /backups here too, to check each dump landed.
+	var backuper *backup.Backuper
+	if volume := os.Getenv("BACKUP_VOLUME"); volume != "" {
+		backuper = backup.New(backup.Config{
+			Volume: volume,
+			Dir:    envOr("BACKUP_MOUNT", "/backups"),
+			// The owner's uid:gid, so the dumps in ~/backups are theirs.
+			User:       envOr("BACKUP_USER", "1000:1000"),
+			Keep:       7,
+			Every:      24 * time.Hour,
+			CheckEvery: 10 * time.Minute,
+			Timeout:    30 * time.Minute,
+		}, st, dockerClient)
+	} else {
+		slog.Info("backups are off: BACKUP_VOLUME isn't set")
+	}
+	handlers := jobs.Kinds{"deploy": deployer}
+	if backuper != nil {
+		handlers["backup"] = backuper
+	}
+
 	runner := jobs.New(jobs.Config{
 		// Two deploys (of different apps) at once: builds are heavy, and
 		// the game servers share these 4 cores.
@@ -151,8 +175,14 @@ func run(addr string) error {
 		Lease:        30 * time.Second,
 		PollInterval: 5 * time.Second,
 		RetryDelay:   15 * time.Second,
-	}, st, deployer)
+	}, st, handlers)
 	deployer.Notify = runner.Wake
+	// The API's view of backups: nil, not a nil *Backuper, when they're off.
+	var backups api.Backups
+	if backuper != nil {
+		backuper.Notify = runner.Wake
+		backups = backuper
+	}
 	reconciler := reconcile.New(reconcile.Config{
 		Interval:    10 * time.Second,
 		MinBackoff:  10 * time.Second,
@@ -179,6 +209,9 @@ func run(addr string) error {
 		// using the database when it closes.
 		var wg sync.WaitGroup
 		wg.Go(func() { reconciler.Run(ctx) })
+		if backuper != nil {
+			wg.Go(func() { backuper.RunScheduler(ctx) })
+		}
 		runner.Run(ctx) // returns at once if ctx is already done
 		wg.Wait()
 	}()
@@ -187,7 +220,7 @@ func run(addr string) error {
 	// platform started up fully.
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: newHandler(api.New(st, deployer, dockerClient, appsDomain)),
+		Handler: newHandler(api.New(st, deployer, dockerClient, backups, appsDomain)),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,

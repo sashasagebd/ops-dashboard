@@ -13,14 +13,16 @@ import {
   rollback,
   setAutoDeploy,
   setEnvVar,
+  startBackup,
   type AppDetail,
+  type Backup,
   type Deployment,
   type DeploymentStatus,
   type EventKind,
   type PlatformApp,
   type PlatformEvent,
 } from './api'
-import { formatBytes, formatDuration } from './format'
+import { formatBytes, formatDuration, formatFileSize } from './format'
 import { LogViewer } from './LogViewer'
 import { appHref } from './route'
 import { usePolling, type PollState } from './usePolling'
@@ -218,6 +220,9 @@ export function AppPage({ id }: { id: number }) {
             <EventsList events={app.events} now={checkedAt} emptyText="Nothing has needed fixing for this app." />
             <h3>Database</h3>
             <Database app={app} onDone={refresh} />
+            {app.database !== null && app.database.state !== 'creating' && (
+              <Backups app={app} now={checkedAt} onDone={refresh} />
+            )}
             <h3>Environment variables</h3>
             <EnvVars app={app} onDone={refresh} />
           </>
@@ -394,6 +399,71 @@ function Database({ app, onDone }: { app: AppDetail; onDone: () => void }) {
       </p>
     </>
   )
+}
+
+// Backups is the app's database backups, newest first, and a button to make
+// one now.
+function Backups({ app, now, onDone }: { app: AppDetail; now: number; onDone: () => void }) {
+  const [action, run] = useAction()
+  const busy = app.backups.some((b) => b.status === 'queued' || b.status === 'running')
+  const onBackUp = () => {
+    void run(async () => {
+      await startBackup(app.id)
+      onDone()
+    })
+  }
+  return (
+    <>
+      <h4>Backups</h4>
+      <p className="muted">
+        Daily, the newest 7 kept, in <span className="mono">~/backups/{app.name}/</span> on the server. The README
+        says how to restore one.
+      </p>
+      <div className="form-inline">
+        <button type="button" onClick={onBackUp} disabled={busy || action.status === 'busy'}>
+          Back up now
+        </button>
+        {busy && <span className="muted">A backup is running.</span>}
+        <ActionError state={action} />
+      </div>
+      {app.backups.length === 0 ? (
+        <p className="muted">No backups yet.</p>
+      ) : (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">When</th>
+                <th scope="col">Status</th>
+                <th scope="col">File</th>
+                <th scope="col">Size</th>
+              </tr>
+            </thead>
+            <tbody>
+              {app.backups.map((b) => (
+                <tr key={b.id}>
+                  <td title={b.createdAt}>{formatDuration(now - Date.parse(b.createdAt))} ago</td>
+                  <td>
+                    <span className={`badge badge-${BACKUP_BADGE[b.status]}`}>{b.status}</span>
+                    {b.error !== null && <div className="deploy-error">{b.error}</div>}
+                  </td>
+                  <td className="mono">{b.file ?? ''}</td>
+                  <td>{b.sizeBytes === null ? '' : formatFileSize(b.sizeBytes)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
+  )
+}
+
+const BACKUP_BADGE: Record<Backup['status'], string> = {
+  queued: 'warn',
+  running: 'warn',
+  done: 'up',
+  failed: 'down',
 }
 
 // How a database's state looks; anything else (stopped, missing) is a

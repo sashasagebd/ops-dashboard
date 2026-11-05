@@ -212,6 +212,10 @@ func (r *Reconciler) app(ctx context.Context, app store.App, db *store.Database,
 
 	var liveContainer, dbContainer *engine.ManagedContainer
 	for _, c := range containers {
+		if c.Labels[engine.LabelRole] == engine.RoleBackup {
+			// A backup running: its job owns it, and removes it when done.
+			continue
+		}
 		if c.Labels[engine.LabelRole] == engine.RoleDatabase {
 			if db != nil {
 				dbContainer = &c

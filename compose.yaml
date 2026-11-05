@@ -73,6 +73,14 @@ services:
       APPS_NETWORK: platform-apps
       CADDY_ADMIN_URL: http://10.203.0.2:2019
       CADDY_PROXY_URL: http://10.203.0.2:80
+      # Backups of app databases (see the platform-backups volume below):
+      # the volume the platform's backup containers write to, by name, and
+      # who they write as (the owner of BACKUP_DIR; see .env.example).
+      BACKUP_VOLUME: platform-backups
+      BACKUP_USER: ${BACKUP_UID:-1000}:${BACKUP_GID:-1000}
+    volumes:
+      # Read-only: the platform only checks each dump landed (its size).
+      - platform-backups:/backups:ro
     # The image's HEALTHCHECK is the dashboard's, so it's replaced here. The
     # platform only listens once Postgres answers and migrations have run,
     # hence the longer start period.
@@ -240,3 +248,15 @@ volumes:
   # Caddy's autosaved config (for --resume) and its data directory.
   caddy-config:
   caddy-data:
+  # Backups of app databases: the host directory BACKUP_DIR (~/backups on
+  # the server) as a named volume, so the platform hands it to its backup
+  # containers by name and never names a host path itself. A fixed name,
+  # since the platform refers to it. The directory must exist before
+  # `docker compose up`. `down -v` removes the volume, never the files in it.
+  platform-backups:
+    name: platform-backups
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${BACKUP_DIR:?set BACKUP_DIR in .env (e.g. /home/sasha/backups) and create the directory}

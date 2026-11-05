@@ -994,8 +994,8 @@ const databaseMemoryBytes = 256 << 20
 // The database user and database name inside an app's Postgres. Each app has
 // a Postgres of its own, so they needn't vary.
 const (
-	databaseUser = "app"
-	databaseDB   = "app"
+	DatabaseUser = "app"
+	DatabaseDB   = "app"
 )
 
 // DatabaseName is an app's database container, its data volume and its
@@ -1005,7 +1005,7 @@ func DatabaseName(app string) string { return "ops-db-" + app }
 // DatabaseURL is how an app reaches its database, given as DATABASE_URL. No
 // TLS: the connection never leaves the app's own internal network.
 func DatabaseURL(app, password string) string {
-	return "postgres://" + databaseUser + ":" + password + "@" + DatabaseName(app) + ":5432/" + databaseDB + "?sslmode=disable"
+	return "postgres://" + DatabaseUser + ":" + password + "@" + DatabaseName(app) + ":5432/" + DatabaseDB + "?sslmode=disable"
 }
 
 // appEnv is what an app's container starts with: its env vars and, if the app
@@ -1057,9 +1057,9 @@ func (d *Deployer) RunDatabase(ctx context.Context, app store.App, db store.Data
 		// Read by the image only when the volume is first initialised; a
 		// recreated container keeps the data, and the password, it finds.
 		Env: map[string]string{
-			"POSTGRES_USER":     databaseUser,
+			"POSTGRES_USER":     DatabaseUser,
 			"POSTGRES_PASSWORD": db.Password,
-			"POSTGRES_DB":       databaseDB,
+			"POSTGRES_DB":       DatabaseDB,
 		},
 		Labels:      databaseLabels(app),
 		Network:     name,

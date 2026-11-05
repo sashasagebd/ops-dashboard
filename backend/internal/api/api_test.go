@@ -28,6 +28,7 @@ type fakeStore struct {
 	kept        []string // KeptImages' answer
 	events      []store.Event
 	databases   map[int64]store.Database
+	backups     []store.Backup
 	err         error // if set, every method fails with it
 
 	mu       sync.Mutex
@@ -106,6 +107,10 @@ func (f *fakeStore) Deployments(context.Context, int64, int) ([]store.Deployment
 }
 
 func (f *fakeStore) KeptImages(context.Context, int64) ([]string, error) { return f.kept, f.err }
+
+func (f *fakeStore) Backups(context.Context, int64, int) ([]store.Backup, error) {
+	return f.backups, f.err
+}
 
 func (f *fakeStore) Database(_ context.Context, appID int64) (store.Database, error) {
 	db, ok := f.databases[appID]
@@ -189,7 +194,7 @@ func newTestAPI() (http.Handler, *fakeStore, *fakeDeployer) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Hostname: "hello.apps.test", Port: 8080}}
 	dep := &fakeDeployer{}
-	return New(st, dep, &fakeEngine{}, "apps.test"), st, dep
+	return New(st, dep, &fakeEngine{}, nil, "apps.test"), st, dep
 }
 
 // do sends a request; a non-empty body is sent as JSON.
@@ -368,7 +373,7 @@ func TestInternalErrorsAreGeneric(t *testing.T) {
 
 func TestListAppsEmptyIsArray(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
-	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, "apps.test"), "GET", "/api/platform/apps", "")
+	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, nil, "apps.test"), "GET", "/api/platform/apps", "")
 	if strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Errorf("body = %s, want []", rec.Body)
 	}
@@ -506,7 +511,7 @@ func TestDatabase(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test", Port: 8080}}
 	eng := &fakeEngine{}
-	h := New(st, &fakeDeployer{}, eng, "apps.test")
+	h := New(st, &fakeDeployer{}, eng, nil, "apps.test")
 
 	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"database":null`) {
 		t.Errorf("no database yet: body %s, want database null", rec.Body)
@@ -555,5 +560,64 @@ func TestDatabase(t *testing.T) {
 	}
 	if rec := do(t, h, "POST", "/api/platform/apps/9/database", ""); rec.Code != http.StatusNotFound {
 		t.Errorf("missing app: %d, want 404", rec.Code)
+	}
+}
+
+type fakeBackups struct {
+	err     error
+	started []int64
+}
+
+func (f *fakeBackups) Start(_ context.Context, appID int64) (store.Backup, error) {
+	if f.err != nil {
+		return store.Backup{}, f.err
+	}
+	f.started = append(f.started, appID)
+	return store.Backup{ID: 4, AppID: appID, Status: store.BackupQueued, CreatedAt: time.Now()}, nil
+}
+
+func TestBackups(t *testing.T) {
+	st := &fakeStore{env: map[string]string{}}
+	st.apps = []store.App{{ID: 1, Name: "hello"}}
+	bk := &fakeBackups{}
+	h := New(st, &fakeDeployer{}, &fakeEngine{}, bk, "apps.test")
+
+	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"backups":[]`) {
+		t.Errorf("no backups yet: %s, want backups []", rec.Body)
+	}
+	finished := time.Now()
+	st.backups = []store.Backup{
+		{ID: 2, AppID: 1, Status: store.BackupFailed, Error: "pg_dump failed: x", FinishedAt: &finished},
+		{ID: 1, AppID: 1, Status: store.BackupDone, File: "hello-20261104-120000.dump", SizeBytes: 4096, FinishedAt: &finished},
+	}
+	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", "")).Backups
+	if len(got) != 2 || got[0].File != nil || *got[0].Error != "pg_dump failed: x" ||
+		*got[1].File != "hello-20261104-120000.dump" || *got[1].SizeBytes != 4096 || got[1].Error != nil {
+		t.Errorf("backups = %+v", got)
+	}
+
+	rec := do(t, h, "POST", "/api/platform/apps/1/backups", "")
+	if rec.Code != http.StatusAccepted || decode[backupResponse](t, rec).Status != "queued" || len(bk.started) != 1 {
+		t.Errorf("back up now: %d %s", rec.Code, rec.Body)
+	}
+	for err, want := range map[error]string{
+		store.ErrNoDatabase:       "no database",
+		store.ErrBackupInProgress: "already in progress",
+	} {
+		bk.err = err
+		if rec := do(t, h, "POST", "/api/platform/apps/1/backups", ""); rec.Code != http.StatusConflict ||
+			!strings.Contains(rec.Body.String(), want) {
+			t.Errorf("with %v: %d %s, want 409 saying %q", err, rec.Code, rec.Body, want)
+		}
+	}
+	if rec := do(t, h, "POST", "/api/platform/apps/9/backups", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("missing app: %d, want 404", rec.Code)
+	}
+
+	// Backups not set up on this platform: a clear 409.
+	off := New(st, &fakeDeployer{}, &fakeEngine{}, nil, "apps.test")
+	if rec := do(t, off, "POST", "/api/platform/apps/1/backups", ""); rec.Code != http.StatusConflict ||
+		!strings.Contains(rec.Body.String(), "BACKUP_DIR") {
+		t.Errorf("backups off: %d %s, want 409 pointing at BACKUP_DIR", rec.Code, rec.Body)
 	}
 }

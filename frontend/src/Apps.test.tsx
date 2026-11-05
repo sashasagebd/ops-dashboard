@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AppDetail, Deployment, PlatformApp, PlatformEvent } from './api'
+import type { AppDetail, Backup, Deployment, PlatformApp, PlatformEvent } from './api'
 import App from './App'
 import { FakeEventSource } from './test/fakeEventSource'
 
@@ -44,7 +44,7 @@ function app(overrides: Partial<PlatformApp> = {}): PlatformApp {
 }
 
 function detail(overrides: Partial<AppDetail> = {}): AppDetail {
-  return { ...app(), envKeys: [], deployments: [], events: [], database: null, ...overrides }
+  return { ...app(), envKeys: [], deployments: [], events: [], database: null, backups: [], ...overrides }
 }
 
 function event(overrides: Partial<PlatformEvent> = {}): PlatformEvent {
@@ -443,6 +443,59 @@ describe('App page', () => {
     render(<App />)
     expect(await screen.findByText('running')).toHaveClass('badge-up')
     expect(screen.queryByText(/Deploy the app to start using it/)).not.toBeInTheDocument()
+  })
+
+  it('lists backups and makes one now', async () => {
+    let queued = false
+    const db = { name: 'ops-db-hello', createdAt: '2026-11-01T00:00:00Z', state: 'running' }
+    const done: Backup = {
+      id: 1,
+      status: 'done',
+      file: 'hello-20261104-120000.dump',
+      sizeBytes: 2048,
+      error: null,
+      createdAt: new Date(Date.now() - 3 * 60 * 60_000).toISOString(),
+      finishedAt: null,
+    }
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({
+          database: db,
+          backups: queued ? [{ ...done, id: 2, status: 'queued', file: null, sizeBytes: null }, done] : [done],
+        }),
+      ],
+      'POST /api/platform/apps/1/backups': () => {
+        queued = true
+        return [202, { ...done, id: 2, status: 'queued', file: null, sizeBytes: null }]
+      },
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    expect(await screen.findByText('hello-20261104-120000.dump')).toBeInTheDocument()
+    expect(screen.getByText('2.0 KiB')).toBeInTheDocument()
+    expect(screen.getByText('done')).toHaveClass('badge-up')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back up now' }))
+    expect(await screen.findByText('queued')).toHaveClass('badge-warn')
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/backups')).toHaveLength(1)
+    // One at a time.
+    expect(screen.getByRole('button', { name: 'Back up now' })).toBeDisabled()
+    expect(screen.getByText('A backup is running.')).toBeInTheDocument()
+  })
+
+  it('has no backups section until the database exists', async () => {
+    mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({ database: { name: 'ops-db-hello', createdAt: new Date().toISOString(), state: 'creating' } }),
+      ],
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    await screen.findByText('being created')
+    expect(screen.queryByRole('button', { name: 'Back up now' })).not.toBeInTheDocument()
   })
 
   it('has no app output to show when nothing is live', async () => {

@@ -29,6 +29,12 @@ var (
 	// (it was never live, its image is gone, or it's the live version);
 	// wrapped with which (CheckRollback).
 	ErrNotRollbackable = errors.New("can't roll back to this deployment")
+	// ErrNoDatabase: a backup was asked for an app without a database (or
+	// whose database hasn't been created yet).
+	ErrNoDatabase = errors.New("the app has no database to back up yet")
+	// ErrBackupInProgress: the app already has a backup queued or running
+	// (the backups_one_in_progress_per_app index).
+	ErrBackupInProgress = errors.New("a backup of this app is already in progress")
 )
 
 // Postgres error codes (https://www.postgresql.org/docs/current/errcodes-appendix.html).
@@ -60,6 +66,8 @@ func translate(err error) error {
 			return fmt.Errorf("%w: an app with that hostname already exists", ErrConflict)
 		case "deployments_one_in_progress_per_app":
 			return ErrDeployInProgress
+		case "backups_one_in_progress_per_app":
+			return ErrBackupInProgress
 		case "app_databases_pkey":
 			return fmt.Errorf("%w: the app already has a database", ErrConflict)
 		}

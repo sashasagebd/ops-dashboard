@@ -115,6 +115,19 @@ export type AppDetail = PlatformApp & {
   deployments: Deployment[] // newest first, at most 20
   events: PlatformEvent[] // the reconciler's, newest first, at most 20
   database: AppDatabase | null // null if the app has none
+  backups: Backup[] // its database's, newest first, at most 7
+}
+
+// Backup matches backupResponse: one pg_dump of an app's database, a file in
+// the backup directory under the app's name.
+export type Backup = {
+  id: number
+  status: 'queued' | 'running' | 'done' | 'failed'
+  file: string | null // the dump's name; null until done
+  sizeBytes: number | null // null until done
+  error: string | null // null unless failed
+  createdAt: string
+  finishedAt: string | null
 }
 
 // AppDatabase matches databaseResponse: an app's own Postgres. Its password
@@ -230,6 +243,11 @@ export function rollback(appId: number, deploymentId: number): Promise<Deploymen
 // within seconds; the app gets DATABASE_URL from its next deploy.
 export function createDatabase(appId: number): Promise<AppDatabase> {
   return sendJSON<AppDatabase>('POST', `/api/platform/apps/${appId}/database`)
+}
+
+// startBackup backs up the app's database now; it runs in the background.
+export function startBackup(appId: number): Promise<Backup> {
+  return sendJSON<Backup>('POST', `/api/platform/apps/${appId}/backups`)
 }
 
 export function setAutoDeploy(appId: number, autoDeploy: boolean): Promise<PlatformApp> {

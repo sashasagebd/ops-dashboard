@@ -158,6 +158,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           # Turns on push-to-deploy; the tests below sign deliveries with it.
           GITHUB_WEBHOOK_SECRET: ci-only-webhook-secret-0123456789abcdef
+          # Where app database backups go (the server uses ~/backups).
+          BACKUP_DIR: /tmp/ci-backups
           # The commit to deploy in the end-to-end test: this one. (For a
           # pull request, the branch head rather than GitHub's merge commit.)
           DEPLOY_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -166,6 +168,10 @@ jobs:
           # A fresh key per run rather than one committed to the repo. It
           # must stay the same for the whole step, across the restart below.
           export PLATFORM_SECRET_KEY="$(openssl rand -hex 32)"
+          # The backup directory must exist; dumps are written as the
+          # runner's user, as they are as the owner's on the server.
+          mkdir -p "$BACKUP_DIR"
+          export BACKUP_UID="$(id -u)" BACKUP_GID="$(id -g)"
           docker compose up -d --build --wait --wait-timeout 180 || { docker compose ps -a; docker compose logs; exit 1; }
           curl -fsS http://127.0.0.1:8080/healthz
           # The dashboard sees the new services (proxy -> Docker works). Plain
@@ -541,6 +547,40 @@ jobs:
           if curl -sSN --max-time 30 "http://127.0.0.1:8080/api/platform/apps/$APP/deployments/$DEP/logs" | grep 'postgres://' > /dev/null; then
             echo "a deploy log shows DATABASE_URL"; exit 1
           fi
+
+          # Backups: "Back up now" through the dashboard. The dump lands in
+          # BACKUP_DIR, owned by the runner's user. Then hello's table is
+          # dropped and the dump restored the way the README says: the count
+          # carries on from where the backup was taken.
+          N=$(count_visit) || on_failure
+          # (If the daily scheduler happens to be backing hello up right
+          # now, that's a 409: wait for it and ask again.)
+          for i in $(seq 1 30); do
+            BK=$(dash POST "/api/platform/apps/$APP/backups" | jq -r '.id // empty')
+            [ -n "$BK" ] && break
+            [ "$i" = 30 ] && on_failure
+            sleep 2
+          done
+          for i in $(seq 1 60); do
+            BSTATUS=$(dash GET "/api/platform/apps/$APP" | jq -r ".backups[] | select(.id == $BK) | .status")
+            [ "$BSTATUS" = done ] && break
+            if [ "$BSTATUS" = failed ] || [ "$i" = 60 ]; then
+              dash GET "/api/platform/apps/$APP" | jq .backups; on_failure
+            fi
+            sleep 2
+          done
+          FILE=$(dash GET "/api/platform/apps/$APP" | jq -r ".backups[] | select(.id == $BK) | .file")
+          ls -l "$BACKUP_DIR/hello/"
+          test -s "$BACKUP_DIR/hello/$FILE" || on_failure
+          test "$(stat -c %u "$BACKUP_DIR/hello/$FILE")" = "$(id -u)" || on_failure
+          # Its container is gone (it held the password).
+          test "$(docker ps -aq --filter label=ops.platform.role=backup | wc -l)" = 0 || on_failure
+          docker exec ops-db-hello psql -U app -d app -c 'DROP TABLE visits'
+          if curl -fsS --max-time 2 -H 'Host: hello.apps.test' http://127.0.0.1/visits; then
+            echo "hello still counts with its table dropped"; exit 1
+          fi
+          docker exec -i ops-db-hello pg_restore --clean --if-exists -U app -d app < "$BACKUP_DIR/hello/$FILE" || on_failure
+          test "$(count_visit)" = $((N + 1)) || on_failure
 
           # A source directory that doesn't exist fails with a clear reason
           # (found mid-stream, so this also checks the reason survives

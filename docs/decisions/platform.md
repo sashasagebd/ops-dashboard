@@ -1206,3 +1206,55 @@ deploy: app containers have no volumes).
 **Alternatives:** a job per database creation (the reconciler already does
 "make it real, retry until it is"); a fixed hostname alias `db` (names are
 unique per network anyway, and `ops-db-<app>` says which).
+
+### Backups daily, 7 kept, in `~/backups`, restore tested
+
+**What:** every app database is backed up with `pg_dump` once a day, and on
+"Back up now", to `BACKUP_DIR/<app>/` (`~/backups` on the server); the
+newest 7 dumps per app are kept. Restoring is a documented manual
+`pg_restore`, and CI restores a real dump.
+**Why:** a backup nobody has restored is a hope, not a backup, so the
+restore is part of the test. Daily with a week kept covers "I broke it
+yesterday" for an app this size; the dumps are plain files the owner can
+copy off the server.
+**Alternatives:** continuous archiving (WAL shipping, point-in-time
+recovery: far more machinery than a hobby app's data needs); volume
+snapshots (need the `VOLUMES` permission and a stopped database to be
+consistent; `pg_dump` is consistent while the app runs).
+
+### How backups work (5.2, 2026-11-04)
+
+**What:** the details behind the entry above (`internal/backup`).
+- **A job, like a deploy.** Each backup is a row in `backups` and a job of
+  kind `backup` in the existing queue, so it's retried (a dump that fails is
+  likely a database restarting) and survives the platform restarting. The
+  queue's jobs now have a typed input per kind (`deployment_id` or
+  `backup_id`, a check makes exactly one set) and `jobs.Kinds` hands each
+  job to its kind's handler. A unique index allows one backup in progress
+  per app, as for deploys.
+- **The scheduler** checks every 10 minutes for databases with no backup
+  for 24 hours (a failed one counts, so a failing backup is tried once a day,
+  each try with its retries) and queues one each.
+- **The dump runs in a short-lived container:** `postgres:18.6` (its
+  `pg_dump` matches the server's version), on the app's database network,
+  as `BACKUP_UID:BACKUP_GID` so the files are the owner's, with its inputs as
+  env vars (never spliced into the script). It writes to a hidden partial
+  file and renames it when complete, so a cut-off dump never looks like a
+  backup, then deletes all but the newest 7. The container is removed
+  however the attempt ends: it holds the password in its env.
+- **The platform never names a host path.** Compose defines the
+  `platform-backups` volume as a bind of `BACKUP_DIR`; the platform hands
+  that volume to backup containers by name. It's mounted into the platform
+  read-only too (compose only creates a volume a service uses), and the
+  platform checks each dump's size there, which proves the file landed
+  where the owner will look.
+- **Restoring runs inside the database's container** (`docker exec ...
+  pg_restore`): Postgres trusts its local socket there, so the password,
+  which is never shown, isn't needed.
+- The reconciler leaves backup containers to their job.
+
+**Alternatives:** the platform running `pg_dump` itself (its image is
+distroless, and it would need to reach every app's database network); a
+cron container in compose (outside the queue: no retries, no record, no
+"Back up now"); writing dumps through the platform (a second copy of every
+byte through a 128 MiB container).

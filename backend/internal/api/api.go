@@ -48,7 +48,17 @@ type Store interface {
 	Events(ctx context.Context, appID int64, limit int) ([]store.Event, error)
 	Database(ctx context.Context, appID int64) (store.Database, error)
 	CreateDatabase(ctx context.Context, appID int64) (store.Database, error)
+	Backups(ctx context.Context, appID int64, limit int) ([]store.Backup, error)
 }
+
+// Backups starts backups now; in production it's a *backup.Backuper, or nil
+// if backups aren't set up (no BACKUP_VOLUME).
+type Backups interface {
+	Start(ctx context.Context, appID int64) (store.Backup, error)
+}
+
+// errBackupsOff answers "Back up now" on a platform without backups set up.
+var errBackupsOff = errors.New("backups aren't set up on this server (see BACKUP_DIR in the README)")
 
 // Deployer starts deploys; in production it's a *deploy.Deployer.
 type Deployer interface {
@@ -65,8 +75,8 @@ type Engine interface {
 
 // New returns the platform API's handler. Apps get the hostname
 // <name>.<appsDomain>.
-func New(st Store, dep Deployer, eng Engine, appsDomain string) http.Handler {
-	a := &api{store: st, deployer: dep, engine: eng, appsDomain: appsDomain}
+func New(st Store, dep Deployer, eng Engine, bk Backups, appsDomain string) http.Handler {
+	a := &api{store: st, deployer: dep, engine: eng, backups: bk, appsDomain: appsDomain}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/platform/apps", a.listApps)
 	mux.HandleFunc("POST /api/platform/apps", a.createApp)
@@ -82,6 +92,7 @@ func New(st Store, dep Deployer, eng Engine, appsDomain string) http.Handler {
 	mux.HandleFunc("GET /api/platform/apps/{id}/logs", a.appLogs)
 	mux.HandleFunc("GET /api/platform/events", a.listEvents)
 	mux.HandleFunc("POST /api/platform/apps/{id}/database", a.createDatabase)
+	mux.HandleFunc("POST /api/platform/apps/{id}/backups", a.createBackup)
 	return mux
 }
 
@@ -89,6 +100,7 @@ type api struct {
 	store      Store
 	deployer   Deployer
 	engine     Engine
+	backups    Backups // nil if backups aren't set up
 	appsDomain string
 }
 
@@ -118,6 +130,30 @@ type appDetailResponse struct {
 	Deployments []deploymentResponse `json:"deployments"` // newest first
 	Events      []eventResponse      `json:"events"`      // the reconciler's, newest first
 	Database    *databaseResponse    `json:"database"`    // null if the app has none
+	Backups     []backupResponse     `json:"backups"`     // its database's, newest first
+}
+
+// backupResponse is one backup of an app's database. The dump is a file in
+// the backup directory, under the app's name.
+type backupResponse struct {
+	ID         int64      `json:"id"`
+	Status     string     `json:"status"`    // queued, running, done or failed
+	File       *string    `json:"file"`      // the dump's name; null until done
+	SizeBytes  *int64     `json:"sizeBytes"` // null until done
+	Error      *string    `json:"error"`     // null unless failed
+	CreatedAt  time.Time  `json:"createdAt"`
+	FinishedAt *time.Time `json:"finishedAt"`
+}
+
+func newBackupResponse(b store.Backup) backupResponse {
+	r := backupResponse{ID: b.ID, Status: string(b.Status), CreatedAt: b.CreatedAt, FinishedAt: b.FinishedAt}
+	if b.Status == store.BackupDone {
+		r.File, r.SizeBytes = &b.File, &b.SizeBytes
+	}
+	if b.Error != "" {
+		r.Error = &b.Error
+	}
+	return r
 }
 
 // databaseResponse is an app's own Postgres. Its password is never shown:
@@ -367,12 +403,22 @@ func (a *api) getApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	bs, err := a.store.Backups(ctx, id, appBackups)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	backups := make([]backupResponse, 0, len(bs)) // [] not null when empty
+	for _, b := range bs {
+		backups = append(backups, newBackupResponse(b))
+	}
 	writeJSON(w, http.StatusOK, appDetailResponse{
 		appResponse: newAppResponse(app, current),
 		EnvKeys:     keys,
 		Deployments: list,
 		Events:      newEventResponses(events),
 		Database:    db,
+		Backups:     backups,
 	})
 }
 
@@ -543,7 +589,33 @@ func (a *api) rollback(w http.ResponseWriter, r *http.Request) {
 const (
 	appEvents = 20 // in an app's detail
 	allEvents = 50 // GET /api/platform/events
+	// An app's backups in its detail: as many as the platform keeps dumps of.
+	appBackups = 7
 )
+
+// createBackup backs up the app's database now (no body). 202: it runs in
+// the background; the app's detail shows how it went. 409 if the app has no
+// database (yet), a backup is in progress, or backups aren't set up.
+func (a *api) createBackup(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if _, err := a.store.App(r.Context(), id); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	if a.backups == nil {
+		writeJSON(w, http.StatusConflict, errorResponse{errBackupsOff.Error()})
+		return
+	}
+	b, err := a.backups.Start(r.Context(), id)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, newBackupResponse(b))
+}
 
 // listEvents is the reconciler's most recent events, for every app and those
 // about no app, newest first.
@@ -675,7 +747,8 @@ func writeError(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, store.ErrNotFound):
 		writeJSON(w, http.StatusNotFound, errorResponse{"not found"})
 	case errors.Is(err, store.ErrConflict), errors.Is(err, store.ErrDeployInProgress),
-		errors.Is(err, store.ErrNotRollbackable):
+		errors.Is(err, store.ErrNotRollbackable), errors.Is(err, store.ErrNoDatabase),
+		errors.Is(err, store.ErrBackupInProgress):
 		writeJSON(w, http.StatusConflict, errorResponse{err.Error()})
 	case errors.Is(err, store.ErrInvalid):
 		writeJSON(w, http.StatusBadRequest, errorResponse{err.Error()})

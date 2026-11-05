@@ -550,3 +550,13 @@ func TestDatabaseCreationFailingIsRecordedOnce(t *testing.T) {
 		t.Error("recorded as created although creating it failed")
 	}
 }
+
+func TestABackupContainerIsLeftToItsJob(t *testing.T) {
+	f := newFakes()
+	f.containers = append(f.containers, engine.ManagedContainer{ID: "bk", Name: "ops-backup-hello-3", State: "running",
+		Labels: map[string]string{engine.LabelApp: "hello", engine.LabelRole: engine.RoleBackup}})
+	f.reconciler(newClock()).Pass(t.Context())
+	if len(f.actions) != 0 {
+		t.Errorf("actions = %q; a backup mid-dump must be left alone", f.actions)
+	}
+}
