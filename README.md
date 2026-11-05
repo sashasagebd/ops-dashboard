@@ -163,8 +163,9 @@ from the tunnel's network outright.
 
 Setting it up, once (the domain must be on Cloudflare):
 
-1. In Cloudflare's dashboard: Zero Trust → Networks → Tunnels → **Create a
-   tunnel** → Cloudflared. Name it (e.g. `homelab`). On the next page, pick
+1. In Cloudflare's dashboard (account home, not the domain): Networking →
+   Tunnels → **Create a tunnel** → Cloudflared. (The same page is also in
+   Zero Trust, under Networks → Connectors.) Name it (e.g. `homelab`). On the next page, pick
    Docker and copy the token: the long string after `--token` in the command
    shown. Don't run that command; compose runs `cloudflared`.
 2. Add the tunnel's routes (Public hostnames, or Published application
