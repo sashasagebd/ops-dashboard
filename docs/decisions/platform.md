@@ -813,6 +813,9 @@ about).
 
 ### The webhook arrives through Tailscale Funnel until there's a domain
 
+_Superseded in 5.4: the webhook comes through Cloudflare Tunnel at
+`hooks.<PUBLIC_DOMAIN>` ("The webhook moves to the tunnel", Phase 5)._
+
 **What:** GitHub's push webhook reaches the platform through Tailscale
 Funnel, on port 8443 of the existing `homelab.<tailnet>.ts.net` name, mapped
 to the webhook listener only. The owner will buy a domain (most likely for
@@ -1151,3 +1154,255 @@ deployment and leaving the app down.
 
 **Alternatives:** applying the routes every pass (a Caddy config rebuild
 every 10s); restarting through a new deployment (a rebuild for a crash).
+
+## Phase 5 (approved 2026-11-04)
+
+### One Postgres container per app
+
+**What:** an app that asks for a database gets a Postgres of its own: a
+`postgres:18.6` container (256 MiB memory limit) with its data on a named
+volume, on an internal network that only it and the app's containers join.
+**Why:** isolation (one app can't exhaust another's connections or memory,
+or read its data), backups and restores per app, and upgrades per app later.
+**Cost:** about 30-60 MiB of memory per database, fine for a few apps.
+**Alternatives:** one shared Postgres with a database and user per app
+(less memory, but one app's load or a bad migration reaches every app, and
+a restore is all or nothing); SQLite in the app's container (lost on every
+deploy: app containers have no volumes).
+
+### How app databases work (5.1, 2026-11-04)
+
+**What:** the details behind the entry above.
+- **A row is the desired state.** "Add a database" stores the app's row in
+  `app_databases`: a random password (32 bytes, hex, so it needs no
+  escaping in a URL), encrypted and bound to the row like env vars. The
+  reconciler then creates the database in its next pass, as it keeps apps
+  running: network, image, container. `provisioned_at` records the first
+  creation, which tells "not created yet" from "its container was deleted";
+  Docker can't tell those apart without the volumes permission, which the
+  platform doesn't have.
+- **No new Docker permissions.** Creating a container with a named volume
+  makes the volume (no `VOLUMES` group); `IMAGES` pulls `postgres:18.6`;
+  `NETWORKS` creates the network. The volume is the one mount any platform
+  container gets, and only ever a named volume, never a host path. The
+  platform never removes a volume, so an app's data outlives its container,
+  and deleting a database isn't offered (yet).
+- **Names are derived, not stored:** `ops-db-<app>` is the container, its
+  volume, its network and its hostname. Its user and database are `app`:
+  each app has its own Postgres, so they needn't vary.
+- **Its own network, internal.** The app's containers join it at creation
+  (Docker API 1.44+ takes several networks at once), next to
+  `platform-apps`; the database is on nothing else. Other apps can't reach
+  it, and it can't reach the internet.
+- **The app gets `DATABASE_URL`** from its next deploy (or a recreate, or a
+  rollback: all start containers the same way), replacing an env var of
+  that name. Never logged or returned by the API; only the app's container
+  and the database's own env hold the password.
+- **The reconciler keeps it running** as it does apps: restarted if it
+  stops (its own backoff, separate from the app's), recreated if deleted,
+  with its data kept on the volume. A database container whose app has no
+  database row is an orphan like any other (its volume stays).
+- **The password is set once.** The image only reads `POSTGRES_PASSWORD`
+  when its volume is first initialised; a recreated container finds the
+  data, and the user, it had.
+
+**Alternatives:** a job per database creation (the reconciler already does
+"make it real, retry until it is"); a fixed hostname alias `db` (names are
+unique per network anyway, and `ops-db-<app>` says which).
+
+### Backups daily, 7 kept, in `~/backups`, restore tested
+
+**What:** every app database is backed up with `pg_dump` once a day, and on
+"Back up now", to `BACKUP_DIR/<app>/` (`~/backups` on the server); the
+newest 7 dumps per app are kept. Restoring is a documented manual
+`pg_restore`, and CI restores a real dump.
+**Why:** a backup nobody has restored is a hope, not a backup, so the
+restore is part of the test. Daily with a week kept covers "I broke it
+yesterday" for an app this size; the dumps are plain files the owner can
+copy off the server.
+**Alternatives:** continuous archiving (WAL shipping, point-in-time
+recovery: far more machinery than a hobby app's data needs); volume
+snapshots (need the `VOLUMES` permission and a stopped database to be
+consistent; `pg_dump` is consistent while the app runs).
+
+### How backups work (5.2, 2026-11-04)
+
+**What:** the details behind the entry above (`internal/backup`).
+- **A job, like a deploy.** Each backup is a row in `backups` and a job of
+  kind `backup` in the existing queue, so it's retried (a dump that fails is
+  likely a database restarting) and survives the platform restarting. The
+  queue's jobs now have a typed input per kind (`deployment_id` or
+  `backup_id`, a check makes exactly one set) and `jobs.Kinds` hands each
+  job to its kind's handler. A unique index allows one backup in progress
+  per app, as for deploys.
+- **The scheduler** checks every 10 minutes for databases with no backup
+  for 24 hours (a failed one counts, so a failing backup is tried once a day,
+  each try with its retries) and queues one each.
+- **The dump runs in a short-lived container:** `postgres:18.6` (its
+  `pg_dump` matches the server's version), on the app's database network,
+  as `BACKUP_UID:BACKUP_GID` so the files are the owner's, with its inputs as
+  env vars (never spliced into the script). It writes to a hidden partial
+  file and renames it when complete, so a cut-off dump never looks like a
+  backup, then deletes all but the newest 7. The container is removed
+  however the attempt ends: it holds the password in its env.
+- **The platform never names a host path.** Compose defines the
+  `platform-backups` volume as a bind of `BACKUP_DIR`; the platform hands
+  that volume to backup containers by name. It's mounted into the platform
+  read-only too (compose only creates a volume a service uses), and the
+  platform checks each dump's size there, which proves the file landed
+  where the owner will look.
+- **Restoring runs inside the database's container** (`docker exec ...
+  pg_restore`): Postgres trusts its local socket there, so the password,
+  which is never shown, isn't needed.
+- The reconciler leaves backup containers to their job.
+
+**Alternatives:** the platform running `pg_dump` itself (its image is
+distroless, and it would need to reach every app's database network); a
+cron container in compose (outside the queue: no retries, no record, no
+"Back up now"); writing dumps through the platform (a second copy of every
+byte through a 128 MiB container).
+
+### The platform owns Caddy's `apps.http.metrics`
+
+**What:** besides its `apps` server, the platform sets one more piece of
+Caddy's config: `apps.http.metrics`, with `per_host` on, so Caddy counts
+requests per hostname. The reconciler keeps it on (it only writes if it's
+off).
+**Why:** per-host counts are how each app's traffic is told apart, and
+Caddy only offers them at this level: the per-server `metrics` setting,
+inside the platform's own server, still works but is deprecated, with a
+warning on every config load. Caddy gives a host its own series only if a
+route matches it, so a made-up `Host` header can't grow its memory.
+**Alternatives:** the deprecated per-server setting (works today, a warning
+every load, gone some day); counting in the apps (each app's own job, and
+apps the platform doesn't control); access logs (parsing every request's
+log line for a count).
+
+### Request metrics in memory, 24 hours
+
+**What:** the platform reads Caddy's metrics every minute and keeps, per
+app, 24 hours of requests per minute, 5xx responses and the p95 response
+time, in memory. They reset when the platform restarts.
+**Why:** they matter mostly "now" and "since this morning"; keeping them
+would need a table, writes every minute and pruning. The dashboard's own
+CPU and memory history works the same way.
+**Alternatives:** Postgres (durable, for numbers that don't need to be);
+Prometheus and Grafana (two more services for one chart).
+
+### How per-app metrics work (5.3, 2026-11-04)
+
+**What:** the details behind the two entries above.
+- **CPU and memory come from the dashboard,** which already samples every
+  container. It also records a series per platform app, keyed by the
+  container's `ops.platform.app` label and summing the app's own containers
+  (not its database or a backup): during a deploy it briefly has two, and
+  both are its usage. An app's container is renamed with every deploy, so
+  only the app's series carries on across them. `/api/history` returns
+  these under `apps`.
+- **Requests come from Caddy's request-duration histogram,** whose counts
+  by status code give requests and 5xx, and whose buckets give the p95,
+  estimated like Prometheus's `histogram_quantile` (linear within the
+  bucket). A small parser reads the few lines needed from Caddy's
+  Prometheus text output, rather than taking on Prometheus's library.
+- **Running totals become per-minute numbers:** each reading's difference
+  from the last. The first reading after the platform starts is only a
+  baseline. A total lower than before means Caddy restarted; the new total
+  is then all there is. A minute with no reading (Caddy or the platform
+  down) is a gap, never a zero.
+- **Health probes don't count:** they use their own probe hostnames.
+
+### Public traffic gets a Caddy server of its own
+
+**What:** Caddy has two servers, both the platform's: `apps` on :80 (the
+tailnet's, published on the Tailscale IP) and `public` on :8080, which
+only `cloudflared` reaches, over a `tunnel` network it shares with Caddy
+alone. The public server has public apps' routes and the webhook's, then a
+404 for anything else. The tailnet server's first route answers 403 to any
+request from the tunnel network's subnet (fixed, `10.203.0.8/29`).
+**Why:** what the internet can reach should be decided by the platform's
+database, not by settings in Cloudflare's dashboard. Routes there are
+easy to get wrong (`caddy:80` instead of `caddy:8080`, a hostname that
+shouldn't be there), and with one server, a wrong route or a forged `Host`
+could reach a tailnet-only app. With two, the tunnel can only ever reach
+routes the platform made public. `cloudflared` can connect to every port
+Caddy listens on, hence the 403 on the tailnet server too; a fixed subnet
+is what makes that rule possible. Unknown hosts get an explicit 404,
+because Caddy otherwise answers an unmatched request with an empty 200.
+**Alternatives:** one server with public hosts added to it (a misrouted
+tunnel serves everything); `cloudflared` on the apps network, straight to
+containers (no Caddy routing, metrics or drain, and the tunnel next to
+every app); filtering by hostname in Cloudflare only (the protection would
+live outside the repo).
+
+### Public is opt-in, per app, as a name under one domain
+
+**What:** an app is public only once it's given a public name on its page,
+one DNS label such as `api`, and is then served at
+`<name>.<PUBLIC_DOMAIN>`. The database stores the name, not the hostname:
+unique, lowercase, one label, `hooks` reserved. Clearing it makes the app
+tailnet-only again. The routes change at once (the API applies them, the
+reconciler would within 10s).
+**Why:** exposing something to the internet should be a deliberate act
+for each app. Storing only the label lets the domain change in one place
+(`PUBLIC_DOMAIN`). One level keeps every name under Cloudflare's free
+certificate, which covers `*.sashasagebd.com` but not deeper.
+**Alternatives:** every app public at `<app name>.<domain>` (exposes apps
+by default); a free-form hostname per app (other domains, deeper names
+the certificate doesn't cover, and the database would have to vet them).
+
+### The webhook moves to the tunnel; Funnel and the published port go
+
+**What:** GitHub's webhook arrives at `hooks.<PUBLIC_DOMAIN>`, which
+Caddy's public server sends to the platform's webhook listener (`:8082`,
+reached over `caddy-admin`, which Caddy and the platform already share).
+The listener's `127.0.0.1:8082` port is no longer published, Tailscale
+Funnel is turned off, and the platform publishes no ports at all again.
+**Why:** with a domain, P2's stopgap isn't needed, and one way in from the
+internet is simpler to reason about than two. The webhook keeps its own
+listener, so `hooks.` still serves nothing but `POST /webhooks/github`.
+**Alternatives:** keep Funnel for the webhook (a second public entry point
+for no gain); route `hooks.` in Cloudflare straight to the platform (it
+would have to join the tunnel network, where its API also listens).
+
+### A remotely managed tunnel, behind a compose profile
+
+**What:** the tunnel is created in Cloudflare's dashboard, and
+`cloudflared` runs it from its token alone (`CLOUDFLARE_TUNNEL_TOKEN`);
+its routes are set in the dashboard, ideally one wildcard
+(`*.<domain>` → `http://caddy:8080`) so making an app public needs no
+Cloudflare change. The service only starts with `COMPOSE_PROFILES=tunnel`.
+**Why:** a token is one secret in `.env`; a locally managed tunnel needs a
+CLI login on the server, a credentials file and a config file. Since what
+the tunnel can reach is fixed by the networks and Caddy's public server,
+the routes kept in Cloudflare can't widen it. The profile keeps CI (no
+token) and a fresh clone working without a tunnel.
+**Alternatives:** a locally managed tunnel with its ingress rules in the
+repo (more files and a login, for routes that can't do harm anyway); a
+`cloudflared` quick tunnel (a random URL).
+
+### How public hostnames work (5.4, 2026-11-04)
+
+**What:** the details behind the entries above.
+- **One PATCH, both servers:** `router.Apply` replaces
+  `/config/apps/http/servers` whole, so the tailnet and public tables
+  always change together. `Routes` reads both back; a missing server, a
+  public server without its closing 404, or a tailnet server without its
+  guard reads as a route nothing wants, so the reconciler re-applies.
+- **The route table:** each live app's tailnet route, plus a public route
+  to the same container if it has a public name and `PUBLIC_DOMAIN` is set,
+  plus `hooks.<domain>` → `platform:8082` if the webhook is on. Probe
+  routes stay tailnet-only. Draining works for both: Caddy counts in-flight
+  requests per upstream, whichever server they came through.
+- **Metrics per app, not per host:** the collector takes each host's
+  difference from its own running totals, then adds hosts up per app
+  (looked up every minute), histogram buckets included, so an app's p95
+  covers its tailnet and public requests together. Hosts that aren't an
+  app's (probes, `hooks.`) aren't kept. Renaming an app's public name keeps
+  its history.
+- **`PUBLIC_DOMAIN` must differ from `APPS_DOMAIN`,** or a public and a
+  tailnet hostname could be the same name on two servers.
+- **`cloudflared` runs read-only, with no capabilities, on two networks:**
+  `tunnel` (internal, with Caddy) and `tunnel-egress` (its own way out to
+  Cloudflare, which nothing else joins). CI can't run it (no token), so it
+  sends requests to Caddy's public server from a container on the tunnel
+  network, and checks what that network can't reach.

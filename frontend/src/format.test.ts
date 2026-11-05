@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Container } from './api'
-import { formatBytes, formatCPU, formatDuration, uptimeText, usagePercent } from './format'
+import { formatBytes, formatCPU, formatDuration, formatFileSize, uptimeText, usagePercent } from './format'
 
 const SECOND = 1000
 const MINUTE = 60 * SECOND
@@ -81,6 +81,18 @@ describe('formatBytes', () => {
     [2_000_398_934_016, '1.8 TiB'], // a "2 TB" disk
   ])('%s is %s', (bytes, want) => {
     expect(formatBytes(bytes)).toBe(want)
+  })
+})
+
+describe('formatFileSize', () => {
+  it.each([
+    [0, '0 B'],
+    [900, '900 B'],
+    [2048, '2.0 KiB'],
+    [3_670_016, '3.5 MiB'],
+    [5_418_610_688, '5.0 GiB'],
+  ])('%s is %s', (bytes, want) => {
+    expect(formatFileSize(bytes)).toBe(want)
   })
 })
 

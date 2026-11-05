@@ -24,13 +24,16 @@ const (
 
 // RunSpec is what the platform runs for one deployment of an app.
 type RunSpec struct {
-	Name        string // container name, unique per deployment
-	Image       string
-	Env         map[string]string
-	Labels      map[string]string // LabelManaged is added automatically
-	Network     string            // the only network it joins
-	MemoryBytes int64
-	NanoCPUs    int64 // 1e9 = one core
+	Name    string // container name, unique per deployment
+	Image   string
+	Env     map[string]string
+	Labels  map[string]string // LabelManaged is added automatically
+	Network string            // the network Caddy reaches it on
+	// Others it joins too: its app's database network, if it has a
+	// database. Never networks outside the platform's.
+	ExtraNetworks []string
+	MemoryBytes   int64
+	NanoCPUs      int64 // 1e9 = one core
 }
 
 // Limits every app container gets regardless of its spec.
@@ -56,6 +59,7 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) (string, error) {
 		labels = map[string]string{}
 	}
 	labels[LabelManaged] = "true"
+	labels[LabelRole] = RoleApp
 
 	pids := int64(pidsLimit)
 	stopTimeout := stopTimeoutSeconds
@@ -89,7 +93,7 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) (string, error) {
 			},
 		},
 		NetworkingConfig: &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{spec.Network: {}},
+			EndpointsConfig: endpoints(spec.Network, spec.ExtraNetworks),
 		},
 	})
 	if err != nil {
@@ -155,6 +159,16 @@ func envList(env map[string]string) []string {
 	out := make([]string, 0, len(env))
 	for _, k := range slices.Sorted(maps.Keys(env)) {
 		out = append(out, k+"="+env[k])
+	}
+	return out
+}
+
+// endpoints is the networks a container joins, all at creation (Docker API
+// 1.44 and later), so it never runs on one without the others.
+func endpoints(primary string, extra []string) map[string]*network.EndpointSettings {
+	out := map[string]*network.EndpointSettings{primary: {}}
+	for _, n := range extra {
+		out[n] = &network.EndpointSettings{}
 	}
 	return out
 }

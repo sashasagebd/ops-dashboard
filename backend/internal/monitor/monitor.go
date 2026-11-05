@@ -208,8 +208,24 @@ func historySample(s *HostStatus) *history.HostSample {
 	}
 }
 
+// The deploy platform's labels, as it puts them on its containers (see
+// backend/internal/engine). Only read here: the dashboard and the platform
+// share no code beyond these names.
+const (
+	platformAppLabel  = "ops.platform.app"
+	platformRoleLabel = "ops.platform.role"
+)
+
+// AppSeriesPrefix starts the history key of a platform app's series:
+// "app:hello". An app's container is renamed with every deploy
+// (app-hello-16), so its own series would break at each one; the app's
+// series carries on.
+const AppSeriesPrefix = "app:"
+
 func historySamples(statuses []ContainerStatus) []history.ContainerSample {
 	samples := make([]history.ContainerSample, 0, len(statuses))
+	apps := map[string]*history.ContainerSample{}
+	var order []string
 	for _, s := range statuses {
 		samples = append(samples, history.ContainerSample{
 			Name:       s.Name,
@@ -218,6 +234,32 @@ func historySamples(statuses []ContainerStatus) []history.ContainerSample {
 			HasMemory:  s.HasStats,
 			MemoryUsed: s.MemoryUsed,
 		})
+
+		// A platform app's own containers (not its database or a backup)
+		// are summed into the app's series: during a deploy it briefly has
+		// two, and both are its usage.
+		app := s.Labels[platformAppLabel]
+		role := s.Labels[platformRoleLabel]
+		if app == "" || (role != "" && role != "app") {
+			continue
+		}
+		a, ok := apps[app]
+		if !ok {
+			a = &history.ContainerSample{Name: AppSeriesPrefix + app}
+			apps[app] = a
+			order = append(order, app)
+		}
+		if s.HasCPU {
+			a.HasCPU = true
+			a.CPUPercent += s.CPUPercent
+		}
+		if s.HasStats {
+			a.HasMemory = true
+			a.MemoryUsed += s.MemoryUsed
+		}
+	}
+	for _, app := range order {
+		samples = append(samples, *apps[app])
 	}
 	return samples
 }

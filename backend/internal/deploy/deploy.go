@@ -54,6 +54,7 @@ type Store interface {
 	CreateRollback(ctx context.Context, appID, targetID int64) (store.Deployment, error)
 	StartRollback(ctx context.Context, id int64) error
 	KeptImages(ctx context.Context, appID int64) ([]string, error)
+	Database(ctx context.Context, appID int64) (store.Database, error)
 }
 
 type Source interface {
@@ -69,6 +70,9 @@ type Engine interface {
 	AppImages(ctx context.Context, app string) ([]engine.Image, error)
 	ImageExists(ctx context.Context, ref string) (bool, error)
 	RemoveImage(ctx context.Context, ref string) error
+	EnsureNetwork(ctx context.Context, name string, labels map[string]string) error
+	Pull(ctx context.Context, ref string) error
+	RunDatabase(ctx context.Context, spec engine.DatabaseSpec) (string, error)
 }
 
 type Router interface {
@@ -76,6 +80,7 @@ type Router interface {
 	Probe(ctx context.Context, host, path string) (int, error)
 	InFlight(ctx context.Context) (map[string]int, error)
 	Routes(ctx context.Context) ([]router.Route, error)
+	SyncMetrics(ctx context.Context) (changed bool, err error)
 }
 
 // Config holds the deployer's settings.
@@ -86,6 +91,28 @@ type Config struct {
 	HealthInterval time.Duration // time between health probes
 	DrainTimeout   time.Duration // how long the old version gets to finish its requests after the switch
 	DrainInterval  time.Duration // time between checks that it has
+
+	// PublicDomain, if set, is where public apps are served on the internet
+	// (through Cloudflare's tunnel): <public name>.<PublicDomain>. Empty:
+	// no app is public.
+	PublicDomain string
+	// WebhookUpstream, if set with PublicDomain, is the platform's webhook
+	// listener as Caddy reaches it (e.g. "platform:8082"), routed publicly
+	// at WebhookHost.
+	WebhookUpstream string
+}
+
+// WebhookHost is the GitHub webhook's public hostname under domain. The
+// database reserves its first label, so no app can take it.
+func WebhookHost(domain string) string { return "hooks." + domain }
+
+// PublicHost is an app's public hostname, or "" if it isn't public (or
+// nothing is: no domain).
+func PublicHost(publicName, domain string) string {
+	if publicName == "" || domain == "" {
+		return ""
+	}
+	return publicName + "." + domain
 }
 
 // Deployer queues deployments and runs them as jobs.
@@ -337,7 +364,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 			return err
 		}
 		d.pruneImages(ctx, log, out, app)
-		out.Printf("Live at http://%s/", app.Hostname)
+		d.printLive(out, app)
 		return nil
 	default:
 		// Finished some other way (superseded by a later deploy, or failed
@@ -358,14 +385,18 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 	}
 
 	// Start the new container next to the old one, which keeps serving.
-	env, err := d.store.EnvVars(ctx, app.ID)
+	env, networks, err := d.appEnv(ctx, app)
 	if err != nil {
 		return err
 	}
 	name := ContainerName(app.Name, dep.ID)
-	out.Printf("Starting container %s (%d MiB memory, %g CPU, %d env vars)",
-		name, app.MemoryLimitBytes>>20, float64(app.CPULimitMillicores)/1000, len(env))
-	containerID, err := d.engine.Run(ctx, d.runSpec(app, dep.ID, tag, env))
+	withDB := ""
+	if len(networks) > 0 {
+		withDB = ", and its database as DATABASE_URL"
+	}
+	out.Printf("Starting container %s (%d MiB memory, %g CPU, %d env vars%s)",
+		name, app.MemoryLimitBytes>>20, float64(app.CPULimitMillicores)/1000, len(env), withDB)
+	containerID, err := d.engine.Run(ctx, d.runSpec(app, dep.ID, tag, env, networks))
 	if err != nil {
 		return err
 	}
@@ -405,7 +436,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 	}
 	d.pruneImages(ctx, log, out, app)
 	log.Info("deploy finished: healthy")
-	out.Printf("Live at http://%s/", app.Hostname)
+	d.printLive(out, app)
 	return nil
 }
 
@@ -467,6 +498,14 @@ func (d *Deployer) reuseImage(ctx context.Context, out *deployLog, dep store.Dep
 	}
 	out.Printf("Using image %s (no build)", dep.ImageTag)
 	return dep.ImageTag, nil
+}
+
+// printLive ends a deploy's log with where the app is served now.
+func (d *Deployer) printLive(out *deployLog, app store.App) {
+	out.Printf("Live at http://%s/", app.Hostname)
+	if host := PublicHost(app.PublicName, d.cfg.PublicDomain); host != "" {
+		out.Printf("Public at https://%s/", host)
+	}
 }
 
 // pruneImages removes the app's images that are no longer kept: the platform
@@ -651,19 +690,35 @@ func (d *Deployer) SyncRoutes(ctx context.Context) (changed bool, err error) {
 	return true, d.router.Apply(ctx, want)
 }
 
+// SyncMetrics makes sure Caddy counts requests per host (for the dashboard's
+// request metrics), for the reconciler. Under the same lock as route
+// updates: both change Caddy's config.
+func (d *Deployer) SyncMetrics(ctx context.Context) (changed bool, err error) {
+	d.applyMu.Lock()
+	defer d.applyMu.Unlock()
+	return d.router.SyncMetrics(ctx)
+}
+
 // routeTable is what Caddy should route: every app's hostname to its live
-// deployment's container, plus any probe routes for deployments being
-// checked.
+// deployment's container (and its public hostname too, for a public app),
+// the webhook's public hostname to the platform, plus any probe routes for
+// deployments being checked (tailnet only).
 func (d *Deployer) routeTable(ctx context.Context) ([]router.Route, error) {
 	live, err := d.store.LiveApps(ctx)
 	if err != nil {
 		return nil, err
 	}
-	routes := make([]router.Route, 0, len(live))
+	routes := make([]router.Route, 0, len(live)+1)
 	for _, a := range live {
+		upstream := ContainerName(a.AppName, a.DeploymentID) + ":" + strconv.Itoa(a.Port)
+		routes = append(routes, router.Route{Host: a.Hostname, Upstream: upstream})
+		if host := PublicHost(a.PublicName, d.cfg.PublicDomain); host != "" {
+			routes = append(routes, router.Route{Host: host, Upstream: upstream, Public: true})
+		}
+	}
+	if d.cfg.PublicDomain != "" && d.cfg.WebhookUpstream != "" {
 		routes = append(routes, router.Route{
-			Host:     a.Hostname,
-			Upstream: ContainerName(a.AppName, a.DeploymentID) + ":" + strconv.Itoa(a.Port),
+			Host: WebhookHost(d.cfg.PublicDomain), Upstream: d.cfg.WebhookUpstream, Public: true,
 		})
 	}
 	d.mu.Lock()
@@ -705,15 +760,16 @@ func deploymentLabels(app store.App, deploymentID int64) map[string]string {
 
 // runSpec is the container a deployment runs as, the same whether a deploy
 // starts it or the reconciler recreates it.
-func (d *Deployer) runSpec(app store.App, deploymentID int64, image string, env map[string]string) engine.RunSpec {
+func (d *Deployer) runSpec(app store.App, deploymentID int64, image string, env map[string]string, networks []string) engine.RunSpec {
 	return engine.RunSpec{
-		Name:        ContainerName(app.Name, deploymentID),
-		Image:       image,
-		Env:         env,
-		Labels:      deploymentLabels(app, deploymentID),
-		Network:     d.cfg.AppsNetwork,
-		MemoryBytes: app.MemoryLimitBytes,
-		NanoCPUs:    int64(app.CPULimitMillicores) * 1_000_000,
+		Name:          ContainerName(app.Name, deploymentID),
+		Image:         image,
+		Env:           env,
+		Labels:        deploymentLabels(app, deploymentID),
+		Network:       d.cfg.AppsNetwork,
+		ExtraNetworks: networks,
+		MemoryBytes:   app.MemoryLimitBytes,
+		NanoCPUs:      int64(app.CPULimitMillicores) * 1_000_000,
 	}
 }
 
@@ -734,11 +790,11 @@ func (d *Deployer) Recreate(ctx context.Context, app store.App, dep store.Deploy
 	if !ok {
 		return ErrImageGone
 	}
-	env, err := d.store.EnvVars(ctx, app.ID)
+	env, networks, err := d.appEnv(ctx, app)
 	if err != nil {
 		return err
 	}
-	_, err = d.engine.Run(ctx, d.runSpec(app, dep.ID, dep.ImageTag, env))
+	_, err = d.engine.Run(ctx, d.runSpec(app, dep.ID, dep.ImageTag, env, networks))
 	return err
 }
 
@@ -969,4 +1025,93 @@ func (s *streamReader) Err() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.err
+}
+
+// An app's database: its container, volume and network all share one name,
+// derived from the app's, so none needs storing.
+
+// DatabaseImage is what every app database runs: pinned, like the platform's
+// own Postgres.
+const DatabaseImage = "postgres:18.6"
+
+// databaseMemoryBytes caps an app database's memory. Postgres's defaults
+// (128 MiB of shared buffers) fit well inside it.
+const databaseMemoryBytes = 256 << 20
+
+// The database user and database name inside an app's Postgres. Each app has
+// a Postgres of its own, so they needn't vary.
+const (
+	DatabaseUser = "app"
+	DatabaseDB   = "app"
+)
+
+// DatabaseName is an app's database container, its data volume and its
+// network, e.g. ops-db-hello. It's also the database's hostname.
+func DatabaseName(app string) string { return "ops-db-" + app }
+
+// DatabaseURL is how an app reaches its database, given as DATABASE_URL. No
+// TLS: the connection never leaves the app's own internal network.
+func DatabaseURL(app, password string) string {
+	return "postgres://" + DatabaseUser + ":" + password + "@" + DatabaseName(app) + ":5432/" + DatabaseDB + "?sslmode=disable"
+}
+
+// appEnv is what an app's container starts with: its env vars and, if the app
+// has a database, DATABASE_URL and the database's network to join (made sure
+// to exist first, as a deploy can come before the reconciler has created the
+// database). The platform's DATABASE_URL replaces an env var of that name.
+func (d *Deployer) appEnv(ctx context.Context, app store.App) (env map[string]string, networks []string, err error) {
+	env, err = d.store.EnvVars(ctx, app.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	db, err := d.store.Database(ctx, app.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return env, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	name := DatabaseName(app.Name)
+	if err := d.engine.EnsureNetwork(ctx, name, databaseLabels(app)); err != nil {
+		return nil, nil, err
+	}
+	env["DATABASE_URL"] = DatabaseURL(app.Name, db.Password)
+	return env, []string{name}, nil
+}
+
+func databaseLabels(app store.App) map[string]string {
+	return map[string]string{
+		engine.LabelApp:   app.Name,
+		engine.LabelAppID: strconv.FormatInt(app.ID, 10),
+	}
+}
+
+// RunDatabase creates and starts an app's database container, for the
+// reconciler (which holds the app's lock): its network first, then its
+// image, pulled if Docker doesn't have it. Its data is on the volume of the
+// same name, so a container created again finds the data of the one before.
+func (d *Deployer) RunDatabase(ctx context.Context, app store.App, db store.Database) error {
+	name := DatabaseName(app.Name)
+	if err := d.engine.EnsureNetwork(ctx, name, databaseLabels(app)); err != nil {
+		return err
+	}
+	if err := d.engine.Pull(ctx, DatabaseImage); err != nil {
+		return err
+	}
+	_, err := d.engine.RunDatabase(ctx, engine.DatabaseSpec{
+		Name:  name,
+		Image: DatabaseImage,
+		// Read by the image only when the volume is first initialised; a
+		// recreated container keeps the data, and the password, it finds.
+		Env: map[string]string{
+			"POSTGRES_USER":     DatabaseUser,
+			"POSTGRES_PASSWORD": db.Password,
+			"POSTGRES_DB":       DatabaseDB,
+		},
+		Labels:      databaseLabels(app),
+		Network:     name,
+		Volume:      name,
+		MemoryBytes: databaseMemoryBytes,
+	})
+	return err
 }

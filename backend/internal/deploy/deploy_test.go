@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -64,8 +65,11 @@ type fakes struct {
 	imageMissing bool           // ImageExists says no
 	imageInUse   map[string]bool
 
-	caddyRoutes []router.Route // what Routes reports Caddy has
-	onRun       func()         // hook, called as Run starts a container
+	caddyRoutes []router.Route      // what Routes reports Caddy has
+	database    *store.Database     // the app's database, if it has one
+	dbSpec      engine.DatabaseSpec // what RunDatabase was asked for
+	userEnv     map[string]string   // EnvVars' answer, if set
+	onRun       func()              // hook, called as Run starts a container
 }
 
 func newFakes() *fakes {
@@ -188,7 +192,33 @@ func (f *fakes) MarkFailed(_ context.Context, id int64, reason string) error {
 }
 
 func (f *fakes) EnvVars(context.Context, int64) (map[string]string, error) {
+	if f.userEnv != nil {
+		return maps.Clone(f.userEnv), nil
+	}
 	return map[string]string{"TOKEN": "s3cret"}, nil
+}
+
+func (f *fakes) Database(context.Context, int64) (store.Database, error) {
+	if f.database == nil {
+		return store.Database{}, store.ErrNotFound
+	}
+	return *f.database, nil
+}
+
+func (f *fakes) EnsureNetwork(_ context.Context, name string, _ map[string]string) error {
+	f.event("network %s", name)
+	return nil
+}
+
+func (f *fakes) Pull(_ context.Context, ref string) error {
+	f.event("pull %s", ref)
+	return nil
+}
+
+func (f *fakes) RunDatabase(_ context.Context, spec engine.DatabaseSpec) (string, error) {
+	f.event("run database %s", spec.Name)
+	f.dbSpec = spec
+	return "db", nil
 }
 
 func (f *fakes) LiveApps(context.Context) ([]store.LiveApp, error) {
@@ -197,7 +227,8 @@ func (f *fakes) LiveApps(context.Context) ([]store.LiveApp, error) {
 	var live []store.LiveApp
 	for id, s := range f.statuses {
 		if s == store.StatusHealthy {
-			live = append(live, store.LiveApp{AppName: f.app.Name, Hostname: "hello.apps.test", Port: f.app.Port, DeploymentID: id})
+			live = append(live, store.LiveApp{AppName: f.app.Name, Hostname: "hello.apps.test", PublicName: f.app.PublicName,
+				Port: f.app.Port, DeploymentID: id})
 		}
 	}
 	return live, nil
@@ -344,6 +375,8 @@ func (f *fakes) Routes(context.Context) ([]router.Route, error) {
 	defer f.mu.Unlock()
 	return slices.Clone(f.caddyRoutes), nil
 }
+
+func (f *fakes) SyncMetrics(context.Context) (bool, error) { return false, nil }
 
 func (f *fakes) Probe(context.Context, string, string) (int, error) {
 	f.mu.Lock()
@@ -797,6 +830,39 @@ func TestSyncRoutesAppliesOnlyWhenCaddyDiffers(t *testing.T) {
 	}
 }
 
+func TestRouteTableWithPublicHostnames(t *testing.T) {
+	tailnet := router.Route{Host: "hello.apps.test", Upstream: "app-hello-6:8080"}
+	public := router.Route{Host: "hi.example.com", Upstream: "app-hello-6:8080", Public: true}
+	hooks := router.Route{Host: "hooks.example.com", Upstream: "platform:8082", Public: true}
+	tests := []struct {
+		name               string
+		publicName, domain string
+		webhook            string
+		want               []router.Route
+	}{
+		{name: "tailnet only", domain: "example.com", want: []router.Route{tailnet}},
+		{name: "public", publicName: "hi", domain: "example.com", want: []router.Route{tailnet, public}},
+		{name: "public, webhook too", publicName: "hi", domain: "example.com", webhook: "platform:8082",
+			want: []router.Route{tailnet, public, hooks}},
+		// No domain configured: nothing is public, whatever the database says.
+		{name: "no domain", publicName: "hi", webhook: "platform:8082", want: []router.Route{tailnet}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakes() // deployment 6 is live
+			f.app.PublicName = tt.publicName
+			d := f.deployer()
+			d.cfg.PublicDomain, d.cfg.WebhookUpstream = tt.domain, tt.webhook
+			if err := d.ApplyRoutes(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(f.applies[0], tt.want) {
+				t.Errorf("applied %+v, want %+v", f.applies[0], tt.want)
+			}
+		})
+	}
+}
+
 func TestRecreateRunsTheLiveDeploymentAgain(t *testing.T) {
 	f := newFakes()
 	d := f.deployer()
@@ -1184,5 +1250,74 @@ func TestStartLatest(t *testing.T) {
 	f.latest = ""
 	if _, err := f.deployer().StartLatest(t.Context(), 1); !errors.Is(err, source.ErrBranchNotFound) {
 		t.Errorf("unknown branch: error = %v, want ErrBranchNotFound", err)
+	}
+}
+
+func TestDeployWithADatabase(t *testing.T) {
+	f := newFakes()
+	f.database = &store.Database{AppID: 1, Password: "pw0123"}
+	// The user's own DATABASE_URL gives way to the platform's.
+	f.userEnv = map[string]string{"TOKEN": "s3cret", "DATABASE_URL": "postgres://elsewhere"}
+	if _, err := deploy(t, f, t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	spec := f.runSpec
+	if spec.Env["DATABASE_URL"] != "postgres://app:pw0123@ops-db-hello:5432/app?sslmode=disable" || spec.Env["TOKEN"] != "s3cret" {
+		t.Errorf("env = %v, want the platform's DATABASE_URL and the app's own vars", spec.Env)
+	}
+	// On Caddy's network, and on its database's, made sure to exist first.
+	if spec.Network != "platform-apps" || !slices.Equal(spec.ExtraNetworks, []string{"ops-db-hello"}) {
+		t.Errorf("networks = %q + %v", spec.Network, spec.ExtraNetworks)
+	}
+	if i, j := slices.Index(f.events, "network ops-db-hello"), slices.Index(f.events, "run app-hello-7"); i < 0 || j < i {
+		t.Errorf("events %q: the network must exist before the container starts", f.events)
+	}
+	// The log says so, and never shows the URL (it has the password).
+	if !slices.Contains(f.logLines, "platform: Starting container app-hello-7 (256 MiB memory, 0.5 CPU, 2 env vars, and its database as DATABASE_URL)") {
+		t.Errorf("log = %q", f.logLines)
+	}
+	for _, l := range f.logLines {
+		if strings.Contains(l, "pw0123") {
+			t.Errorf("log line %q contains the database password", l)
+		}
+	}
+}
+
+func TestDeployWithoutADatabaseJoinsNothingElse(t *testing.T) {
+	f := newFakes()
+	if _, err := deploy(t, f, t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.runSpec.ExtraNetworks) != 0 || f.runSpec.Env["DATABASE_URL"] != "" {
+		t.Errorf("spec = %+v, want no database network or URL", f.runSpec)
+	}
+}
+
+func TestRecreateKeepsTheDatabase(t *testing.T) {
+	f := newFakes()
+	f.database = &store.Database{AppID: 1, Password: "pw"}
+	live := store.Deployment{ID: 6, AppID: 1, Status: store.StatusHealthy, ImageTag: "ops-platform/hello:" + sha}
+	if err := f.deployer().Recreate(t.Context(), f.app, live); err != nil {
+		t.Fatal(err)
+	}
+	if f.runSpec.Env["DATABASE_URL"] == "" || len(f.runSpec.ExtraNetworks) != 1 {
+		t.Errorf("recreated spec = %+v, want its database too", f.runSpec)
+	}
+}
+
+func TestRunDatabase(t *testing.T) {
+	f := newFakes()
+	db := store.Database{AppID: 1, Password: "pw0123"}
+	if err := f.deployer().RunDatabase(t.Context(), f.app, db); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.events, []string{"network ops-db-hello", "pull postgres:18.6", "run database ops-db-hello"}) {
+		t.Errorf("events = %q, want network, image, then the container", f.events)
+	}
+	spec := f.dbSpec
+	if spec.Image != "postgres:18.6" || spec.Network != "ops-db-hello" || spec.Volume != "ops-db-hello" ||
+		spec.Env["POSTGRES_PASSWORD"] != "pw0123" || spec.Env["POSTGRES_USER"] != "app" || spec.Env["POSTGRES_DB"] != "app" ||
+		spec.Labels[engine.LabelApp] != "hello" || spec.MemoryBytes != 256<<20 {
+		t.Errorf("database spec = %+v", spec)
 	}
 }

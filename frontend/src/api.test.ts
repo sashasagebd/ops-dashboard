@@ -27,6 +27,7 @@ describe('fetchHistory', () => {
       stepSeconds: 60,
       host: { cpuPercent: [null, 12.35], cpuPercentMax: [null, 80], memoryBytes: [1, null], diskUsedBytes: [5, 5] },
       containers: { mc: { cpuPercent: [1.5, null], cpuPercentMax: [3, null], memoryBytes: [100, 200] } },
+      apps: {},
     }
     const fetchMock = stubFetch(200, body)
     const controller = new AbortController()

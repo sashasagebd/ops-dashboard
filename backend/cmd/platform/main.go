@@ -18,15 +18,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/api"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/backup"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/deploy"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/healthcheck"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/jobs"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/metrics"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/reconcile"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/router"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/secrets"
@@ -75,6 +78,20 @@ func run(addr string) error {
 	webhookSecret := os.Getenv("GITHUB_WEBHOOK_SECRET")
 	if webhookSecret != "" && len(webhookSecret) < 32 {
 		return errors.New("GITHUB_WEBHOOK_SECRET: use at least 32 characters (e.g. openssl rand -hex 32)")
+	}
+	// Public hostnames, through Cloudflare's tunnel: apps made public are
+	// served at <public name>.<PUBLIC_DOMAIN>, and the webhook at
+	// hooks.<PUBLIC_DOMAIN>. Off unless set.
+	publicDomain := strings.ToLower(strings.TrimSuffix(os.Getenv("PUBLIC_DOMAIN"), "."))
+	if publicDomain != "" && publicDomain == strings.ToLower(appsDomain) {
+		// A public and a tailnet hostname could then be the same name, on
+		// two Caddy servers that must never share one.
+		return errors.New("PUBLIC_DOMAIN must differ from APPS_DOMAIN")
+	}
+	// The webhook's listener as Caddy reaches it, for hooks.<PUBLIC_DOMAIN>.
+	var webhookUpstream string
+	if webhookSecret != "" {
+		webhookUpstream = envOr("WEBHOOK_UPSTREAM", "platform:8082")
 	}
 
 	// docker stop sends SIGTERM; Ctrl+C sends SIGINT.
@@ -133,6 +150,9 @@ func run(addr string) error {
 		envOr("CADDY_ADMIN_URL", "http://10.203.0.2:2019"),
 		envOr("CADDY_PROXY_URL", "http://10.203.0.2:80"),
 	)
+	// The tunnel network's subnet (compose's tunnel network): Caddy's
+	// tailnet server refuses requests from it.
+	caddy.TunnelSubnet = os.Getenv("TUNNEL_SUBNET")
 	deployer := deploy.New(deploy.Config{
 		AppsNetwork:    envOr("APPS_NETWORK", "platform-apps"),
 		DeployTimeout:  20 * time.Minute,
@@ -140,7 +160,55 @@ func run(addr string) error {
 		HealthInterval: time.Second,
 		DrainTimeout:   15 * time.Second,
 		DrainInterval:  250 * time.Millisecond,
+
+		PublicDomain:    publicDomain,
+		WebhookUpstream: webhookUpstream,
 	}, st, github, dockerClient, caddy)
+	if publicDomain == "" {
+		slog.Info("public hostnames are off: PUBLIC_DOMAIN isn't set")
+	}
+	// Backups of app databases, on when compose gives the platform the backup
+	// volume (BACKUP_VOLUME; the host directory behind it is BACKUP_DIR). It's
+	// mounted read-only at /backups here too, to check each dump landed.
+	var backuper *backup.Backuper
+	if volume := os.Getenv("BACKUP_VOLUME"); volume != "" {
+		backuper = backup.New(backup.Config{
+			Volume: volume,
+			Dir:    envOr("BACKUP_MOUNT", "/backups"),
+			// The owner's uid:gid, so the dumps in ~/backups are theirs.
+			User:       envOr("BACKUP_USER", "1000:1000"),
+			Keep:       7,
+			Every:      24 * time.Hour,
+			CheckEvery: 10 * time.Minute,
+			Timeout:    30 * time.Minute,
+		}, st, dockerClient)
+	} else {
+		slog.Info("backups are off: BACKUP_VOLUME isn't set")
+	}
+	// Apps' request numbers, read from Caddy every minute, 24h kept in
+	// memory.
+	requests := metrics.New(caddy, time.Minute, 24*time.Hour)
+	// Counted per app: its tailnet and public hostnames together.
+	requests.Group = func(ctx context.Context) (map[string]string, error) {
+		apps, err := st.Apps(ctx)
+		if err != nil {
+			return nil, err
+		}
+		group := make(map[string]string, 2*len(apps))
+		for _, a := range apps {
+			group[a.Hostname] = a.Name
+			if host := deploy.PublicHost(a.PublicName, publicDomain); host != "" {
+				group[host] = a.Name
+			}
+		}
+		return group, nil
+	}
+
+	handlers := jobs.Kinds{"deploy": deployer}
+	if backuper != nil {
+		handlers["backup"] = backuper
+	}
+
 	runner := jobs.New(jobs.Config{
 		// Two deploys (of different apps) at once: builds are heavy, and
 		// the game servers share these 4 cores.
@@ -151,8 +219,14 @@ func run(addr string) error {
 		Lease:        30 * time.Second,
 		PollInterval: 5 * time.Second,
 		RetryDelay:   15 * time.Second,
-	}, st, deployer)
+	}, st, handlers)
 	deployer.Notify = runner.Wake
+	// The API's view of backups: nil, not a nil *Backuper, when they're off.
+	var backups api.Backups
+	if backuper != nil {
+		backuper.Notify = runner.Wake
+		backups = backuper
+	}
 	reconciler := reconcile.New(reconcile.Config{
 		Interval:    10 * time.Second,
 		MinBackoff:  10 * time.Second,
@@ -179,6 +253,10 @@ func run(addr string) error {
 		// using the database when it closes.
 		var wg sync.WaitGroup
 		wg.Go(func() { reconciler.Run(ctx) })
+		if backuper != nil {
+			wg.Go(func() { backuper.RunScheduler(ctx) })
+		}
+		wg.Go(func() { requests.Run(ctx) })
 		runner.Run(ctx) // returns at once if ctx is already done
 		wg.Wait()
 	}()
@@ -187,7 +265,7 @@ func run(addr string) error {
 	// platform started up fully.
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: newHandler(api.New(st, deployer, dockerClient, appsDomain)),
+		Handler: newHandler(api.New(st, deployer, dockerClient, backups, requests, appsDomain, publicDomain)),
 		// Without this, a client that sends headers very slowly can hold a
 		// connection open forever (Slowloris).
 		ReadHeaderTimeout: 5 * time.Second,

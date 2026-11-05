@@ -66,6 +66,9 @@ export type HistoryResponse = {
   stepSeconds: number
   host: HostHistory
   containers: Record<string, ContainerHistory> // by container name
+  // The deploy platform's apps, by app name: each sums its containers, which
+  // change name with every deploy.
+  apps: Record<string, ContainerHistory>
 }
 
 // Platform types match the response types in backend/internal/api/api.go,
@@ -107,6 +110,12 @@ export type PlatformApp = {
   nextCommitSha: string | null // a pushed commit waiting for the deploy in progress
   createdAt: string
   currentDeployment: Deployment | null // the live one; null if nothing is live
+  // Public on the internet (through Cloudflare) at <publicName>.<domain>;
+  // both null if tailnet-only. publicHostname is also null while the server
+  // has no public domain set up.
+  publicName: string | null
+  publicHostname: string | null
+  requestsLastHour: number | null // from Caddy, tailnet and public together; null without readings yet
 }
 
 // AppDetail matches appDetailResponse.
@@ -114,6 +123,32 @@ export type AppDetail = PlatformApp & {
   envKeys: string[] // names only: values are write-only
   deployments: Deployment[] // newest first, at most 20
   events: PlatformEvent[] // the reconciler's, newest first, at most 20
+  database: AppDatabase | null // null if the app has none
+  backups: Backup[] // its database's, newest first, at most 7
+  publicDomain: string | null // what a public name goes in front of; null if public hostnames aren't set up
+}
+
+// Backup matches backupResponse: one pg_dump of an app's database, a file in
+// the backup directory under the app's name.
+export type Backup = {
+  id: number
+  status: 'queued' | 'running' | 'done' | 'failed'
+  file: string | null // the dump's name; null until done
+  sizeBytes: number | null // null until done
+  error: string | null // null unless failed
+  createdAt: string
+  finishedAt: string | null
+}
+
+// AppDatabase matches databaseResponse: an app's own Postgres. Its password
+// is never shown; the app gets it inside DATABASE_URL.
+export type AppDatabase = {
+  name: string // its container, volume and network, e.g. ops-db-hello
+  createdAt: string // when it was added
+  // 'creating' until the platform first creates its container, then Docker's
+  // state ('running', 'exited', ...), 'missing' while it's created again, or
+  // 'unknown' if Docker couldn't be asked.
+  state: string
 }
 
 // EventKind is what the reconciler did about something it found wrong.
@@ -124,6 +159,7 @@ export type EventKind =
   | 'removed_orphan' // a container no live deployment uses, removed
   | 'routes_reapplied' // Caddy's routes didn't match, re-applied
   | 'fix_failed' // one of the above, tried and failed
+  | 'database_created' // an app's database created for the first time
 
 // PlatformEvent matches eventResponse.
 export type PlatformEvent = {
@@ -146,6 +182,16 @@ export type NewApp = {
   sourceDir?: string
   memoryLimitBytes?: number
   cpuLimitMillicores?: number
+}
+
+// AppMetrics matches metricsResponse: an app's request numbers, one value
+// per step from start, oldest first, null where there was no reading.
+export type AppMetrics = {
+  start: string
+  stepSeconds: number
+  requests: Series
+  errors: Series // 5xx responses
+  p95Ms: Series // 95th percentile response time; null also with no requests
 }
 
 // LogLine matches logLineResponse: one line of a deploy's log (the
@@ -185,6 +231,11 @@ export function fetchApp(id: number, signal?: AbortSignal): Promise<AppDetail> {
   return getJSON<AppDetail>(`/api/platform/apps/${id}`, signal)
 }
 
+// fetchAppMetrics is an app's request numbers over the last hour or day.
+export function fetchAppMetrics(appId: number, window: HistoryWindow, signal?: AbortSignal): Promise<AppMetrics> {
+  return getJSON<AppMetrics>(`/api/platform/apps/${appId}/metrics?window=${window}`, signal)
+}
+
 // fetchEvents is the reconciler's most recent events, for every app.
 export function fetchEvents(signal?: AbortSignal): Promise<PlatformEvent[]> {
   return getJSON<PlatformEvent[]>('/api/platform/events', signal)
@@ -211,6 +262,23 @@ export function deployLatest(appId: number): Promise<Deployment> {
 // off.
 export function rollback(appId: number, deploymentId: number): Promise<Deployment> {
   return sendJSON<Deployment>('POST', `/api/platform/apps/${appId}/deployments/${deploymentId}/rollback`)
+}
+
+// createDatabase gives the app a Postgres of its own. The platform creates it
+// within seconds; the app gets DATABASE_URL from its next deploy.
+export function createDatabase(appId: number): Promise<AppDatabase> {
+  return sendJSON<AppDatabase>('POST', `/api/platform/apps/${appId}/database`)
+}
+
+// startBackup backs up the app's database now; it runs in the background.
+export function startBackup(appId: number): Promise<Backup> {
+  return sendJSON<Backup>('POST', `/api/platform/apps/${appId}/backups`)
+}
+
+// setPublicName makes the app public at <name>.<publicDomain> at once, or
+// tailnet-only again with ''.
+export function setPublicName(appId: number, publicName: string): Promise<PlatformApp> {
+  return sendJSON<PlatformApp>('PATCH', `/api/platform/apps/${appId}`, { publicName })
 }
 
 export function setAutoDeploy(appId: number, autoDeploy: boolean): Promise<PlatformApp> {

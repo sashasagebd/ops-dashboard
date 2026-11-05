@@ -3,7 +3,10 @@
 # one; BuildKit-only features such as RUN --mount aren't available.
 FROM golang:1.27-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+# Dependencies first (pgx, for /visits), so a code change doesn't download
+# them again: this layer is cached until go.mod or go.sum changes.
+COPY go.mod go.sum ./
+RUN go mod download
 COPY *.go ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /hello .
 

@@ -303,13 +303,30 @@ func TestHistoryBody(t *testing.T) {
 			},
 			want: `{"start":"2026-10-06T12:00:00Z","stepSeconds":60,` +
 				`"host":{"cpuPercent":[null,12.35],"cpuPercentMax":[null,80],"memoryBytes":[1073741825,null],"diskUsedBytes":[53687091200,53687091200]},` +
-				`"containers":{"mc":{"cpuPercent":[1.5,null],"cpuPercentMax":[3,null],"memoryBytes":[100,200]}}}` + "\n",
+				`"containers":{"mc":{"cpuPercent":[1.5,null],"cpuPercentMax":[3,null],"memoryBytes":[100,200]}},"apps":{}}` + "\n",
+		},
+		{
+			// A platform app's series is keyed "app:<name>" in the history;
+			// the response has it under apps, by name, not as a container.
+			name: "platform apps apart from containers",
+			view: history.View{
+				Start: start,
+				Step:  time.Minute,
+				Containers: map[string]history.ContainerHistory{
+					"app-hello-16": {CPU: []history.Point{pt(1, 1)}, Memory: []history.Point{pt(7, 0)}},
+					"app:hello":    {CPU: []history.Point{pt(2, 2)}, Memory: []history.Point{pt(14, 0)}},
+				},
+			},
+			want: `{"start":"2026-10-06T12:00:00Z","stepSeconds":60,` +
+				`"host":{"cpuPercent":[],"cpuPercentMax":[],"memoryBytes":[],"diskUsedBytes":[]},` +
+				`"containers":{"app-hello-16":{"cpuPercent":[1],"cpuPercentMax":[1],"memoryBytes":[7]}},` +
+				`"apps":{"hello":{"cpuPercent":[2],"cpuPercentMax":[2],"memoryBytes":[14]}}}` + "\n",
 		},
 		{
 			name: "no data: empty lists and object, not null",
 			view: history.View{Start: start, Step: time.Minute},
 			want: `{"start":"2026-10-06T12:00:00Z","stepSeconds":60,` +
-				`"host":{"cpuPercent":[],"cpuPercentMax":[],"memoryBytes":[],"diskUsedBytes":[]},"containers":{}}` + "\n",
+				`"host":{"cpuPercent":[],"cpuPercentMax":[],"memoryBytes":[],"diskUsedBytes":[]},"containers":{},"apps":{}}` + "\n",
 		},
 	}
 	for _, tt := range tests {

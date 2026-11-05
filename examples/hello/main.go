@@ -7,7 +7,8 @@
 // them: on SIGTERM it stops taking new connections and finishes the requests
 // it has before exiting. And it can be made to fail on purpose (BROKEN=1),
 // or to answer slowly (/slow), to show a deploy that never goes live and a
-// request that outlives the switch to a new version.
+// request that outlives the switch to a new version. Given a database
+// (DATABASE_URL), /visits counts visits in it.
 package main
 
 import (
@@ -61,6 +62,10 @@ func main() {
 		case <-r.Context().Done():
 		}
 	})
+
+	// /visits counts visits in the app's database, if it has one (see
+	// visits.go).
+	mux.Handle("GET /visits", newVisits(context.Background()))
 
 	srv := &http.Server{Addr: ":8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 

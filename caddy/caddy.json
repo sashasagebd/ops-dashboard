@@ -9,6 +9,13 @@
           "listen": [":80"],
           "routes": [],
           "automatic_https": { "disable": true }
+        },
+        "public": {
+          "listen": [":8080"],
+          "routes": [
+            { "handle": [{ "handler": "static_response", "status_code": 404 }], "terminal": true }
+          ],
+          "automatic_https": { "disable": true }
         }
       }
     }

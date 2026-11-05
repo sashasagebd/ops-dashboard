@@ -5,9 +5,34 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
+
+// sentRoute and sentServer decode an Apply body as Caddy will read it, not
+// through our own structs.
+type sentRoute struct {
+	Match []struct {
+		Host []string `json:"host"`
+	} `json:"match"`
+	Handle []struct {
+		Handler   string `json:"handler"`
+		Upstreams []struct {
+			Dial string `json:"dial"`
+		} `json:"upstreams"`
+		StatusCode int `json:"status_code"`
+	} `json:"handle"`
+	Terminal bool `json:"terminal"`
+}
+
+type sentServer struct {
+	Listen         []string    `json:"listen"`
+	Routes         []sentRoute `json:"routes"`
+	AutomaticHTTPS struct {
+		Disable bool `json:"disable"`
+	} `json:"automatic_https"`
+}
 
 func TestApplyReplacesRoutes(t *testing.T) {
 	var gotMethod, gotPath, gotType string
@@ -21,51 +46,47 @@ func TestApplyReplacesRoutes(t *testing.T) {
 	c := New(srv.URL, "")
 	err := c.Apply(t.Context(), []Route{
 		{Host: "hello.apps.test", Upstream: "app-hello-7:8080"},
+		{Host: "hello.example.com", Upstream: "app-hello-7:8080", Public: true},
 		{Host: "probe-8.platform.internal", Upstream: "app-hello-8:8080"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if gotMethod != http.MethodPatch || gotPath != serverPath || gotType != "application/json" {
-		t.Errorf("request = %s %s (%s), want PATCH %s (application/json)", gotMethod, gotPath, gotType, serverPath)
+	if gotMethod != http.MethodPatch || gotPath != serversPath || gotType != "application/json" {
+		t.Errorf("request = %s %s (%s), want PATCH %s (application/json)", gotMethod, gotPath, gotType, serversPath)
 	}
-	// Checked as Caddy will read it, not against our own structs.
-	var server struct {
-		Listen         []string        `json:"listen"`
-		Routes         json.RawMessage `json:"routes"`
-		AutomaticHTTPS struct {
-			Disable bool `json:"disable"`
-		} `json:"automatic_https"`
-	}
-	if err := json.Unmarshal(gotBody, &server); err != nil {
+	var servers map[string]sentServer
+	if err := json.Unmarshal(gotBody, &servers); err != nil {
 		t.Fatalf("body %s: %v", gotBody, err)
 	}
-	if len(server.Listen) != 1 || server.Listen[0] != ":80" || !server.AutomaticHTTPS.Disable {
-		t.Errorf("server = %s, want listen [:80] and automatic HTTPS off", gotBody)
+	if len(servers) != 2 {
+		t.Fatalf("servers = %s, want apps and public only", gotBody)
 	}
-	var routes []struct {
-		Match []struct {
-			Host []string `json:"host"`
-		} `json:"match"`
-		Handle []struct {
-			Handler   string `json:"handler"`
-			Upstreams []struct {
-				Dial string `json:"dial"`
-			} `json:"upstreams"`
-		} `json:"handle"`
-		Terminal bool `json:"terminal"`
+	tailnet, public := servers["apps"], servers["public"]
+	if len(tailnet.Listen) != 1 || tailnet.Listen[0] != ":80" || !tailnet.AutomaticHTTPS.Disable {
+		t.Errorf("apps server = %+v, want listen [:80] and automatic HTTPS off", tailnet)
 	}
-	if err := json.Unmarshal(server.Routes, &routes); err != nil {
-		t.Fatalf("routes %s: %v", server.Routes, err)
+	if len(public.Listen) != 1 || public.Listen[0] != ":8080" || !public.AutomaticHTTPS.Disable {
+		t.Errorf("public server = %+v, want listen [:8080] and automatic HTTPS off", public)
 	}
-	if len(routes) != 2 {
-		t.Fatalf("got %d routes, want 2: %s", len(routes), gotBody)
+	if len(tailnet.Routes) != 2 {
+		t.Fatalf("apps server has %d routes, want 2: %s", len(tailnet.Routes), gotBody)
 	}
-	r := routes[0]
+	r := tailnet.Routes[0]
 	if r.Match[0].Host[0] != "hello.apps.test" || r.Handle[0].Handler != "reverse_proxy" ||
 		r.Handle[0].Upstreams[0].Dial != "app-hello-7:8080" || !r.Terminal {
 		t.Errorf("first route = %+v", r)
+	}
+	// The public server: the public route, then a 404 for anything else.
+	if len(public.Routes) != 2 {
+		t.Fatalf("public server has %d routes, want 2: %s", len(public.Routes), gotBody)
+	}
+	if r := public.Routes[0]; r.Match[0].Host[0] != "hello.example.com" || r.Handle[0].Upstreams[0].Dial != "app-hello-7:8080" {
+		t.Errorf("public route = %+v", r)
+	}
+	if r := public.Routes[1]; len(r.Match) != 0 || r.Handle[0].Handler != "static_response" || r.Handle[0].StatusCode != 404 || !r.Terminal {
+		t.Errorf("last public route = %+v, want a 404 for every request", r)
 	}
 }
 
@@ -105,7 +126,7 @@ func TestRoutesReadsWhatApplySent(t *testing.T) {
 			saved, _ = io.ReadAll(r.Body)
 			return
 		}
-		if r.URL.Path != serverPath {
+		if r.URL.Path != serversPath {
 			http.Error(w, "wrong path", http.StatusNotFound)
 			return
 		}
@@ -114,35 +135,107 @@ func TestRoutesReadsWhatApplySent(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
-	want := []Route{{Host: "hello.apps.test", Upstream: "app-hello-7:8080"}, {Host: "api.apps.test", Upstream: "app-api-3:3000"}}
-	if err := c.Apply(t.Context(), want); err != nil {
-		t.Fatal(err)
-	}
-	got, err := c.Routes(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
-		t.Errorf("Routes = %+v, want %+v", got, want)
+	for _, want := range [][]Route{
+		{
+			{Host: "hello.apps.test", Upstream: "app-hello-7:8080"},
+			{Host: "api.apps.test", Upstream: "app-api-3:3000"},
+			{Host: "api.example.com", Upstream: "app-api-3:3000", Public: true},
+		},
+		{}, // nothing routed: both servers still there, the 404 too
+	} {
+		if err := c.Apply(t.Context(), want); err != nil {
+			t.Fatal(err)
+		}
+		got, err := c.Routes(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("Routes = %+v, want %+v", got, want)
+		}
 	}
 }
 
-func TestRoutesOddShapesAndMissingServer(t *testing.T) {
+func TestTunnelGuard(t *testing.T) {
+	var saved []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			saved, _ = io.ReadAll(r.Body)
+			return
+		}
+		w.Write(saved)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "")
+	c.TunnelSubnet = "10.203.0.8/29"
+	want := []Route{{Host: "hello.apps.test", Upstream: "app-hello-7:8080"}}
+	if err := c.Apply(t.Context(), want); err != nil {
+		t.Fatal(err)
+	}
+	var servers map[string]struct {
+		Routes []struct {
+			Match []struct {
+				Host     []string `json:"host"`
+				RemoteIP struct {
+					Ranges []string `json:"ranges"`
+				} `json:"remote_ip"`
+			} `json:"match"`
+			Handle []struct {
+				Handler    string `json:"handler"`
+				StatusCode int    `json:"status_code"`
+			} `json:"handle"`
+			Terminal bool `json:"terminal"`
+		} `json:"routes"`
+	}
+	if err := json.Unmarshal(saved, &servers); err != nil {
+		t.Fatal(err)
+	}
+	// First on the tailnet server, before any host: 403 for the tunnel.
+	guard := servers["apps"].Routes[0]
+	if len(guard.Match) != 1 || len(guard.Match[0].Host) != 0 || !slices.Equal(guard.Match[0].RemoteIP.Ranges, []string{"10.203.0.8/29"}) ||
+		guard.Handle[0].Handler != "static_response" || guard.Handle[0].StatusCode != 403 || !guard.Terminal {
+		t.Errorf("first tailnet route = %+v, want a 403 for the tunnel's subnet", guard)
+	}
+	// Not on the public server: that's where the tunnel belongs.
+	if strings.Contains(string(saved), `"public":{"listen":[":8080"],"routes":[{"match":[{"remote_ip"`) {
+		t.Error("the public server refuses the tunnel too")
+	}
+	// Read back without the guard; a table without it gets applied again.
+	if got, _ := c.Routes(t.Context()); !slices.Equal(got, want) {
+		t.Errorf("Routes = %+v, want %+v", got, want)
+	}
+	c.TunnelSubnet = "10.203.0.16/29" // a guard for another subnet isn't this one
+	if got, _ := c.Routes(t.Context()); len(got) == 0 || got[0] != (Route{}) {
+		t.Errorf("Routes = %+v, want a route nothing wants first", got)
+	}
+}
+
+func TestRoutesOddShapesAndMissingServers(t *testing.T) {
+	// What Apply sends for no routes, to build the odd cases from.
+	const tailnetEmpty = `"apps":{"listen":[":80"],"routes":[]}`
+	const publicEmpty = `"public":{"listen":[":8080"],"routes":[{"handle":[{"handler":"static_response","status_code":404}],"terminal":true}]}`
 	tests := []struct {
 		name   string
 		status int
 		body   string
 		want   []Route
 	}{
-		{name: "server missing", status: http.StatusBadRequest, body: `{"error":"invalid traversal path"}`, want: []Route{}},
-		{name: "server null", status: http.StatusOK, body: `null`, want: []Route{}},
-		{name: "no routes key", status: http.StatusOK, body: `{"listen":[":80"]}`, want: []Route{}},
+		// Missing servers come back as a route nothing wants, so the
+		// table is applied again.
+		{name: "no servers", status: http.StatusBadRequest, body: `{"error":"invalid traversal path"}`,
+			want: []Route{{}, {Public: true}}},
+		{name: "servers null", status: http.StatusOK, body: `null`, want: []Route{{}, {Public: true}}},
+		{name: "public missing", status: http.StatusOK, body: `{` + tailnetEmpty + `}`, want: []Route{{Public: true}}},
+		{name: "public without its 404", status: http.StatusOK,
+			body: `{` + tailnetEmpty + `,"public":{"listen":[":8080"],"routes":[]}}`, want: []Route{{Public: true}}},
+		{name: "no routes key", status: http.StatusOK, body: `{"apps":{"listen":[":80"]},` + publicEmpty + `}`, want: []Route{}},
 		{
 			// Edited by hand: a file server, not a proxy. It must not look
 			// like any route the platform wants.
 			name:   "a route Apply never makes",
 			status: http.StatusOK,
-			body:   `{"routes":[{"match":[{"host":["hello.apps.test"]}],"handle":[{"handler":"file_server"}],"terminal":true}]}`,
+			body:   `{"apps":{"routes":[{"match":[{"host":["hello.apps.test"]}],"handle":[{"handler":"file_server"}],"terminal":true}]},` + publicEmpty + `}`,
 			want:   []Route{{Host: "hello.apps.test"}},
 		},
 	}
@@ -157,7 +250,7 @@ func TestRoutesOddShapesAndMissingServer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(got) != len(tt.want) || (len(got) > 0 && got[0] != tt.want[0]) {
+			if !slices.Equal(got, tt.want) {
 				t.Errorf("Routes = %+v, want %+v", got, tt.want)
 			}
 		})
@@ -225,5 +318,64 @@ func TestProbeSendsHostAndDoesNotFollowRedirects(t *testing.T) {
 	}
 	if status != http.StatusFound {
 		t.Errorf("status = %d, want 302 (not followed)", status)
+	}
+}
+
+func TestSyncMetrics(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		wantChanged bool
+	}{
+		{name: "never set", status: http.StatusOK, body: "null", wantChanged: true},
+		{name: "path missing", status: http.StatusBadRequest, body: `{"error":"invalid traversal path"}`, wantChanged: true},
+		{name: "on but not per host", status: http.StatusOK, body: `{}`, wantChanged: true},
+		{name: "already per host", status: http.StatusOK, body: `{"per_host":true}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var posted string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/config/apps/http/metrics" {
+					http.Error(w, "wrong path", http.StatusNotFound)
+					return
+				}
+				if r.Method == http.MethodPost {
+					b, _ := io.ReadAll(r.Body)
+					posted = string(b)
+					return
+				}
+				w.WriteHeader(tt.status)
+				io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+
+			changed, err := New(srv.URL, "").SyncMetrics(t.Context())
+			if err != nil || changed != tt.wantChanged {
+				t.Fatalf("SyncMetrics = %v, %v; want changed %v", changed, err, tt.wantChanged)
+			}
+			if tt.wantChanged && posted != `{"per_host":true}` {
+				t.Errorf("posted %q, want per_host on", posted)
+			}
+			if !tt.wantChanged && posted != "" {
+				t.Errorf("posted %q although it was already on", posted)
+			}
+		})
+	}
+}
+
+func TestMetrics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.Error(w, "no", http.StatusNotFound)
+			return
+		}
+		io.WriteString(w, "# HELP x\nx 1\n")
+	}))
+	defer srv.Close()
+	got, err := New(srv.URL, "").Metrics(t.Context())
+	if err != nil || string(got) != "# HELP x\nx 1\n" {
+		t.Errorf("Metrics = %q, %v", got, err)
 	}
 }

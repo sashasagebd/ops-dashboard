@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/history"
@@ -199,6 +200,9 @@ type historyResponse struct {
 	StepSeconds int                                 `json:"stepSeconds"`
 	Host        hostHistoryResponse                 `json:"host"`
 	Containers  map[string]containerHistoryResponse `json:"containers"` // by name; {} if none
+	// The deploy platform's apps, by app name, each summing its containers
+	// (which change name with every deploy); {} if none.
+	Apps map[string]containerHistoryResponse `json:"apps"`
 }
 
 type hostHistoryResponse struct {
@@ -230,11 +234,17 @@ func handleHistory(hist HistorySource) http.HandlerFunc {
 		// history is still a valid answer (every value null).
 		v := hist.History(window)
 		containers := make(map[string]containerHistoryResponse, len(v.Containers))
+		apps := map[string]containerHistoryResponse{}
 		for name, c := range v.Containers {
-			containers[name] = containerHistoryResponse{
+			r := containerHistoryResponse{
 				CPUPercent:    values(c.CPU, avg, 2),
 				CPUPercentMax: values(c.CPU, peak, 2),
 				MemoryBytes:   values(c.Memory, avg, 0),
+			}
+			if app, ok := strings.CutPrefix(name, monitor.AppSeriesPrefix); ok {
+				apps[app] = r
+			} else {
+				containers[name] = r
 			}
 		}
 		writeJSON(w, http.StatusOK, historyResponse{
@@ -247,6 +257,7 @@ func handleHistory(hist HistorySource) http.HandlerFunc {
 				DiskUsedBytes: values(v.Host.Disk, avg, 0),
 			},
 			Containers: containers,
+			Apps:       apps,
 		})
 	}
 }

@@ -16,14 +16,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
+	"strings"
 	"time"
 )
 
 // Route sends requests for Host to Upstream (a container name and port on
-// the apps network, e.g. "app-hello-7:8080").
+// the apps network, e.g. "app-hello-7:8080"). A Public route is on Caddy's
+// public server, the one Cloudflare's tunnel reaches; the others are on its
+// tailnet server.
 type Route struct {
 	Host     string
 	Upstream string
+	Public   bool
 }
 
 // Caddy talks to Caddy's admin API and, for health checks, to its proxy port.
@@ -31,6 +36,13 @@ type Caddy struct {
 	AdminURL   string // e.g. http://10.203.0.2:2019
 	ProxyURL   string // e.g. http://10.203.0.2:80
 	HTTPClient *http.Client
+
+	// TunnelSubnet, if set, is the network cloudflared reaches Caddy from
+	// (e.g. 10.203.0.8/29). The tailnet server refuses every request from
+	// it: cloudflared can connect to any port Caddy listens on, so without
+	// this, a tunnel pointed at caddy:80 by mistake would serve tailnet-only
+	// apps to the internet.
+	TunnelSubnet string
 }
 
 // New returns a Caddy client. Requests time out after 10s: admin calls are
@@ -39,32 +51,53 @@ func New(adminURL, proxyURL string) *Caddy {
 	return &Caddy{AdminURL: adminURL, ProxyURL: proxyURL, HTTPClient: &http.Client{Timeout: 10 * time.Second}}
 }
 
-// The server in Caddy's config (caddy/caddy.json) that the platform owns
-// outright: Apply replaces the whole object, not just its routes, so it
-// doesn't depend on a routes array already existing (Caddy may drop an empty
-// one when it saves its config). Nothing else edits it.
-const serverPath = "/config/apps/http/servers/apps"
+// Caddy's servers, which the platform owns outright (caddy/caddy.json only
+// bootstraps them): Apply replaces the whole object, not just the routes, so
+// it doesn't depend on a routes array already existing (Caddy may drop an
+// empty one when it saves its config). Nothing else edits them.
+const serversPath = "/config/apps/http/servers"
 
-// listenAddr is where Caddy accepts app traffic inside its container.
-const listenAddr = ":80"
+// The two servers. "apps" takes tailnet traffic on :80, which compose
+// publishes on the server's Tailscale IP only. "public" takes what
+// Cloudflare's tunnel forwards, on :8080, which only cloudflared reaches (the
+// tunnel network); it has public hostnames' routes only, so a request through
+// the tunnel can never reach a tailnet-only app, whatever its Host header.
+const (
+	tailnetServer = "apps"
+	publicServer  = "public"
+	tailnetListen = ":80"
+	publicListen  = ":8080"
+)
 
 // Apply makes routes Caddy's complete routing table, replacing whatever was
-// there.
+// there, on both servers.
 func (c *Caddy) Apply(ctx context.Context, routes []Route) error {
-	body, err := json.Marshal(caddyServer{
-		Listen: []string{listenAddr},
-		Routes: caddyRoutes(routes),
-		// Plain HTTP: inside the tailnet now, behind Cloudflare later, which
-		// terminates HTTPS itself.
-		AutomaticHTTPS: caddyAutoHTTPS{Disable: true},
+	var tailnet, public []Route
+	for _, r := range routes {
+		if r.Public {
+			public = append(public, r)
+		} else {
+			tailnet = append(tailnet, r)
+		}
+	}
+	tailnetRoutes := caddyRoutes(tailnet)
+	if c.TunnelSubnet != "" {
+		tailnetRoutes = append([]caddyRoute{c.tunnelGuard()}, tailnetRoutes...)
+	}
+	body, err := json.Marshal(map[string]caddyServer{
+		tailnetServer: newServer(tailnetListen, tailnetRoutes),
+		// Last, a 404 for any other host. Without it Caddy answers a request
+		// no route matches with an empty 200, which through the tunnel would
+		// look like a site that exists.
+		publicServer: newServer(publicListen, append(caddyRoutes(public), notFoundRoute())),
 	})
 	if err != nil {
 		return err
 	}
-	// PATCH replaces the value at the path (the server) in one operation:
+	// PATCH replaces the value at the path (both servers) in one operation:
 	// Caddy swaps to the new config only if it's valid, so a request never
 	// leaves routing half-updated.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.AdminURL+serverPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.AdminURL+serversPath, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -104,10 +137,11 @@ func (c *Caddy) Probe(ctx context.Context, host, path string) (int, error) {
 // Routes returns the routes Caddy has now, in the platform's terms, for the
 // reconciler to compare with what it should have. A route in any shape Apply
 // doesn't produce (edited by hand, say) comes back with an empty Upstream, so
-// it never matches a wanted route. If the platform's server is missing
-// altogether (Caddy started without its saved config), that's no routes.
+// it never matches a wanted route. So does a missing server (Caddy started
+// without its saved config), or a public server without its closing 404:
+// either way the table gets applied again.
 func (c *Caddy) Routes(ctx context.Context) ([]Route, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.AdminURL+serverPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.AdminURL+serversPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -116,32 +150,126 @@ func (c *Caddy) Routes(ctx context.Context) ([]Route, error) {
 		return nil, fmt.Errorf("reading routes: %w", err)
 	}
 	defer resp.Body.Close()
+	var servers map[string]*caddyServer // null entries if removed
 	switch {
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
-		// Caddy answers 4xx for a path into config that doesn't exist.
-		return []Route{}, nil
+		// Caddy answers 4xx for a path into config that doesn't exist: no
+		// servers at all.
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("reading routes: Caddy answered %s", resp.Status)
-	}
-	var server *caddyServer // "null" if the server was removed
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&server); err != nil {
-		return nil, fmt.Errorf("reading routes: %w", err)
+	default:
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&servers); err != nil {
+			return nil, fmt.Errorf("reading routes: %w", err)
+		}
 	}
 	out := []Route{}
-	if server == nil {
-		return out, nil
-	}
-	for _, r := range server.Routes {
-		var route Route
-		if len(r.Match) == 1 && len(r.Match[0].Host) == 1 {
-			route.Host = r.Match[0].Host[0]
+	for _, name := range []string{tailnetServer, publicServer} {
+		public := name == publicServer
+		server := servers[name]
+		if server == nil {
+			out = append(out, Route{Public: public}) // missing: matches nothing wanted
+			continue
 		}
-		if len(r.Handle) == 1 && r.Handle[0].Handler == "reverse_proxy" && len(r.Handle[0].Upstreams) == 1 && r.Terminal {
-			route.Upstream = r.Handle[0].Upstreams[0].Dial
+		routes := server.Routes
+		if !public && c.TunnelSubnet != "" {
+			if len(routes) == 0 || !reflect.DeepEqual(routes[0], c.tunnelGuard()) {
+				out = append(out, Route{}) // no guard first
+			} else {
+				routes = routes[1:]
+			}
 		}
-		out = append(out, route)
+		if public {
+			if n := len(routes); n == 0 || !isNotFound(routes[n-1]) {
+				out = append(out, Route{Public: true}) // no closing 404
+			} else {
+				routes = routes[:n-1]
+			}
+		}
+		for _, r := range routes {
+			route := Route{Public: public}
+			if len(r.Match) == 1 && len(r.Match[0].Host) == 1 {
+				route.Host = r.Match[0].Host[0]
+			}
+			if len(r.Handle) == 1 && r.Handle[0].Handler == "reverse_proxy" && len(r.Handle[0].Upstreams) == 1 && r.Terminal {
+				route.Upstream = r.Handle[0].Upstreams[0].Dial
+			}
+			out = append(out, route)
+		}
 	}
 	return out, nil
+}
+
+// metricsPath is Caddy's HTTP metrics setting. It belongs to Caddy's whole
+// HTTP app, not the server the platform owns, but per-host metrics can only
+// be turned on there (the per-server setting is deprecated): the one path
+// outside its own server the platform writes (see docs/decisions/platform.md).
+const metricsPath = "/config/apps/http/metrics"
+
+// SyncMetrics makes sure Caddy counts requests per host, which is how the
+// platform tells apps' traffic apart, changing the setting only if it's off
+// (changed reports whether it did). Caddy only gives a host its own label if
+// a route matches it, so a made-up Host header can't add new series.
+func (c *Caddy) SyncMetrics(ctx context.Context) (changed bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.AdminURL+metricsPath, nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("reading metrics config: %w", err)
+	}
+	var current *struct {
+		PerHost bool `json:"per_host"`
+	}
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		err = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&current)
+	case resp.StatusCode >= 500:
+		err = fmt.Errorf("reading metrics config: Caddy answered %s", resp.Status)
+	}
+	resp.Body.Close()
+	if err != nil {
+		return false, err
+	}
+	if current != nil && current.PerHost {
+		return false, nil
+	}
+	// POST sets the object whether or not it exists yet.
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, c.AdminURL+metricsPath,
+		strings.NewReader(`{"per_host":true}`))
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = c.HTTPClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("turning on per-host metrics: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return false, fmt.Errorf("turning on per-host metrics: Caddy answered %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	return true, nil
+}
+
+// Metrics returns Caddy's metrics, in Prometheus's text format, from its
+// admin API.
+func (c *Caddy) Metrics(ctx context.Context) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.AdminURL+"/metrics", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reading metrics: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("reading metrics: Caddy answered %s", resp.Status)
+	}
+	// A few hosts' histograms are tens of KiB; the cap is for safety only.
+	return io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 }
 
 // InFlight returns how many requests Caddy is proxying to each upstream right
@@ -188,6 +316,16 @@ type caddyServer struct {
 	AutomaticHTTPS caddyAutoHTTPS `json:"automatic_https"`
 }
 
+func newServer(listen string, routes []caddyRoute) caddyServer {
+	return caddyServer{
+		Listen: []string{listen},
+		Routes: routes,
+		// Plain HTTP: the tailnet server is reached inside the tailnet, and
+		// Cloudflare terminates HTTPS for the public one.
+		AutomaticHTTPS: caddyAutoHTTPS{Disable: true},
+	}
+}
+
 type caddyAutoHTTPS struct {
 	Disable bool `json:"disable"`
 }
@@ -195,18 +333,45 @@ type caddyAutoHTTPS struct {
 // caddyRoute is one entry in Caddy's JSON route list: match the Host header,
 // reverse-proxy to the upstream, and stop there.
 type caddyRoute struct {
-	Match    []caddyMatch   `json:"match"`
+	Match    []caddyMatch   `json:"match,omitempty"`
 	Handle   []caddyHandler `json:"handle"`
 	Terminal bool           `json:"terminal"`
 }
 
 type caddyMatch struct {
-	Host []string `json:"host"`
+	Host     []string       `json:"host,omitempty"`
+	RemoteIP *caddyRemoteIP `json:"remote_ip,omitempty"`
+}
+
+// caddyRemoteIP matches the connection's source address (not a header).
+type caddyRemoteIP struct {
+	Ranges []string `json:"ranges"`
 }
 
 type caddyHandler struct {
-	Handler   string          `json:"handler"`
-	Upstreams []caddyUpstream `json:"upstreams"`
+	Handler    string          `json:"handler"`
+	Upstreams  []caddyUpstream `json:"upstreams,omitempty"`
+	StatusCode int             `json:"status_code,omitempty"` // static_response's
+}
+
+// notFoundRoute matches every request (it has no match) and answers 404.
+func notFoundRoute() caddyRoute {
+	return caddyRoute{Handle: []caddyHandler{{Handler: "static_response", StatusCode: http.StatusNotFound}}, Terminal: true}
+}
+
+// tunnelGuard answers 403 to every request from the tunnel's network; the
+// tailnet server's first route (see TunnelSubnet).
+func (c *Caddy) tunnelGuard() caddyRoute {
+	return caddyRoute{
+		Match:    []caddyMatch{{RemoteIP: &caddyRemoteIP{Ranges: []string{c.TunnelSubnet}}}},
+		Handle:   []caddyHandler{{Handler: "static_response", StatusCode: http.StatusForbidden}},
+		Terminal: true,
+	}
+}
+
+func isNotFound(r caddyRoute) bool {
+	return len(r.Match) == 0 && len(r.Handle) == 1 && r.Handle[0].Handler == "static_response" &&
+		r.Handle[0].StatusCode == http.StatusNotFound
 }
 
 type caddyUpstream struct {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/docker"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/history"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/host"
 )
 
@@ -391,5 +392,49 @@ func TestPollRecordsHistory(t *testing.T) {
 	mem := containers["mc"].Memory
 	if len(containers) != 1 || !mem[0].OK || !mem[1].OK || mem[2].OK {
 		t.Errorf("containers = %+v, want one mc series with memory in minutes 0 and 1 across the recreate, and a gap for the failed poll", containers)
+	}
+}
+
+func TestHistorySamplesSumEachPlatformApp(t *testing.T) {
+	status := func(name, app, role string, cpu float64, mem uint64) ContainerStatus {
+		labels := map[string]string{}
+		if app != "" {
+			labels[platformAppLabel] = app
+		}
+		if role != "" {
+			labels[platformRoleLabel] = role
+		}
+		return ContainerStatus{
+			Container: docker.Container{Name: name, Labels: labels},
+			HasCPU:    true, CPUPercent: cpu, HasStats: true, MemoryUsed: mem,
+		}
+	}
+	samples := historySamples([]ContainerStatus{
+		status("mc", "", "", 5, 1000),
+		// Mid-deploy: two of hello's containers, both its usage.
+		status("app-hello-15", "hello", "app", 1, 10),
+		status("app-hello-16", "hello", "", 2, 20), // from before the role label
+		// Its database and a backup are not the app's own usage.
+		status("ops-db-hello", "hello", "database", 4, 400),
+		status("ops-backup-hello-3", "hello", "backup", 8, 800),
+	})
+
+	byName := map[string]history.ContainerSample{}
+	for _, s := range samples {
+		byName[s.Name] = s
+	}
+	// Every container keeps its own series...
+	for _, name := range []string{"mc", "app-hello-15", "app-hello-16", "ops-db-hello", "ops-backup-hello-3"} {
+		if _, ok := byName[name]; !ok {
+			t.Errorf("no sample for %s", name)
+		}
+	}
+	// ...and hello gets one more, summing only its own containers.
+	app, ok := byName["app:hello"]
+	if !ok || !app.HasCPU || app.CPUPercent != 3 || !app.HasMemory || app.MemoryUsed != 30 {
+		t.Errorf("app:hello = %+v, want CPU 3, memory 30", app)
+	}
+	if len(samples) != 6 {
+		t.Errorf("%d samples, want 6 (5 containers and 1 app)", len(samples))
 	}
 }

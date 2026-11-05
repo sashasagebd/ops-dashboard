@@ -10,7 +10,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/sashasagebd/ops-dashboard/backend/internal/engine"
+	"github.com/sashasagebd/ops-dashboard/backend/internal/metrics"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/source"
 	"github.com/sashasagebd/ops-dashboard/backend/internal/store"
 )
@@ -25,6 +28,8 @@ type fakeStore struct {
 	deployments []store.Deployment
 	kept        []string // KeptImages' answer
 	events      []store.Event
+	databases   map[int64]store.Database
+	backups     []store.Backup
 	err         error // if set, every method fails with it
 
 	mu       sync.Mutex
@@ -59,6 +64,21 @@ func (f *fakeStore) CreateApp(_ context.Context, n store.NewApp) (store.App, err
 		SourceDir: n.SourceDir}
 	f.apps = append(f.apps, a)
 	return a, nil
+}
+
+func (f *fakeStore) SetPublicName(_ context.Context, id int64, name string) (store.App, error) {
+	for _, a := range f.apps {
+		if a.PublicName == name && name != "" && a.ID != id {
+			return store.App{}, fmt.Errorf("%w: another app already has that public name", store.ErrConflict)
+		}
+	}
+	for i, a := range f.apps {
+		if a.ID == id {
+			f.apps[i].PublicName = name
+			return f.apps[i], nil
+		}
+	}
+	return store.App{}, store.ErrNotFound
 }
 
 func (f *fakeStore) SetAutoDeploy(_ context.Context, id int64, on bool) (store.App, error) {
@@ -104,6 +124,30 @@ func (f *fakeStore) Deployments(context.Context, int64, int) ([]store.Deployment
 
 func (f *fakeStore) KeptImages(context.Context, int64) ([]string, error) { return f.kept, f.err }
 
+func (f *fakeStore) Backups(context.Context, int64, int) ([]store.Backup, error) {
+	return f.backups, f.err
+}
+
+func (f *fakeStore) Database(_ context.Context, appID int64) (store.Database, error) {
+	db, ok := f.databases[appID]
+	if !ok {
+		return store.Database{}, store.ErrNotFound
+	}
+	return db, nil
+}
+
+func (f *fakeStore) CreateDatabase(_ context.Context, appID int64) (store.Database, error) {
+	if _, ok := f.databases[appID]; ok {
+		return store.Database{}, fmt.Errorf("%w: the app already has a database", store.ErrConflict)
+	}
+	if f.databases == nil {
+		f.databases = map[int64]store.Database{}
+	}
+	db := store.Database{AppID: appID, Password: "secret-pw", CreatedAt: time.Now()}
+	f.databases[appID] = db
+	return db, nil
+}
+
 func (f *fakeStore) Events(_ context.Context, appID int64, limit int) ([]store.Event, error) {
 	var out []store.Event
 	for _, e := range f.events {
@@ -137,6 +181,13 @@ type fakeDeployer struct {
 	started    []string
 	latest     string // the branch head StartLatest finds; "" for none
 	rolledBack []int64
+
+	routesApplied int
+}
+
+func (f *fakeDeployer) ApplyRoutes(context.Context) error {
+	f.routesApplied++
+	return nil
 }
 
 func (f *fakeDeployer) Rollback(_ context.Context, appID, target int64) (store.Deployment, error) {
@@ -166,7 +217,7 @@ func newTestAPI() (http.Handler, *fakeStore, *fakeDeployer) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Hostname: "hello.apps.test", Port: 8080}}
 	dep := &fakeDeployer{}
-	return New(st, dep, &fakeEngine{}, "apps.test"), st, dep
+	return New(st, dep, &fakeEngine{}, nil, nil, "apps.test", ""), st, dep
 }
 
 // do sends a request; a non-empty body is sent as JSON.
@@ -345,7 +396,7 @@ func TestInternalErrorsAreGeneric(t *testing.T) {
 
 func TestListAppsEmptyIsArray(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
-	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, "apps.test"), "GET", "/api/platform/apps", "")
+	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, nil, nil, "apps.test", ""), "GET", "/api/platform/apps", "")
 	if strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Errorf("body = %s, want []", rec.Body)
 	}
@@ -376,6 +427,71 @@ func TestAutoDeploySwitch(t *testing.T) {
 	}
 	if rec := do(t, h, "PATCH", "/api/platform/apps/9", `{"autoDeploy":true}`); rec.Code != http.StatusNotFound {
 		t.Errorf("missing app: status %d, want 404", rec.Code)
+	}
+}
+
+func TestPublicName(t *testing.T) {
+	st := &fakeStore{env: map[string]string{}}
+	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test"}, {ID: 2, Name: "other", Hostname: "other.apps.test"}}
+	dep := &fakeDeployer{}
+	h := New(st, dep, &fakeEngine{}, nil, nil, "apps.test", "example.com")
+
+	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", ""))
+	if got.PublicName != nil || got.PublicHostname != nil {
+		t.Errorf("new app: public %v %v, want tailnet-only", got.PublicName, got.PublicHostname)
+	}
+	if got.PublicDomain == nil || *got.PublicDomain != "example.com" {
+		t.Errorf("publicDomain = %v, want example.com", got.PublicDomain)
+	}
+	rec := do(t, h, "PATCH", "/api/platform/apps/1", `{"publicName":"hi"}`)
+	app := decode[appResponse](t, rec)
+	if rec.Code != http.StatusOK || app.PublicHostname == nil || *app.PublicHostname != "hi.example.com" ||
+		*app.PublicName != "hi" || st.apps[0].PublicName != "hi" {
+		t.Fatalf("made public: %d %s", rec.Code, rec.Body)
+	}
+	if dep.routesApplied != 1 {
+		t.Errorf("routes applied %d times, want once, straight away", dep.routesApplied)
+	}
+	// Only the public name changed.
+	if st.apps[0].AutoDeploy {
+		t.Error("autoDeploy changed too")
+	}
+
+	for body, want := range map[string]int{
+		`{"publicName":"Hi"}`:        http.StatusBadRequest,
+		`{"publicName":"a.b"}`:       http.StatusBadRequest,
+		`{"publicName":"-x"}`:        http.StatusBadRequest,
+		`{"publicName":7}`:           http.StatusBadRequest,
+		`{"publicName":"hooks"}`:     http.StatusConflict, // the webhook's
+		`{"publicName":"hi"}`:        http.StatusOK,       // its own again: fine
+		`{"publicName":"elsewhere"}`: http.StatusOK,
+	} {
+		if rec := do(t, h, "PATCH", "/api/platform/apps/1", body); rec.Code != want {
+			t.Errorf("PATCH %s: status %d, want %d: %s", body, rec.Code, want, rec.Body)
+		}
+	}
+	do(t, h, "PATCH", "/api/platform/apps/1", `{"publicName":"hi"}`)
+	if rec := do(t, h, "PATCH", "/api/platform/apps/2", `{"publicName":"hi"}`); rec.Code != http.StatusConflict {
+		t.Errorf("another app's name: status %d, want 409", rec.Code)
+	}
+
+	// Cleared: tailnet-only again.
+	rec = do(t, h, "PATCH", "/api/platform/apps/1", `{"publicName":""}`)
+	if app := decode[appResponse](t, rec); rec.Code != http.StatusOK || app.PublicName != nil || app.PublicHostname != nil {
+		t.Errorf("cleared: %d %s", rec.Code, rec.Body)
+	}
+
+	// No public domain: an app can't be made public, but clearing works.
+	off := New(st, dep, &fakeEngine{}, nil, nil, "apps.test", "")
+	if rec := do(t, off, "PATCH", "/api/platform/apps/1", `{"publicName":"hi"}`); rec.Code != http.StatusConflict ||
+		!strings.Contains(rec.Body.String(), "PUBLIC_DOMAIN") {
+		t.Errorf("no domain: %d %s, want 409 pointing at PUBLIC_DOMAIN", rec.Code, rec.Body)
+	}
+	if rec := do(t, off, "PATCH", "/api/platform/apps/1", `{"publicName":""}`); rec.Code != http.StatusOK {
+		t.Errorf("clearing with no domain: %d", rec.Code)
+	}
+	if got := decode[appDetailResponse](t, do(t, off, "GET", "/api/platform/apps/1", "")); got.PublicDomain != nil {
+		t.Errorf("no domain: publicDomain = %v, want null", *got.PublicDomain)
 	}
 }
 
@@ -476,5 +592,171 @@ func TestEvents(t *testing.T) {
 	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", ""))
 	if len(got.Events) != 1 || got.Events[0].ID != 3 {
 		t.Errorf("hello's events = %+v, want only its restart", got.Events)
+	}
+}
+
+func TestDatabase(t *testing.T) {
+	st := &fakeStore{env: map[string]string{}}
+	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test", Port: 8080}}
+	eng := &fakeEngine{}
+	h := New(st, &fakeDeployer{}, eng, nil, nil, "apps.test", "")
+
+	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"database":null`) {
+		t.Errorf("no database yet: body %s, want database null", rec.Body)
+	}
+
+	rec := do(t, h, "POST", "/api/platform/apps/1/database", "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	got := decode[databaseResponse](t, rec)
+	// Not created by the reconciler yet.
+	if got.Name != "ops-db-hello" || got.State != "creating" || got.CreatedAt.IsZero() {
+		t.Errorf("created = %+v", got)
+	}
+	// The password never comes back, here or in the app's detail.
+	for _, path := range []string{"/api/platform/apps/1"} {
+		if body := do(t, h, "GET", path, "").Body.String(); strings.Contains(body, "secret-pw") {
+			t.Errorf("GET %s shows the database password: %s", path, body)
+		}
+	}
+	if strings.Contains(rec.Body.String(), "secret-pw") {
+		t.Errorf("create response shows the password: %s", rec.Body)
+	}
+
+	// Once created, its state is Docker's; gone is "missing".
+	now := time.Now()
+	db := st.databases[1]
+	db.ProvisionedAt = &now
+	st.databases[1] = db
+	eng.containers = []engine.ManagedContainer{
+		{ID: "a", Name: "app-hello-7", State: "running", Labels: map[string]string{engine.LabelDeployment: "7"}},
+		{ID: "d", Name: "ops-db-hello", State: "exited", Labels: map[string]string{engine.LabelRole: engine.RoleDatabase}},
+	}
+	if d := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", "")).Database; d == nil || d.State != "exited" {
+		t.Errorf("database = %+v, want exited", d)
+	}
+	eng.containers = eng.containers[:1]
+	if d := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", "")).Database; d == nil || d.State != "missing" {
+		t.Errorf("database = %+v, want missing", d)
+	}
+
+	// One per app; unknown apps are 404.
+	if rec := do(t, h, "POST", "/api/platform/apps/1/database", ""); rec.Code != http.StatusConflict ||
+		!strings.Contains(rec.Body.String(), "already has a database") {
+		t.Errorf("second: %d %s, want 409 saying so", rec.Code, rec.Body)
+	}
+	if rec := do(t, h, "POST", "/api/platform/apps/9/database", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("missing app: %d, want 404", rec.Code)
+	}
+}
+
+type fakeBackups struct {
+	err     error
+	started []int64
+}
+
+func (f *fakeBackups) Start(_ context.Context, appID int64) (store.Backup, error) {
+	if f.err != nil {
+		return store.Backup{}, f.err
+	}
+	f.started = append(f.started, appID)
+	return store.Backup{ID: 4, AppID: appID, Status: store.BackupQueued, CreatedAt: time.Now()}, nil
+}
+
+func TestBackups(t *testing.T) {
+	st := &fakeStore{env: map[string]string{}}
+	st.apps = []store.App{{ID: 1, Name: "hello"}}
+	bk := &fakeBackups{}
+	h := New(st, &fakeDeployer{}, &fakeEngine{}, bk, nil, "apps.test", "")
+
+	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"backups":[]`) {
+		t.Errorf("no backups yet: %s, want backups []", rec.Body)
+	}
+	finished := time.Now()
+	st.backups = []store.Backup{
+		{ID: 2, AppID: 1, Status: store.BackupFailed, Error: "pg_dump failed: x", FinishedAt: &finished},
+		{ID: 1, AppID: 1, Status: store.BackupDone, File: "hello-20261104-120000.dump", SizeBytes: 4096, FinishedAt: &finished},
+	}
+	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", "")).Backups
+	if len(got) != 2 || got[0].File != nil || *got[0].Error != "pg_dump failed: x" ||
+		*got[1].File != "hello-20261104-120000.dump" || *got[1].SizeBytes != 4096 || got[1].Error != nil {
+		t.Errorf("backups = %+v", got)
+	}
+
+	rec := do(t, h, "POST", "/api/platform/apps/1/backups", "")
+	if rec.Code != http.StatusAccepted || decode[backupResponse](t, rec).Status != "queued" || len(bk.started) != 1 {
+		t.Errorf("back up now: %d %s", rec.Code, rec.Body)
+	}
+	for err, want := range map[error]string{
+		store.ErrNoDatabase:       "no database",
+		store.ErrBackupInProgress: "already in progress",
+	} {
+		bk.err = err
+		if rec := do(t, h, "POST", "/api/platform/apps/1/backups", ""); rec.Code != http.StatusConflict ||
+			!strings.Contains(rec.Body.String(), want) {
+			t.Errorf("with %v: %d %s, want 409 saying %q", err, rec.Code, rec.Body, want)
+		}
+	}
+	if rec := do(t, h, "POST", "/api/platform/apps/9/backups", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("missing app: %d, want 404", rec.Code)
+	}
+
+	// Backups not set up on this platform: a clear 409.
+	off := New(st, &fakeDeployer{}, &fakeEngine{}, nil, nil, "apps.test", "")
+	if rec := do(t, off, "POST", "/api/platform/apps/1/backups", ""); rec.Code != http.StatusConflict ||
+		!strings.Contains(rec.Body.String(), "BACKUP_DIR") {
+		t.Errorf("backups off: %d %s, want 409 pointing at BACKUP_DIR", rec.Code, rec.Body)
+	}
+}
+
+type fakeRequests struct{}
+
+func (fakeRequests) Window(app string, window time.Duration) metrics.Series {
+	one, five, p := 1.0, 5.0, 0.0234567
+	s := metrics.Series{Start: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC), Step: time.Minute}
+	if app == "hello" {
+		s.Requests = []*float64{nil, &five}
+		s.Errors = []*float64{nil, &one}
+		s.P95 = []*float64{nil, &p}
+	}
+	return s
+}
+
+func (fakeRequests) Total(app string, _ time.Duration) (float64, bool) {
+	if app == "hello" {
+		return 5.4, true
+	}
+	return 0, false
+}
+
+func TestRequestMetrics(t *testing.T) {
+	st := &fakeStore{env: map[string]string{}}
+	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test"}, {ID: 2, Name: "new", Hostname: "new.apps.test"}}
+	h := New(st, &fakeDeployer{}, &fakeEngine{}, nil, fakeRequests{}, "apps.test", "")
+
+	rec := do(t, h, "GET", "/api/platform/apps/1/metrics", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	// Seconds become milliseconds, rounded to one decimal; gaps are null.
+	want := `{"start":"2026-11-04T12:00:00Z","stepSeconds":60,"requests":[null,5],"errors":[null,1],"p95Ms":[null,23.5]}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Errorf("body = %s\nwant   %s", got, want)
+	}
+	if rec := do(t, h, "GET", "/api/platform/apps/1/metrics?window=24h", ""); rec.Code != http.StatusOK {
+		t.Errorf("24h: %d", rec.Code)
+	}
+	if rec := do(t, h, "GET", "/api/platform/apps/1/metrics?window=7d", ""); rec.Code != http.StatusBadRequest {
+		t.Errorf("7d: %d, want 400", rec.Code)
+	}
+	if rec := do(t, h, "GET", "/api/platform/apps/9/metrics", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("missing app: %d, want 404", rec.Code)
+	}
+
+	// Last-hour requests on the apps list (rounded), null without readings.
+	list := decode[[]appResponse](t, do(t, h, "GET", "/api/platform/apps", ""))
+	if list[0].RequestsLastHour == nil || *list[0].RequestsLastHour != 5 || list[1].RequestsLastHour != nil {
+		t.Errorf("requestsLastHour = %v, %v; want 5, null", list[0].RequestsLastHour, list[1].RequestsLastHour)
 	}
 }

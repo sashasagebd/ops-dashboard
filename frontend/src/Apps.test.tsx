@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AppDetail, Deployment, PlatformApp, PlatformEvent } from './api'
+import type { AppDetail, Backup, Deployment, PlatformApp, PlatformEvent } from './api'
 import App from './App'
 import { FakeEventSource } from './test/fakeEventSource'
 
@@ -39,12 +39,24 @@ function app(overrides: Partial<PlatformApp> = {}): PlatformApp {
     nextCommitSha: null,
     createdAt: '2026-11-01T00:00:00Z',
     currentDeployment: null,
+    publicName: null,
+    publicHostname: null,
+    requestsLastHour: null,
     ...overrides,
   }
 }
 
 function detail(overrides: Partial<AppDetail> = {}): AppDetail {
-  return { ...app(), envKeys: [], deployments: [], events: [], ...overrides }
+  return {
+    ...app(),
+    envKeys: [],
+    deployments: [],
+    events: [],
+    database: null,
+    backups: [],
+    publicDomain: 'example.com',
+    ...overrides,
+  }
 }
 
 function event(overrides: Partial<PlatformEvent> = {}): PlatformEvent {
@@ -65,7 +77,18 @@ type Handler = (init: RequestInit | undefined) => [number, unknown]
 // apart from the Apps page's events, which are none unless a test says.
 // It returns the mock, whose calls show what was sent.
 function mockFetch(routes: Record<string, Handler>) {
-  const all: Record<string, Handler> = { 'GET /api/platform/events': () => [200, []], ...routes }
+  const all: Record<string, Handler> = {
+    'GET /api/platform/events': () => [200, []],
+    'GET /api/history?window=1h': () => [
+      200,
+      { start: new Date().toISOString(), stepSeconds: 60, host: {}, containers: {}, apps: {} },
+    ],
+    'GET /api/platform/apps/1/metrics?window=1h': () => [
+      200,
+      { start: new Date().toISOString(), stepSeconds: 60, requests: [], errors: [], p95Ms: [] },
+    ],
+    ...routes,
+  }
   const fetchMock = vi.fn((url: string, init?: RequestInit) => {
     const handler = all[`${init?.method ?? 'GET'} ${url}`]
     const [status, body] = handler ? handler(init) : [404, { error: 'not found' }]
@@ -100,7 +123,18 @@ describe('Apps page', () => {
     mockFetch({
       'GET /api/platform/apps': () => [
         200,
-        [app(), app({ id: 2, name: 'api', hostname: 'api.apps.test', currentDeployment: deployment() })],
+        [
+          app(),
+          app({
+            id: 2,
+            name: 'api',
+            hostname: 'api.apps.test',
+            currentDeployment: deployment(),
+            requestsLastHour: 57,
+            publicName: 'api',
+            publicHostname: 'api.example.com',
+          }),
+        ],
       ],
     })
     window.location.hash = '#/apps'
@@ -114,6 +148,14 @@ describe('Apps page', () => {
     )
     expect(within(rows[1]).getByText('not deployed')).toBeInTheDocument()
     expect(within(rows[2]).getByText('0123456')).toBeInTheDocument()
+    // A public app's public address too, over HTTPS.
+    expect(within(rows[2]).getByRole('link', { name: 'api.example.com' })).toHaveAttribute(
+      'href',
+      'https://api.example.com/',
+    )
+    // Last-hour requests: none known for hello, 57 for api.
+    expect(within(rows[1]).getByText('—')).toBeInTheDocument()
+    expect(within(rows[2]).getByText('57')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Apps' })).toHaveAttribute('aria-current', 'page')
   })
 
@@ -330,6 +372,55 @@ describe('App page', () => {
     expect(screen.queryByText('0123456')).not.toBeInTheDocument()
   })
 
+  it('makes the app public, after asking, and tailnet-only again', async () => {
+    let publicName: string | null = null
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({ publicName, publicHostname: publicName === null ? null : `${publicName}.example.com` }),
+      ],
+      'PATCH /api/platform/apps/1': (init) => {
+        const name = (JSON.parse(init?.body as string) as { publicName: string }).publicName
+        publicName = name === '' ? null : name
+        return [200, app({ publicName })]
+      },
+    })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    expect(await screen.findByText('no, tailnet only')).toBeInTheDocument()
+    const input = screen.getByRole('textbox', { name: 'Public name' })
+    const makePublic = screen.getByRole('button', { name: 'Make public' })
+    // Not one part of a hostname: can't be sent.
+    fireEvent.change(input, { target: { value: 'my.api' } })
+    expect(makePublic).toBeDisabled()
+    fireEvent.change(input, { target: { value: 'API' } }) // lowercased as typed
+    expect(makePublic).toBeEnabled()
+    fireEvent.click(makePublic)
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('https://api.example.com/'))
+    expect(JSON.parse(sent(fetchMock, 'PATCH', '/api/platform/apps/1')[0][1]?.body as string)).toEqual({
+      publicName: 'api',
+    })
+    const links = await screen.findAllByRole('link', { name: 'api.example.com' })
+    expect(links[0]).toHaveAttribute('href', 'https://api.example.com/')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Make tailnet-only' }))
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringContaining('stops working'))
+    expect(JSON.parse(sent(fetchMock, 'PATCH', '/api/platform/apps/1')[1][1]?.body as string)).toEqual({
+      publicName: '',
+    })
+    expect(await screen.findByText('no, tailnet only')).toBeInTheDocument()
+  })
+
+  it("says public hostnames aren't set up without a public domain", async () => {
+    mockFetch({ 'GET /api/platform/apps/1': () => [200, detail({ publicDomain: null })] })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    expect(await screen.findByText(/Public hostnames aren't set up on this server/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Make public' })).not.toBeInTheDocument()
+  })
+
   it('rolls back to an earlier version, after asking', async () => {
     let rolledBack = false
     const live = deployment({ id: 8 })
@@ -400,6 +491,138 @@ describe('App page', () => {
     expect(await screen.findByText('recreated')).toHaveClass('badge-warn')
     expect(screen.getByText(/Recreated hello/)).toBeInTheDocument()
     expect(screen.getByText('2m ago', { exact: false })).toBeInTheDocument()
+  })
+
+  it('adds a database, after asking', async () => {
+    let added = false
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({
+          currentDeployment: deployment(),
+          database: added ? { name: 'ops-db-hello', createdAt: new Date().toISOString(), state: 'creating' } : null,
+        }),
+      ],
+      'POST /api/platform/apps/1/database': () => {
+        added = true
+        return [201, { name: 'ops-db-hello', createdAt: new Date().toISOString(), state: 'creating' }]
+      },
+    })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Add a database' }))
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('DATABASE_URL from its next deploy'))
+    expect(await screen.findByText('being created')).toHaveClass('badge-warn')
+    expect(screen.getByText('ops-db-hello')).toBeInTheDocument()
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/database')).toHaveLength(1)
+    // The live version predates it, so it says to deploy.
+    expect(screen.getByText(/Deploy the app to start using it/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Add a database' })).not.toBeInTheDocument()
+  })
+
+  it('shows a running database the live version already uses', async () => {
+    const created = new Date(Date.now() - 60 * 60_000).toISOString()
+    mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({ currentDeployment: deployment(), database: { name: 'ops-db-hello', createdAt: created, state: 'running' } }),
+      ],
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    expect(await screen.findByText('running')).toHaveClass('badge-up')
+    expect(screen.queryByText(/Deploy the app to start using it/)).not.toBeInTheDocument()
+  })
+
+  it('lists backups and makes one now', async () => {
+    let queued = false
+    const db = { name: 'ops-db-hello', createdAt: '2026-11-01T00:00:00Z', state: 'running' }
+    const done: Backup = {
+      id: 1,
+      status: 'done',
+      file: 'hello-20261104-120000.dump',
+      sizeBytes: 2048,
+      error: null,
+      createdAt: new Date(Date.now() - 3 * 60 * 60_000).toISOString(),
+      finishedAt: null,
+    }
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({
+          database: db,
+          backups: queued ? [{ ...done, id: 2, status: 'queued', file: null, sizeBytes: null }, done] : [done],
+        }),
+      ],
+      'POST /api/platform/apps/1/backups': () => {
+        queued = true
+        return [202, { ...done, id: 2, status: 'queued', file: null, sizeBytes: null }]
+      },
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    expect(await screen.findByText('hello-20261104-120000.dump')).toBeInTheDocument()
+    expect(screen.getByText('2.0 KiB')).toBeInTheDocument()
+    expect(screen.getByText('done')).toHaveClass('badge-up')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back up now' }))
+    expect(await screen.findByText('queued')).toHaveClass('badge-warn')
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/backups')).toHaveLength(1)
+    // One at a time.
+    expect(screen.getByRole('button', { name: 'Back up now' })).toBeDisabled()
+    expect(screen.getByText('A backup is running.')).toBeInTheDocument()
+  })
+
+  it('has no backups section until the database exists', async () => {
+    mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({ database: { name: 'ops-db-hello', createdAt: new Date().toISOString(), state: 'creating' } }),
+      ],
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    await screen.findByText('being created')
+    expect(screen.queryByRole('button', { name: 'Back up now' })).not.toBeInTheDocument()
+  })
+
+  it("shows the app's CPU, memory and requests", async () => {
+    mockFetch({
+      'GET /api/platform/apps/1': () => [200, detail()],
+      'GET /api/history?window=1h': () => [
+        200,
+        {
+          start: new Date().toISOString(),
+          stepSeconds: 60,
+          host: {},
+          containers: {},
+          apps: { hello: { cpuPercent: [1, 2.5], cpuPercentMax: [2, 4], memoryBytes: [10 * 1024 * 1024, 20 * 1024 * 1024] } },
+        },
+      ],
+      'GET /api/platform/apps/1/metrics?window=1h': () => [
+        200,
+        { start: new Date().toISOString(), stepSeconds: 60, requests: [null, 30, 12], errors: [null, 1, 0], p95Ms: [null, 23.5, null] },
+      ],
+    })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    // The latest values, and the hour's totals.
+    expect(await screen.findByText('2.5%')).toBeInTheDocument()
+    expect(screen.getByText('20 MiB of 256 MiB')).toBeInTheDocument()
+    expect(await screen.findByText('42 in the last hour, 1 5xx, p95 23.5 ms')).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: /hello requests a minute, last hour: average 21\/min, peak 30\/min/ })).toBeInTheDocument()
+  })
+
+  it('says when there are no metrics yet', async () => {
+    mockFetch({ 'GET /api/platform/apps/1': () => [200, detail()] })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    expect(await screen.findByText(/counted once a minute/)).toBeInTheDocument()
+    expect(screen.getAllByText('no data yet')).toHaveLength(2) // CPU and memory
   })
 
   it('has no app output to show when nothing is live', async () => {

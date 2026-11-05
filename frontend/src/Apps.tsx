@@ -2,32 +2,43 @@ import { useCallback, useState, type FormEvent, type ReactNode } from 'react'
 import {
   appLogURL,
   createApp,
+  createDatabase,
   deleteEnvVar,
   deployCommit,
   deployLatest,
   deploymentLogURL,
   fetchApp,
+  fetchAppMetrics,
   fetchApps,
   fetchEvents,
+  fetchHistory,
   rollback,
   setAutoDeploy,
+  setPublicName,
   setEnvVar,
+  startBackup,
   type AppDetail,
+  type Backup,
+  type Series,
   type Deployment,
   type DeploymentStatus,
   type EventKind,
   type PlatformApp,
   type PlatformEvent,
 } from './api'
-import { formatBytes, formatDuration } from './format'
+import { formatBytes, formatCPU, formatDuration, formatFileSize } from './format'
 import { LogViewer } from './LogViewer'
 import { appHref } from './route'
+import { seriesMax } from './series'
+import { Sparkline } from './Sparkline'
 import { usePolling, type PollState } from './usePolling'
 
 const APPS_REFRESH_MS = 10_000
 // Often enough to follow a deploy through its stages (building, starting,
 // healthy), which take seconds to minutes each.
 const APP_REFRESH_MS = 3_000
+// Metrics change once a minute (a step), so there's no point asking often.
+const METRICS_REFRESH_MS = 30_000
 
 const STATUS_BADGE: Record<DeploymentStatus, string> = {
   queued: 'warn',
@@ -49,6 +60,7 @@ const EVENT_BADGE: Record<EventKind, string> = {
   removed_orphan: 'neutral',
   routes_reapplied: 'neutral',
   fix_failed: 'down',
+  database_created: 'up',
 }
 
 const EVENT_LABEL: Record<EventKind, string> = {
@@ -58,11 +70,14 @@ const EVENT_LABEL: Record<EventKind, string> = {
   removed_orphan: 'cleaned up',
   routes_reapplied: 'routes fixed',
   fix_failed: 'fix failed',
+  database_created: 'database created',
 }
 
 const IN_PROGRESS: ReadonlySet<DeploymentStatus> = new Set(['queued', 'building', 'starting'])
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/
+// One part of a hostname, as the platform checks a public name.
+const PUBLIC_NAME_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
 
 // AppsPage lists the platform's apps and registers new ones.
 export function AppsPage() {
@@ -98,6 +113,7 @@ function AppsTable({ apps }: { apps: PlatformApp[] }) {
             <th scope="col">Name</th>
             <th scope="col">Address</th>
             <th scope="col">Live</th>
+            <th scope="col">Requests (1h)</th>
           </tr>
         </thead>
         <tbody>
@@ -108,6 +124,12 @@ function AppsTable({ apps }: { apps: PlatformApp[] }) {
               </td>
               <td>
                 <AppLink hostname={a.hostname} />
+                {a.publicHostname !== null && (
+                  <>
+                    <br />
+                    <PublicLink hostname={a.publicHostname} />
+                  </>
+                )}
               </td>
               <td>
                 {a.currentDeployment === null ? (
@@ -116,6 +138,7 @@ function AppsTable({ apps }: { apps: PlatformApp[] }) {
                   <span className="mono">{shortSHA(a.currentDeployment.commitSha)}</span>
                 )}
               </td>
+              <td>{a.requestsLastHour === null ? <span className="muted">—</span> : a.requestsLastHour}</td>
             </tr>
           ))}
         </tbody>
@@ -198,9 +221,13 @@ export function AppPage({ id }: { id: number }) {
           <>
             <h2>{app.name}</h2>
             <AppSummary app={app} />
+            <h3>Metrics</h3>
+            <Metrics app={app} />
             <h3>Deploy</h3>
             <DeployForm app={app} onDeployed={onDeployed} />
             <AutoDeploy app={app} onDone={refresh} />
+            <h3>Public access</h3>
+            <PublicAccess app={app} onDone={refresh} />
             <h3>Logs</h3>
             <Logs app={app} choice={log} onChoose={setLog} />
             <h3>Deployments</h3>
@@ -213,6 +240,11 @@ export function AppPage({ id }: { id: number }) {
             />
             <h3>Events</h3>
             <EventsList events={app.events} now={checkedAt} emptyText="Nothing has needed fixing for this app." />
+            <h3>Database</h3>
+            <Database app={app} onDone={refresh} />
+            {app.database !== null && app.database.state !== 'creating' && (
+              <Backups app={app} now={checkedAt} onDone={refresh} />
+            )}
             <h3>Environment variables</h3>
             <EnvVars app={app} onDone={refresh} />
           </>
@@ -229,6 +261,14 @@ function AppSummary({ app }: { app: AppDetail }) {
       <dt>Address</dt>
       <dd>
         <AppLink hostname={app.hostname} />
+      </dd>
+      <dt>Public</dt>
+      <dd>
+        {app.publicHostname === null ? (
+          <span className="muted">no, tailnet only</span>
+        ) : (
+          <PublicLink hostname={app.publicHostname} />
+        )}
       </dd>
       <dt>Live</dt>
       <dd>
@@ -334,10 +374,285 @@ function AutoDeploy({ app, onDone }: { app: AppDetail; onDone: () => void }) {
   )
 }
 
+// PublicAccess makes the app public on the internet, at a name of its own
+// under the server's public domain, or tailnet-only again.
+function PublicAccess({ app, onDone }: { app: AppDetail; onDone: () => void }) {
+  const [name, setName] = useState('')
+  const [action, run] = useAction()
+  const domain = app.publicDomain
+  const save = (publicName: string) => {
+    void run(async () => {
+      await setPublicName(app.id, publicName)
+      setName('')
+      onDone()
+    })
+  }
+  const onSubmit = (e: FormEvent) => {
+    e.preventDefault()
+    if (!window.confirm(`Make ${app.name} public? Anyone on the internet can reach it at https://${name}.${domain}/.`)) {
+      return
+    }
+    save(name)
+  }
+  const onPrivate = () => {
+    if (!window.confirm(`Make ${app.name} tailnet-only? https://${app.publicHostname}/ stops working at once.`)) return
+    save('')
+  }
+
+  if (domain === null) {
+    return (
+      <p className="muted">
+        Public hostnames aren't set up on this server (<span className="mono">PUBLIC_DOMAIN</span>), so apps are
+        tailnet-only.
+      </p>
+    )
+  }
+  return (
+    <div>
+      {app.publicHostname === null ? (
+        <p className="muted">Tailnet only. Give it a public name to serve it on the internet, through Cloudflare.</p>
+      ) : (
+        <p>
+          Public at <PublicLink hostname={app.publicHostname} />.{' '}
+          <button type="button" onClick={onPrivate} disabled={action.status === 'busy'}>
+            Make tailnet-only
+          </button>
+        </p>
+      )}
+      <form className="form-inline" onSubmit={onSubmit}>
+        <label>
+          <span className="visually-hidden">Public name</span>
+          <input
+            className="mono"
+            value={name}
+            onChange={(e) => setName(e.target.value.trim().toLowerCase())}
+            placeholder={app.publicName ?? 'e.g. api'}
+            pattern={PUBLIC_NAME_PATTERN.source}
+            title="Lowercase letters, digits and inner hyphens"
+            spellCheck={false}
+          />
+        </label>
+        <span className="mono">.{domain}</span>
+        <button type="submit" disabled={!PUBLIC_NAME_PATTERN.test(name) || action.status === 'busy'}>
+          {app.publicHostname === null ? 'Make public' : 'Change'}
+        </button>
+        <ActionError state={action} />
+      </form>
+    </div>
+  )
+}
+
 // rolledBackTo is the deployment the app's latest deploy rolled back to, or
 // null if its latest deploy isn't a rollback.
 function rolledBackTo(app: AppDetail): number | null {
   return app.deployments.at(0)?.rollbackOf ?? null
+}
+
+// Metrics is the app's last hour: CPU and memory from the dashboard's own
+// history (summed over its containers, which change name each deploy), and
+// requests from the platform (counted by Caddy).
+function Metrics({ app }: { app: AppDetail }) {
+  const history = usePolling(useCallback((signal: AbortSignal) => fetchHistory('1h', signal), []), METRICS_REFRESH_MS)
+  const requests = usePolling(
+    useCallback((signal: AbortSignal) => fetchAppMetrics(app.id, '1h', signal), [app.id]),
+    METRICS_REFRESH_MS,
+  )
+  const usage = history.status === 'ok' ? history.data.apps[app.name] : undefined
+  const req = requests.status === 'ok' ? requests.data : undefined
+  return (
+    <dl className="facts">
+      <dt>CPU</dt>
+      <dd className="cell-trend">
+        {usage ? (
+          <>
+            <Sparkline
+              values={usage.cpuPercent}
+              peaks={usage.cpuPercentMax}
+              max={Math.max(1, seriesMax(usage.cpuPercentMax))}
+              label={`${app.name} CPU, last hour`}
+              format={formatCPU}
+            />
+            <span>{formatCPU(last(usage.cpuPercent))}</span>
+          </>
+        ) : (
+          <span className="muted">no data yet</span>
+        )}
+      </dd>
+      <dt>Memory</dt>
+      <dd className="cell-trend">
+        {usage ? (
+          <>
+            <Sparkline
+              values={usage.memoryBytes}
+              max={app.memoryLimitBytes}
+              label={`${app.name} memory, last hour`}
+              format={formatBytes}
+            />
+            <span>
+              {formatBytes(last(usage.memoryBytes))} of {formatBytes(app.memoryLimitBytes)}
+            </span>
+          </>
+        ) : (
+          <span className="muted">no data yet</span>
+        )}
+      </dd>
+      <dt>Requests</dt>
+      <dd className="cell-trend">
+        {req && req.requests.some((v) => v !== null) ? (
+          <>
+            <Sparkline
+              values={req.requests}
+              max={Math.max(1, seriesMax(req.requests))}
+              label={`${app.name} requests a minute, last hour`}
+              format={(v) => `${Math.round(v)}/min`}
+            />
+            <span>
+              {sum(req.requests)} in the last hour, {sum(req.errors)} 5xx
+              {last(req.p95Ms) !== null && `, p95 ${last(req.p95Ms)} ms`}
+            </span>
+          </>
+        ) : (
+          <span className="muted">no data yet (counted once a minute)</span>
+        )}
+      </dd>
+    </dl>
+  )
+}
+
+// last is a series' newest value that isn't a gap, or null.
+function last(values: Series): number | null {
+  for (let i = values.length - 1; i >= 0; i--) {
+    const v = values[i]
+    if (v !== null) return v
+  }
+  return null
+}
+
+function sum(values: Series): number {
+  return values.reduce<number>((total, v) => total + (v ?? 0), 0)
+}
+
+// Database is the app's own Postgres: a button to add one, or what it is and
+// whether it's running.
+function Database({ app, onDone }: { app: AppDetail; onDone: () => void }) {
+  const [action, run] = useAction()
+  const db = app.database
+  if (db === null) {
+    const onAdd = () => {
+      const question =
+        `Add a Postgres database for ${app.name}? It reaches the app as DATABASE_URL from its next deploy, ` +
+        `and it can't be removed from the dashboard.`
+      if (!window.confirm(question)) return
+      void run(async () => {
+        await createDatabase(app.id)
+        onDone()
+      })
+    }
+    return (
+      <div>
+        <p className="muted">
+          No database. Add one and the platform runs a Postgres for this app alone, keeps it running and keeps its data.
+        </p>
+        <button type="button" onClick={onAdd} disabled={action.status === 'busy'}>
+          Add a database
+        </button>
+        <ActionError state={action} />
+      </div>
+    )
+  }
+  // A live version deployed before the database was added has no
+  // DATABASE_URL yet.
+  const live = app.currentDeployment
+  const needsDeploy = live === null || Date.parse(live.createdAt) < Date.parse(db.createdAt)
+  return (
+    <>
+      <dl className="facts">
+        <dt>Postgres 18</dt>
+        <dd>
+          <span className="mono">{db.name}</span>{' '}
+          <span className={`badge badge-${DATABASE_BADGE[db.state] ?? 'warn'}`}>
+            {db.state === 'creating' ? 'being created' : db.state}
+          </span>
+        </dd>
+      </dl>
+      <p className="muted">
+        The app gets it as <span className="mono">DATABASE_URL</span>; the password is never shown.
+        {needsDeploy && ' Deploy the app to start using it.'}
+      </p>
+    </>
+  )
+}
+
+// Backups is the app's database backups, newest first, and a button to make
+// one now.
+function Backups({ app, now, onDone }: { app: AppDetail; now: number; onDone: () => void }) {
+  const [action, run] = useAction()
+  const busy = app.backups.some((b) => b.status === 'queued' || b.status === 'running')
+  const onBackUp = () => {
+    void run(async () => {
+      await startBackup(app.id)
+      onDone()
+    })
+  }
+  return (
+    <>
+      <h4>Backups</h4>
+      <p className="muted">
+        Daily, the newest 7 kept, in <span className="mono">~/backups/{app.name}/</span> on the server. The README
+        says how to restore one.
+      </p>
+      <div className="form-inline">
+        <button type="button" onClick={onBackUp} disabled={busy || action.status === 'busy'}>
+          Back up now
+        </button>
+        {busy && <span className="muted">A backup is running.</span>}
+        <ActionError state={action} />
+      </div>
+      {app.backups.length === 0 ? (
+        <p className="muted">No backups yet.</p>
+      ) : (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">When</th>
+                <th scope="col">Status</th>
+                <th scope="col">File</th>
+                <th scope="col">Size</th>
+              </tr>
+            </thead>
+            <tbody>
+              {app.backups.map((b) => (
+                <tr key={b.id}>
+                  <td title={b.createdAt}>{formatDuration(now - Date.parse(b.createdAt))} ago</td>
+                  <td>
+                    <span className={`badge badge-${BACKUP_BADGE[b.status]}`}>{b.status}</span>
+                    {b.error !== null && <div className="deploy-error">{b.error}</div>}
+                  </td>
+                  <td className="mono">{b.file ?? ''}</td>
+                  <td>{b.sizeBytes === null ? '' : formatFileSize(b.sizeBytes)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
+  )
+}
+
+const BACKUP_BADGE: Record<Backup['status'], string> = {
+  queued: 'warn',
+  running: 'warn',
+  done: 'up',
+  failed: 'down',
+}
+
+// How a database's state looks; anything else (stopped, missing) is a
+// warning, since the reconciler is bringing it back.
+const DATABASE_BADGE: Record<string, string> = {
+  running: 'up',
+  unknown: 'neutral',
 }
 
 function EnvVars({ app, onDone }: { app: AppDetail; onDone: () => void }) {
@@ -623,11 +938,20 @@ function Field({ label, hint, children }: { label: string; hint: string; childre
   )
 }
 
-// Apps are served over plain HTTP: on the tailnet for now, and behind
-// Cloudflare (which adds HTTPS) once they're public.
+// Apps are served over plain HTTP on the tailnet; their public addresses
+// (PublicLink) are HTTPS.
 function AppLink({ hostname }: { hostname: string }) {
   return (
     <a href={`http://${hostname}/`} target="_blank" rel="noreferrer">
+      {hostname}
+    </a>
+  )
+}
+
+// PublicLink is an app's public address: HTTPS, which Cloudflare adds.
+function PublicLink({ hostname }: { hostname: string }) {
+  return (
+    <a href={`https://${hostname}/`} target="_blank" rel="noreferrer">
       {hostname}
     </a>
   )

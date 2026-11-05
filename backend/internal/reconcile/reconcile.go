@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sashasagebd/ops-dashboard/backend/internal/deploy"
@@ -34,6 +35,8 @@ import (
 type Store interface {
 	Apps(ctx context.Context) ([]store.App, error)
 	CurrentDeployment(ctx context.Context, appID int64) (store.Deployment, error)
+	Databases(ctx context.Context) ([]store.Database, error)
+	MarkDatabaseProvisioned(ctx context.Context, appID int64) error
 	AddEvent(ctx context.Context, e store.NewEvent) error
 	PruneEvents(ctx context.Context, before time.Time) (int64, error)
 }
@@ -49,7 +52,9 @@ type Engine interface {
 type Deployer interface {
 	TryLockApp(appID int64) (unlock func(), ok bool)
 	Recreate(ctx context.Context, app store.App, dep store.Deployment) error
+	RunDatabase(ctx context.Context, app store.App, db store.Database) error
 	SyncRoutes(ctx context.Context) (changed bool, err error)
+	SyncMetrics(ctx context.Context) (changed bool, err error)
 }
 
 // Config holds the reconciler's settings.
@@ -76,15 +81,15 @@ type Reconciler struct {
 	deployer Deployer
 	now      func() time.Time
 
-	crashes   map[int64]*crashes // by app ID
-	failing   map[string]bool    // fixes failing pass after pass, by key: recorded once
+	crashes   map[string]*crashes // by container: "app:<app ID>" or "db:<app ID>"
+	failing   map[string]bool     // fixes failing pass after pass, by key: recorded once
 	lastPrune time.Time
 	lastErr   string // the last failed pass's error, to log only changes
 }
 
-// crashes is an app's recent restarts, for backing off.
+// crashes is a container's recent restarts, for backing off.
 type crashes struct {
-	deployment int64     // whose container; a new live deployment starts afresh
+	deployment int64     // whose container (0 for a database); a new live deployment starts afresh
 	restarts   int       // since the app was last stable
 	lastStart  time.Time // when the reconciler last started it
 	next       time.Time // no restart before this
@@ -94,7 +99,7 @@ type crashes struct {
 func New(cfg Config, st Store, eng Engine, dep Deployer) *Reconciler {
 	return &Reconciler{
 		cfg: cfg, store: st, engine: eng, deployer: dep, now: time.Now,
-		crashes: map[int64]*crashes{}, failing: map[string]bool{},
+		crashes: map[string]*crashes{}, failing: map[string]bool{},
 	}
 }
 
@@ -152,12 +157,32 @@ func (r *Reconciler) Pass(ctx context.Context) error {
 			Message: "Caddy's routes didn't match the database (a route was missing or changed); re-applied them"})
 	}
 
+	// Per-host request metrics on, for the dashboard. Set once; this only
+	// acts if Caddy lost its config. Not an event: nothing was broken.
+	if changed, err := r.deployer.SyncMetrics(ctx); err != nil {
+		errs = append(errs, err)
+	} else if changed {
+		slog.Info("turned on Caddy's per-host request metrics")
+	}
+
 	apps, err := r.store.Apps(ctx)
 	if err != nil {
 		return errors.Join(append(errs, err)...)
 	}
+	dbs, err := r.store.Databases(ctx)
+	if err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	dbByApp := map[int64]store.Database{}
+	for _, db := range dbs {
+		dbByApp[db.AppID] = db
+	}
 	for _, app := range apps {
-		if err := r.app(ctx, app, routesOK); err != nil {
+		var db *store.Database
+		if d, ok := dbByApp[app.ID]; ok {
+			db = &d
+		}
+		if err := r.app(ctx, app, db, routesOK); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", app.Name, err))
 		}
 	}
@@ -171,10 +196,11 @@ func (r *Reconciler) Pass(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// app reconciles one app's containers, unless a deploy of it is running: the
-// deploy owns them until it's done. Orphans are only removed if
-// removeOrphans (Caddy's routes are known to be right; see Pass).
-func (r *Reconciler) app(ctx context.Context, app store.App, removeOrphans bool) error {
+// app reconciles one app's containers, its database's (if db isn't nil)
+// first, unless a deploy of it is running: the deploy owns them until it's
+// done. Orphans are only removed if removeOrphans (Caddy's routes are known
+// to be right; see Pass).
+func (r *Reconciler) app(ctx context.Context, app store.App, db *store.Database, removeOrphans bool) error {
 	unlock, ok := r.deployer.TryLockApp(app.ID)
 	if !ok {
 		return nil
@@ -193,9 +219,20 @@ func (r *Reconciler) app(ctx context.Context, app store.App, removeOrphans bool)
 		return err
 	}
 
-	var liveContainer *engine.ManagedContainer
+	var liveContainer, dbContainer *engine.ManagedContainer
 	for _, c := range containers {
-		if hasLive && c.Labels[engine.LabelDeployment] == strconv.FormatInt(live.ID, 10) {
+		if c.Labels[engine.LabelRole] == engine.RoleBackup {
+			// A backup running: its job owns it, and removes it when done.
+			continue
+		}
+		if c.Labels[engine.LabelRole] == engine.RoleDatabase {
+			if db != nil {
+				dbContainer = &c
+				continue
+			}
+			// The app has no database (any more): its container is an
+			// orphan like any other. Its volume, with the data, stays.
+		} else if hasLive && c.Labels[engine.LabelDeployment] == strconv.FormatInt(live.ID, 10) {
 			liveContainer = &c
 			continue
 		}
@@ -205,8 +242,12 @@ func (r *Reconciler) app(ctx context.Context, app store.App, removeOrphans bool)
 			r.removeOrphan(ctx, app.ID, app.Name, c)
 		}
 	}
+	if db != nil {
+		r.database(ctx, app, *db, dbContainer)
+	}
+	appKey := "app:" + strconv.FormatInt(app.ID, 10)
 	if !hasLive {
-		delete(r.crashes, app.ID)
+		delete(r.crashes, appKey)
 		return nil
 	}
 
@@ -215,7 +256,7 @@ func (r *Reconciler) app(ctx context.Context, app store.App, removeOrphans bool)
 	case liveContainer == nil:
 		r.recreate(ctx, app, live, name, "it had been removed")
 	case liveContainer.State == "running":
-		r.maybeStable(app.ID)
+		r.maybeStable(appKey)
 	case liveContainer.State == "dead":
 		// Docker can't start a dead container: replace it.
 		key := "remove:" + liveContainer.ID
@@ -226,7 +267,7 @@ func (r *Reconciler) app(ctx context.Context, app store.App, removeOrphans bool)
 		r.fixed(key)
 		r.recreate(ctx, app, live, name, "Docker had marked it dead")
 	case liveContainer.State == "exited" || liveContainer.State == "created":
-		r.restart(ctx, app, live, *liveContainer)
+		r.restart(ctx, app, appKey, live.ID, *liveContainer, "its container")
 	default:
 		// "restarting" (Docker's own restart policy, on containers from
 		// before the reconciler), "paused" (someone paused it on purpose)
@@ -235,14 +276,15 @@ func (r *Reconciler) app(ctx context.Context, app store.App, removeOrphans bool)
 	return nil
 }
 
-// restart starts the app's stopped live container again, unless it's backing
-// off after repeated crashes, recording why it stopped.
-func (r *Reconciler) restart(ctx context.Context, app store.App, live store.Deployment, c engine.ManagedContainer) {
+// restart starts one of the app's stopped containers again (key and
+// deployment say which, what says it in words: "its container"), unless
+// it's backing off after repeated crashes, recording why it stopped.
+func (r *Reconciler) restart(ctx context.Context, app store.App, key string, deployment int64, c engine.ManagedContainer, what string) {
 	now := r.now()
-	st := r.crashes[app.ID]
-	if st == nil || st.deployment != live.ID {
-		st = &crashes{deployment: live.ID}
-		r.crashes[app.ID] = st
+	st := r.crashes[key]
+	if st == nil || st.deployment != deployment {
+		st = &crashes{deployment: deployment}
+		r.crashes[key] = st
 	}
 	if now.Before(st.next) {
 		return
@@ -266,19 +308,20 @@ func (r *Reconciler) restart(ctx context.Context, app store.App, live store.Depl
 	st.lastStart = now
 	backoff := r.backoff(st.restarts)
 	st.next = now.Add(backoff)
-	key := "start:" + c.ID
+	fixKey := "start:" + c.ID
 	if err := r.engine.Start(ctx, c.ID); err != nil {
-		r.fixFailed(ctx, key, app.ID, fmt.Sprintf("%s's container %s %s, and starting it again failed", app.Name, c.Name, stopped), err)
+		r.fixFailed(ctx, fixKey, app.ID, fmt.Sprintf("%s's %s %s %s, and starting it again failed",
+			app.Name, strings.TrimPrefix(what, "its "), c.Name, stopped), err)
 		return
 	}
-	r.fixed(key)
+	r.fixed(fixKey)
 
 	e := store.NewEvent{AppID: app.ID, Kind: store.EventRestarted, Output: output,
-		Message: fmt.Sprintf("Restarted %s: its container %s %s", app.Name, c.Name, stopped)}
+		Message: fmt.Sprintf("Restarted %s: %s %s %s", app.Name, what, c.Name, stopped)}
 	if st.restarts >= crashLoopAfter {
 		e.Kind = store.EventCrashLooping
-		e.Message = fmt.Sprintf("%s keeps stopping: restarted %d times (its container %s %s); the next restart waits at least %s",
-			app.Name, st.restarts, c.Name, stopped, backoff)
+		e.Message = fmt.Sprintf("%s keeps stopping: restarted %d times (%s %s %s); the next restart waits at least %s",
+			app.Name, st.restarts, what, c.Name, stopped, backoff)
 	}
 	slog.Info("restarted an app's container", "app", app.Name, "container", c.Name, "restarts", st.restarts, "stopped", stopped)
 	r.event(ctx, e)
@@ -294,11 +337,11 @@ func (r *Reconciler) backoff(n int) time.Duration {
 	return min(d, r.cfg.MaxBackoff)
 }
 
-// maybeStable forgets an app's crashes once it has run for StableAfter since
-// the reconciler last started it.
-func (r *Reconciler) maybeStable(appID int64) {
-	if st := r.crashes[appID]; st != nil && r.now().Sub(st.lastStart) >= r.cfg.StableAfter {
-		delete(r.crashes, appID)
+// maybeStable forgets a container's crashes once it has run for StableAfter
+// since the reconciler last started it.
+func (r *Reconciler) maybeStable(key string) {
+	if st := r.crashes[key]; st != nil && r.now().Sub(st.lastStart) >= r.cfg.StableAfter {
+		delete(r.crashes, key)
 	}
 }
 
@@ -307,6 +350,68 @@ func describeExit(e engine.ExitInfo) string {
 		return fmt.Sprintf("was killed for using more than its memory limit (exit code %d)", e.ExitCode)
 	}
 	return fmt.Sprintf("had exited with code %d", e.ExitCode)
+}
+
+// database keeps an app's database container running: created the first
+// time (or again, if it was deleted: its data is on its volume), started if
+// it stopped, replaced if Docker marked it dead. c is its container, nil if
+// there's none.
+func (r *Reconciler) database(ctx context.Context, app store.App, db store.Database, c *engine.ManagedContainer) {
+	name := deploy.DatabaseName(app.Name)
+	key := "db:" + strconv.FormatInt(app.ID, 10)
+	switch {
+	case c == nil:
+		r.runDatabase(ctx, app, db)
+	case c.State == "running":
+		r.maybeStable(key)
+		if db.ProvisionedAt == nil {
+			// Created, but recording that failed last time.
+			r.markProvisioned(ctx, app)
+		}
+	case c.State == "dead":
+		fixKey := "remove:" + c.ID
+		if err := r.engine.Remove(ctx, c.ID); err != nil {
+			r.fixFailed(ctx, fixKey, app.ID, fmt.Sprintf("%s's database %s is dead, and removing it failed", app.Name, name), err)
+			return
+		}
+		r.fixed(fixKey)
+		r.runDatabase(ctx, app, db)
+	case c.State == "exited" || c.State == "created":
+		r.restart(ctx, app, key, 0, *c, "its database")
+	}
+}
+
+// runDatabase creates the app's database container: for the first time, or
+// again after it was deleted (its data is on the volume of the same name).
+func (r *Reconciler) runDatabase(ctx context.Context, app store.App, db store.Database) {
+	name := deploy.DatabaseName(app.Name)
+	first := db.ProvisionedAt == nil
+	fixKey := "database:" + strconv.FormatInt(app.ID, 10)
+	if err := r.deployer.RunDatabase(ctx, app, db); err != nil {
+		msg := fmt.Sprintf("Creating %s's database %s failed", app.Name, name)
+		if !first {
+			msg = fmt.Sprintf("%s's database %s is missing, and creating it again failed", app.Name, name)
+		}
+		r.fixFailed(ctx, fixKey, app.ID, msg, err)
+		return
+	}
+	r.fixed(fixKey)
+	if first {
+		r.markProvisioned(ctx, app)
+		slog.Info("created an app's database", "app", app.Name, "container", name)
+		r.event(ctx, store.NewEvent{AppID: app.ID, Kind: store.EventDatabaseCreated,
+			Message: fmt.Sprintf("Created %s's database %s (Postgres 18); the app gets DATABASE_URL from its next deploy", app.Name, name)})
+		return
+	}
+	slog.Info("recreated an app's database", "app", app.Name, "container", name)
+	r.event(ctx, store.NewEvent{AppID: app.ID, Kind: store.EventRecreated,
+		Message: fmt.Sprintf("Recreated %s's database %s: its container had been removed. Its data was kept on the volume %s", app.Name, name, name)})
+}
+
+func (r *Reconciler) markProvisioned(ctx context.Context, app store.App) {
+	if err := r.store.MarkDatabaseProvisioned(ctx, app.ID); err != nil {
+		slog.Error("recording a database as created", "app", app.Name, "err", err)
+	}
 }
 
 // recreate creates the live deployment's container again.

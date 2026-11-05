@@ -48,6 +48,15 @@ export function formatBytes(bytes: number | null): string {
   return `${(bytes / TiB).toFixed(1)} TiB`
 }
 
+// formatFileSize is for files, which (unlike memory) are often small: bytes
+// and KiB below a MiB, then one decimal place.
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < MiB) return `${(bytes / 1024).toFixed(1)} KiB`
+  if (bytes < GiB) return `${(bytes / MiB).toFixed(1)} MiB`
+  return `${(bytes / GiB).toFixed(1)} GiB`
+}
+
 // usagePercent is part / whole as 0–100, or 0 if whole is 0.
 export function usagePercent(part: number, whole: number): number {
   return whole > 0 ? (part / whole) * 100 : 0
