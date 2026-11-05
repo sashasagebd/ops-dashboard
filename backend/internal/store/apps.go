@@ -23,12 +23,14 @@ type App struct {
 	SourceDir          string    `db:"source_dir"`      // "" is the repo's root
 	AutoDeploy         bool      `db:"auto_deploy"`     // pushes to Branch deploy it
 	NextCommitSHA      string    `db:"next_commit_sha"` // a pushed commit waiting for the deploy in progress; "" if none
+	PublicName         string    `db:"public_name"`     // served publicly at <PublicName>.<PUBLIC_DOMAIN>; "" if tailnet-only
 	CreatedAt          time.Time `db:"created_at"`
 }
 
 const appColumns = `id, name, repo_url, branch, hostname, port, health_check_path,
 	memory_limit_bytes, cpu_limit_millicores, source_dir, auto_deploy,
-	COALESCE(next_commit_sha, '') AS next_commit_sha, created_at`
+	COALESCE(next_commit_sha, '') AS next_commit_sha,
+	COALESCE(public_name, '') AS public_name, created_at`
 
 // NewApp is what CreateApp needs. Name, RepoURL, Hostname and Port are
 // required; for the rest, the zero value means "use the database's default",
@@ -89,6 +91,17 @@ func (s *Store) Apps(ctx context.Context) ([]App, error) {
 	rows, _ := s.pool.Query(ctx, "SELECT "+appColumns+" FROM apps ORDER BY name")
 	apps, err := pgx.CollectRows(rows, pgx.RowToStructByName[App])
 	return apps, translate(err)
+}
+
+// SetPublicName makes an app public at <name>.<PUBLIC_DOMAIN>, or
+// tailnet-only again with "", returning the updated app. A name another app
+// has is ErrConflict.
+func (s *Store) SetPublicName(ctx context.Context, id int64, name string) (App, error) {
+	rows, _ := s.pool.Query(ctx, `
+		UPDATE apps SET public_name = NULLIF($2, '')
+		WHERE id = $1 RETURNING `+appColumns, id, name)
+	app, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[App])
+	return app, translate(err)
 }
 
 // SetAutoDeploy turns push-to-deploy on or off for an app, returning the

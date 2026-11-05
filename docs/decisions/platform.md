@@ -813,6 +813,9 @@ about).
 
 ### The webhook arrives through Tailscale Funnel until there's a domain
 
+_Superseded in 5.4: the webhook comes through Cloudflare Tunnel at
+`hooks.<PUBLIC_DOMAIN>` ("The webhook moves to the tunnel", Phase 5)._
+
 **What:** GitHub's push webhook reaches the platform through Tailscale
 Funnel, on port 8443 of the existing `homelab.<tailnet>.ts.net` name, mapped
 to the webhook listener only. The owner will buy a domain (most likely for
@@ -1307,3 +1310,99 @@ Prometheus and Grafana (two more services for one chart).
   is then all there is. A minute with no reading (Caddy or the platform
   down) is a gap, never a zero.
 - **Health probes don't count:** they use their own probe hostnames.
+
+### Public traffic gets a Caddy server of its own
+
+**What:** Caddy has two servers, both the platform's: `apps` on :80 (the
+tailnet's, published on the Tailscale IP) and `public` on :8080, which
+only `cloudflared` reaches, over a `tunnel` network it shares with Caddy
+alone. The public server has public apps' routes and the webhook's, then a
+404 for anything else. The tailnet server's first route answers 403 to any
+request from the tunnel network's subnet (fixed, `10.203.0.8/29`).
+**Why:** what the internet can reach should be decided by the platform's
+database, not by settings in Cloudflare's dashboard. Routes there are
+easy to get wrong (`caddy:80` instead of `caddy:8080`, a hostname that
+shouldn't be there), and with one server, a wrong route or a forged `Host`
+could reach a tailnet-only app. With two, the tunnel can only ever reach
+routes the platform made public. `cloudflared` can connect to every port
+Caddy listens on, hence the 403 on the tailnet server too; a fixed subnet
+is what makes that rule possible. Unknown hosts get an explicit 404,
+because Caddy otherwise answers an unmatched request with an empty 200.
+**Alternatives:** one server with public hosts added to it (a misrouted
+tunnel serves everything); `cloudflared` on the apps network, straight to
+containers (no Caddy routing, metrics or drain, and the tunnel next to
+every app); filtering by hostname in Cloudflare only (the protection would
+live outside the repo).
+
+### Public is opt-in, per app, as a name under one domain
+
+**What:** an app is public only once it's given a public name on its page,
+one DNS label such as `api`, and is then served at
+`<name>.<PUBLIC_DOMAIN>`. The database stores the name, not the hostname:
+unique, lowercase, one label, `hooks` reserved. Clearing it makes the app
+tailnet-only again. The routes change at once (the API applies them, the
+reconciler would within 10s).
+**Why:** exposing something to the internet should be a deliberate act
+for each app. Storing only the label lets the domain change in one place
+(`PUBLIC_DOMAIN`). One level keeps every name under Cloudflare's free
+certificate, which covers `*.sashasagebd.com` but not deeper.
+**Alternatives:** every app public at `<app name>.<domain>` (exposes apps
+by default); a free-form hostname per app (other domains, deeper names
+the certificate doesn't cover, and the database would have to vet them).
+
+### The webhook moves to the tunnel; Funnel and the published port go
+
+**What:** GitHub's webhook arrives at `hooks.<PUBLIC_DOMAIN>`, which
+Caddy's public server sends to the platform's webhook listener (`:8082`,
+reached over `caddy-admin`, which Caddy and the platform already share).
+The listener's `127.0.0.1:8082` port is no longer published, Tailscale
+Funnel is turned off, and the platform publishes no ports at all again.
+**Why:** with a domain, P2's stopgap isn't needed, and one way in from the
+internet is simpler to reason about than two. The webhook keeps its own
+listener, so `hooks.` still serves nothing but `POST /webhooks/github`.
+**Alternatives:** keep Funnel for the webhook (a second public entry point
+for no gain); route `hooks.` in Cloudflare straight to the platform (it
+would have to join the tunnel network, where its API also listens).
+
+### A remotely managed tunnel, behind a compose profile
+
+**What:** the tunnel is created in Cloudflare's dashboard, and
+`cloudflared` runs it from its token alone (`CLOUDFLARE_TUNNEL_TOKEN`);
+its routes are set in the dashboard, ideally one wildcard
+(`*.<domain>` → `http://caddy:8080`) so making an app public needs no
+Cloudflare change. The service only starts with `COMPOSE_PROFILES=tunnel`.
+**Why:** a token is one secret in `.env`; a locally managed tunnel needs a
+CLI login on the server, a credentials file and a config file. Since what
+the tunnel can reach is fixed by the networks and Caddy's public server,
+the routes kept in Cloudflare can't widen it. The profile keeps CI (no
+token) and a fresh clone working without a tunnel.
+**Alternatives:** a locally managed tunnel with its ingress rules in the
+repo (more files and a login, for routes that can't do harm anyway); a
+`cloudflared` quick tunnel (a random URL).
+
+### How public hostnames work (5.4, 2026-11-04)
+
+**What:** the details behind the entries above.
+- **One PATCH, both servers:** `router.Apply` replaces
+  `/config/apps/http/servers` whole, so the tailnet and public tables
+  always change together. `Routes` reads both back; a missing server, a
+  public server without its closing 404, or a tailnet server without its
+  guard reads as a route nothing wants, so the reconciler re-applies.
+- **The route table:** each live app's tailnet route, plus a public route
+  to the same container if it has a public name and `PUBLIC_DOMAIN` is set,
+  plus `hooks.<domain>` → `platform:8082` if the webhook is on. Probe
+  routes stay tailnet-only. Draining works for both: Caddy counts in-flight
+  requests per upstream, whichever server they came through.
+- **Metrics per app, not per host:** the collector takes each host's
+  difference from its own running totals, then adds hosts up per app
+  (looked up every minute), histogram buckets included, so an app's p95
+  covers its tailnet and public requests together. Hosts that aren't an
+  app's (probes, `hooks.`) aren't kept. Renaming an app's public name keeps
+  its history.
+- **`PUBLIC_DOMAIN` must differ from `APPS_DOMAIN`,** or a public and a
+  tailnet hostname could be the same name on two servers.
+- **`cloudflared` runs read-only, with no capabilities, on two networks:**
+  `tunnel` (internal, with Caddy) and `tunnel-egress` (its own way out to
+  Cloudflare, which nothing else joins). CI can't run it (no token), so it
+  sends requests to Caddy's public server from a container on the tunnel
+  network, and checks what that network can't reach.

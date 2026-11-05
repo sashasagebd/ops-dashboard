@@ -227,7 +227,8 @@ func (f *fakes) LiveApps(context.Context) ([]store.LiveApp, error) {
 	var live []store.LiveApp
 	for id, s := range f.statuses {
 		if s == store.StatusHealthy {
-			live = append(live, store.LiveApp{AppName: f.app.Name, Hostname: "hello.apps.test", Port: f.app.Port, DeploymentID: id})
+			live = append(live, store.LiveApp{AppName: f.app.Name, Hostname: "hello.apps.test", PublicName: f.app.PublicName,
+				Port: f.app.Port, DeploymentID: id})
 		}
 	}
 	return live, nil
@@ -824,6 +825,39 @@ func TestSyncRoutesAppliesOnlyWhenCaddyDiffers(t *testing.T) {
 			}
 			if tt.wantChanged && describe(f.applies[0]) != "[hello.apps.test->app-hello-6:8080]" {
 				t.Errorf("applied %s, want the database's table", describe(f.applies[0]))
+			}
+		})
+	}
+}
+
+func TestRouteTableWithPublicHostnames(t *testing.T) {
+	tailnet := router.Route{Host: "hello.apps.test", Upstream: "app-hello-6:8080"}
+	public := router.Route{Host: "hi.example.com", Upstream: "app-hello-6:8080", Public: true}
+	hooks := router.Route{Host: "hooks.example.com", Upstream: "platform:8082", Public: true}
+	tests := []struct {
+		name               string
+		publicName, domain string
+		webhook            string
+		want               []router.Route
+	}{
+		{name: "tailnet only", domain: "example.com", want: []router.Route{tailnet}},
+		{name: "public", publicName: "hi", domain: "example.com", want: []router.Route{tailnet, public}},
+		{name: "public, webhook too", publicName: "hi", domain: "example.com", webhook: "platform:8082",
+			want: []router.Route{tailnet, public, hooks}},
+		// No domain configured: nothing is public, whatever the database says.
+		{name: "no domain", publicName: "hi", webhook: "platform:8082", want: []router.Route{tailnet}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakes() // deployment 6 is live
+			f.app.PublicName = tt.publicName
+			d := f.deployer()
+			d.cfg.PublicDomain, d.cfg.WebhookUpstream = tt.domain, tt.webhook
+			if err := d.ApplyRoutes(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(f.applies[0], tt.want) {
+				t.Errorf("applied %+v, want %+v", f.applies[0], tt.want)
 			}
 		})
 	}

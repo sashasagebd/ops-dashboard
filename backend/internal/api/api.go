@@ -38,6 +38,7 @@ type Store interface {
 	App(ctx context.Context, id int64) (store.App, error)
 	CreateApp(ctx context.Context, a store.NewApp) (store.App, error)
 	SetAutoDeploy(ctx context.Context, id int64, on bool) (store.App, error)
+	SetPublicName(ctx context.Context, id int64, name string) (store.App, error)
 	EnvVarKeys(ctx context.Context, appID int64) ([]string, error)
 	SetEnvVar(ctx context.Context, appID int64, key, value string) error
 	DeleteEnvVar(ctx context.Context, appID int64, key string) error
@@ -59,8 +60,9 @@ type Backups interface {
 	Start(ctx context.Context, appID int64) (store.Backup, error)
 }
 
-// Requests is apps' recent request numbers, by hostname; in production it's
-// a *metrics.Collector, or nil in tests that don't need it.
+// Requests is apps' recent request numbers, by app name (its tailnet and
+// public hostnames together); in production it's a *metrics.Collector, or
+// nil in tests that don't need it.
 type Requests interface {
 	Window(host string, window time.Duration) metrics.Series
 	Total(host string, window time.Duration) (float64, bool)
@@ -74,6 +76,7 @@ type Deployer interface {
 	Start(ctx context.Context, appID int64, commitSHA string) (store.Deployment, error)
 	StartLatest(ctx context.Context, appID int64) (store.Deployment, error)
 	Rollback(ctx context.Context, appID, deploymentID int64) (store.Deployment, error)
+	ApplyRoutes(ctx context.Context) error
 }
 
 // Engine reads app containers' output; in production it's an *engine.Client.
@@ -82,10 +85,16 @@ type Engine interface {
 	FollowLogs(ctx context.Context, id string, tail int, since time.Time, emit func(engine.LogLine)) error
 }
 
+// errPublicOff answers making an app public on a platform without a public
+// domain.
+var errPublicOff = errors.New("public hostnames aren't set up on this server (see PUBLIC_DOMAIN in the README)")
+
 // New returns the platform API's handler. Apps get the hostname
-// <name>.<appsDomain>.
-func New(st Store, dep Deployer, eng Engine, bk Backups, req Requests, appsDomain string) http.Handler {
-	a := &api{store: st, deployer: dep, engine: eng, backups: bk, requests: req, appsDomain: appsDomain}
+// <name>.<appsDomain>, and public ones <public name>.<publicDomain> ("": no
+// app can be public).
+func New(st Store, dep Deployer, eng Engine, bk Backups, req Requests, appsDomain, publicDomain string) http.Handler {
+	a := &api{store: st, deployer: dep, engine: eng, backups: bk, requests: req,
+		appsDomain: appsDomain, publicDomain: publicDomain}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/platform/apps", a.listApps)
 	mux.HandleFunc("POST /api/platform/apps", a.createApp)
@@ -113,6 +122,8 @@ type api struct {
 	backups    Backups  // nil if backups aren't set up
 	requests   Requests // nil: no request numbers
 	appsDomain string
+
+	publicDomain string // "" if nothing can be public
 }
 
 // Response types: the API's contract, separate from the store's types so it
@@ -133,7 +144,12 @@ type appResponse struct {
 	NextCommitSHA      *string             `json:"nextCommitSha"` // a pushed commit waiting for the deploy in progress
 	CreatedAt          time.Time           `json:"createdAt"`
 	CurrentDeployment  *deploymentResponse `json:"currentDeployment"` // null if nothing is live
-	// Requests to its hostname in the last hour, from Caddy; null if there
+	// The name in front of PUBLIC_DOMAIN it's public at, and the full
+	// hostname, null if it's tailnet-only. The hostname is also null while
+	// no public domain is set up, though the name is kept.
+	PublicName     *string `json:"publicName"`
+	PublicHostname *string `json:"publicHostname"`
+	// Requests to its hostnames in the last hour, from Caddy; null if there
 	// are no readings (the platform just started, or Caddy can't be read).
 	RequestsLastHour *int64 `json:"requestsLastHour"`
 }
@@ -155,6 +171,9 @@ type appDetailResponse struct {
 	Events      []eventResponse      `json:"events"`      // the reconciler's, newest first
 	Database    *databaseResponse    `json:"database"`    // null if the app has none
 	Backups     []backupResponse     `json:"backups"`     // its database's, newest first
+	// The server's public domain, which a public name goes in front of;
+	// null if public hostnames aren't set up.
+	PublicDomain *string `json:"publicDomain"`
 }
 
 // backupResponse is one backup of an app's database. The dump is a file in
@@ -223,11 +242,15 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-// appResponse is newAppResponse with the app's last-hour requests.
+// appResponse is newAppResponse with the app's public hostname and
+// last-hour requests.
 func (a *api) appResponse(app store.App, current *store.Deployment) appResponse {
 	r := newAppResponse(app, current)
+	if host := deploy.PublicHost(app.PublicName, a.publicDomain); host != "" {
+		r.PublicHostname = &host
+	}
 	if a.requests != nil {
-		if n, ok := a.requests.Total(app.Hostname, time.Hour); ok {
+		if n, ok := a.requests.Total(app.Name, time.Hour); ok {
 			v := int64(math.Round(n))
 			r.RequestsLastHour = &v
 		}
@@ -244,6 +267,9 @@ func newAppResponse(a store.App, current *store.Deployment) appResponse {
 	}
 	if a.NextCommitSHA != "" {
 		r.NextCommitSHA = &a.NextCommitSHA
+	}
+	if a.PublicName != "" {
+		r.PublicName = &a.PublicName
 	}
 	if current != nil {
 		d := newDeploymentResponse(*current)
@@ -448,19 +474,32 @@ func (a *api) getApp(w http.ResponseWriter, r *http.Request) {
 	for _, b := range bs {
 		backups = append(backups, newBackupResponse(b))
 	}
+	var publicDomain *string
+	if a.publicDomain != "" {
+		publicDomain = &a.publicDomain
+	}
 	writeJSON(w, http.StatusOK, appDetailResponse{
-		appResponse: a.appResponse(app, current),
-		EnvKeys:     keys,
-		Deployments: list,
-		Events:      newEventResponses(events),
-		Database:    db,
-		Backups:     backups,
+		appResponse:  a.appResponse(app, current),
+		PublicDomain: publicDomain,
+		EnvKeys:      keys,
+		Deployments:  list,
+		Events:       newEventResponses(events),
+		Database:     db,
+		Backups:      backups,
 	})
 }
 
+// updateAppRequest is the settings that can change; at least one, and
+// those left out stay as they are.
 type updateAppRequest struct {
-	AutoDeploy *bool `json:"autoDeploy"` // the only setting that can change, for now
+	AutoDeploy *bool `json:"autoDeploy"`
+	// PublicName makes the app public at <publicName>.<PUBLIC_DOMAIN>; ""
+	// makes it tailnet-only again.
+	PublicName *string `json:"publicName"`
 }
+
+// publicNameRe is one DNS label, lowercase, as the database checks it.
+var publicNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 func (a *api) updateApp(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
@@ -471,14 +510,40 @@ func (a *api) updateApp(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
-	if req.AutoDeploy == nil {
-		badRequest(w, "autoDeploy: true or false")
+	switch {
+	case req.AutoDeploy == nil && req.PublicName == nil:
+		badRequest(w, "nothing to change: autoDeploy (true or false) or publicName")
+		return
+	case req.PublicName != nil && *req.PublicName != "" && !publicNameRe.MatchString(*req.PublicName):
+		badRequest(w, "publicName: lowercase letters, digits and inner hyphens, at most 63 characters (one part of a hostname, e.g. api)")
+		return
+	case req.PublicName != nil && *req.PublicName == "hooks":
+		writeJSON(w, http.StatusConflict, errorResponse{"publicName: hooks is the GitHub webhook's"})
+		return
+	case req.PublicName != nil && *req.PublicName != "" && a.publicDomain == "":
+		writeJSON(w, http.StatusConflict, errorResponse{errPublicOff.Error()})
 		return
 	}
-	app, err := a.store.SetAutoDeploy(r.Context(), id, *req.AutoDeploy)
-	if err != nil {
-		writeError(w, r, err)
-		return
+	// Each setting is its own update; both are idempotent, so a failure
+	// halfway leaves nothing that a retry doesn't fix.
+	var app store.App
+	var err error
+	if req.AutoDeploy != nil {
+		if app, err = a.store.SetAutoDeploy(r.Context(), id, *req.AutoDeploy); err != nil {
+			writeError(w, r, err)
+			return
+		}
+	}
+	if req.PublicName != nil {
+		if app, err = a.store.SetPublicName(r.Context(), id, *req.PublicName); err != nil {
+			writeError(w, r, err)
+			return
+		}
+		// Caddy's routes follow at once, rather than at the reconciler's
+		// next pass.
+		if err := a.deployer.ApplyRoutes(r.Context()); err != nil {
+			slog.Warn("applying routes after a public name change; the reconciler will retry", "app", app.Name, "err", err)
+		}
 	}
 	current, err := a.current(r.Context(), id)
 	if err != nil {
@@ -748,7 +813,7 @@ func (a *api) appMetrics(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResponse{"not found"})
 		return
 	}
-	s := a.requests.Window(app.Hostname, window)
+	s := a.requests.Window(app.Name, window)
 	p95 := make([]*float64, len(s.P95))
 	for i, v := range s.P95 {
 		if v != nil {

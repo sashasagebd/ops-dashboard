@@ -39,13 +39,24 @@ function app(overrides: Partial<PlatformApp> = {}): PlatformApp {
     nextCommitSha: null,
     createdAt: '2026-11-01T00:00:00Z',
     currentDeployment: null,
+    publicName: null,
+    publicHostname: null,
     requestsLastHour: null,
     ...overrides,
   }
 }
 
 function detail(overrides: Partial<AppDetail> = {}): AppDetail {
-  return { ...app(), envKeys: [], deployments: [], events: [], database: null, backups: [], ...overrides }
+  return {
+    ...app(),
+    envKeys: [],
+    deployments: [],
+    events: [],
+    database: null,
+    backups: [],
+    publicDomain: 'example.com',
+    ...overrides,
+  }
 }
 
 function event(overrides: Partial<PlatformEvent> = {}): PlatformEvent {
@@ -112,7 +123,18 @@ describe('Apps page', () => {
     mockFetch({
       'GET /api/platform/apps': () => [
         200,
-        [app(), app({ id: 2, name: 'api', hostname: 'api.apps.test', currentDeployment: deployment(), requestsLastHour: 57 })],
+        [
+          app(),
+          app({
+            id: 2,
+            name: 'api',
+            hostname: 'api.apps.test',
+            currentDeployment: deployment(),
+            requestsLastHour: 57,
+            publicName: 'api',
+            publicHostname: 'api.example.com',
+          }),
+        ],
       ],
     })
     window.location.hash = '#/apps'
@@ -126,6 +148,11 @@ describe('Apps page', () => {
     )
     expect(within(rows[1]).getByText('not deployed')).toBeInTheDocument()
     expect(within(rows[2]).getByText('0123456')).toBeInTheDocument()
+    // A public app's public address too, over HTTPS.
+    expect(within(rows[2]).getByRole('link', { name: 'api.example.com' })).toHaveAttribute(
+      'href',
+      'https://api.example.com/',
+    )
     // Last-hour requests: none known for hello, 57 for api.
     expect(within(rows[1]).getByText('—')).toBeInTheDocument()
     expect(within(rows[2]).getByText('57')).toBeInTheDocument()
@@ -343,6 +370,55 @@ describe('App page', () => {
       autoDeploy: false,
     })
     expect(screen.queryByText('0123456')).not.toBeInTheDocument()
+  })
+
+  it('makes the app public, after asking, and tailnet-only again', async () => {
+    let publicName: string | null = null
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({ publicName, publicHostname: publicName === null ? null : `${publicName}.example.com` }),
+      ],
+      'PATCH /api/platform/apps/1': (init) => {
+        const name = (JSON.parse(init?.body as string) as { publicName: string }).publicName
+        publicName = name === '' ? null : name
+        return [200, app({ publicName })]
+      },
+    })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    window.location.hash = '#/apps/1'
+    render(<App />)
+
+    expect(await screen.findByText('no, tailnet only')).toBeInTheDocument()
+    const input = screen.getByRole('textbox', { name: 'Public name' })
+    const makePublic = screen.getByRole('button', { name: 'Make public' })
+    // Not one part of a hostname: can't be sent.
+    fireEvent.change(input, { target: { value: 'my.api' } })
+    expect(makePublic).toBeDisabled()
+    fireEvent.change(input, { target: { value: 'API' } }) // lowercased as typed
+    expect(makePublic).toBeEnabled()
+    fireEvent.click(makePublic)
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('https://api.example.com/'))
+    expect(JSON.parse(sent(fetchMock, 'PATCH', '/api/platform/apps/1')[0][1]?.body as string)).toEqual({
+      publicName: 'api',
+    })
+    const links = await screen.findAllByRole('link', { name: 'api.example.com' })
+    expect(links[0]).toHaveAttribute('href', 'https://api.example.com/')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Make tailnet-only' }))
+    expect(confirm).toHaveBeenLastCalledWith(expect.stringContaining('stops working'))
+    expect(JSON.parse(sent(fetchMock, 'PATCH', '/api/platform/apps/1')[1][1]?.body as string)).toEqual({
+      publicName: '',
+    })
+    expect(await screen.findByText('no, tailnet only')).toBeInTheDocument()
+  })
+
+  it("says public hostnames aren't set up without a public domain", async () => {
+    mockFetch({ 'GET /api/platform/apps/1': () => [200, detail({ publicDomain: null })] })
+    window.location.hash = '#/apps/1'
+    render(<App />)
+    expect(await screen.findByText(/Public hostnames aren't set up on this server/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Make public' })).not.toBeInTheDocument()
   })
 
   it('rolls back to an earlier version, after asking', async () => {

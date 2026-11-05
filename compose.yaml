@@ -45,17 +45,13 @@ services:
   # The deploy platform's control plane (docs/platform-plan.md). Same image
   # as the dashboard, different binary. A separate service so monitoring
   # keeps working when the platform doesn't, and so only the platform can
-  # write to Docker (docs/decisions/platform.md). No published port.
+  # write to Docker (docs/decisions/platform.md). No published port: GitHub's
+  # webhook reaches its webhook listener (8082) through Cloudflare's tunnel
+  # and Caddy, at hooks.<PUBLIC_DOMAIN>.
   platform:
     build: .
     entrypoint: ["/platform"]
     restart: unless-stopped
-    ports:
-      # The GitHub webhook's listener, and nothing else: the API on 8081
-      # stays unpublished. 127.0.0.1 only (Docker bypasses UFW); Tailscale
-      # Funnel forwards the public webhook URL here. Nothing listens on it
-      # unless GITHUB_WEBHOOK_SECRET is set.
-      - "127.0.0.1:${WEBHOOK_PORT:-8082}:8082"
     environment:
       # Hex passwords (see .env.example) need no escaping in a URL. No TLS:
       # the connection never leaves the internal platform-db network.
@@ -70,6 +66,12 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       # Optional: turns on push-to-deploy (see .env.example).
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      # Optional: apps made public are served at <public name>.<PUBLIC_DOMAIN>
+      # through the tunnel (see .env.example).
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-}
+      # The tunnel network's subnet (below), which Caddy's tailnet server
+      # refuses.
+      TUNNEL_SUBNET: 10.203.0.8/29
       APPS_NETWORK: platform-apps
       CADDY_ADMIN_URL: http://10.203.0.2:2019
       CADDY_PROXY_URL: http://10.203.0.2:80
@@ -163,6 +165,8 @@ services:
     networks:
       # Its proxy side: the only network apps are on.
       apps: {}
+      # Where cloudflared reaches its public server (:8080).
+      tunnel: {}
       # Its admin side. The admin API has no authentication, so it listens
       # only on this fixed address (see caddy/caddy.json), on a network only
       # the platform shares. Caddy is also on the apps network, and binding
@@ -173,6 +177,31 @@ services:
     # The image's caddy binary carries this file capability; with it outside
     # the container's capability set, Linux refuses to run the binary at all.
     cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+
+  # Cloudflare Tunnel: an outbound connection to Cloudflare that brings public
+  # traffic for PUBLIC_DOMAIN's hostnames in, with no published port and no
+  # port forwarding. Its routes are set in Cloudflare's dashboard (README,
+  # "Public hostnames") and should point at http://caddy:8080, Caddy's
+  # public server, which only has the public apps' routes (and the
+  # webhook's). Whatever they point at, it can only reach Caddy: it's on the
+  # tunnel network with Caddy alone, and Caddy's tailnet server refuses it.
+  # Off unless the tunnel profile is on (COMPOSE_PROFILES=tunnel in .env).
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.7
+    profiles: [tunnel]
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      # The tunnel's token from Cloudflare's dashboard; it's all cloudflared
+      # needs. Never commit it.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    networks:
+      - tunnel # to Caddy
+      - tunnel-egress # to Cloudflare
+    read_only: true
+    cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 128m
 
@@ -235,6 +264,17 @@ networks:
           # (.2) to whichever starts first; after a reboot that was the
           # platform, and Caddy then failed with "Address already in use".
           ip_range: 10.203.0.4/30
+  tunnel:
+    # cloudflared and Caddy only. A fixed subnet, which the platform tells
+    # Caddy's tailnet server to refuse (TUNNEL_SUBNET above). Next to
+    # caddy-admin's 10.203.0.0/29, outside Docker's default pools.
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.203.0.8/29
+  tunnel-egress:
+    # cloudflared's way out to Cloudflare; nothing else joins it, so the
+    # tunnel can't reach any other service through it.
   apps:
     # Every deployed app, and Caddy's proxy side; nothing else. The platform
     # creates app containers on it by this fixed name. Not internal: apps

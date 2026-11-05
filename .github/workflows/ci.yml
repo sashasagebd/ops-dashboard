@@ -158,6 +158,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           # Turns on push-to-deploy; the tests below sign deliveries with it.
           GITHUB_WEBHOOK_SECRET: ci-only-webhook-secret-0123456789abcdef
+          # Public hostnames. There's no tunnel here (no Cloudflare token):
+          # requests go where cloudflared would send them, Caddy's public
+          # server, from a container on the tunnel network.
+          PUBLIC_DOMAIN: public.test
           # Where app database backups go (the server uses ~/backups).
           BACKUP_DIR: /tmp/ci-backups
           # The commit to deploy in the end-to-end test: this one. (For a
@@ -228,6 +232,13 @@ jobs:
           visit() {
             docker run --rm --network platform-apps curlimages/curl:8.11.1 -sS --max-time 10 \
               -H "Host: $1" "http://caddy$2"
+          }
+          # Requests from the internet, as cloudflared forwards them: from the
+          # tunnel network to Caddy's public server. Extra curl options
+          # first, then the host and path.
+          pub() {
+            docker run --rm --network dashboard_tunnel curlimages/curl:8.11.1 -sS --max-time 10 \
+              "${@:1:$#-2}" -H "Host: ${@: -2:1}" "http://caddy:8080${@: -1}"
           }
           # Queues a deploy of commit $1, printing the deployment's ID.
           start_deploy() {
@@ -323,14 +334,15 @@ jobs:
           grep -F 'listening' /tmp/app.log || { cat /tmp/app.log; on_failure; }
 
           # Push-to-deploy: deliveries as GitHub sends them (JSON, signed
-          # with the shared secret) to the webhook's own published port.
-          # selftest is the only app so far, on this repo's main branch.
-          # Prints the response, then the status code on its own line.
+          # with the shared secret) to the webhook's public hostname, through
+          # Caddy's public server as the tunnel delivers them. selftest is the
+          # only app so far, on this repo's main branch. Prints the response,
+          # then the status code on its own line.
           hook() {
             sig="sha256=$(printf '%s' "$3" | openssl dgst -sha256 -hmac "$GITHUB_WEBHOOK_SECRET" | sed 's/^.*= //')"
-            curl -sS -X POST -H 'Content-Type: application/json' -H "X-GitHub-Event: $1" \
+            pub -X POST -H 'Content-Type: application/json' -H "X-GitHub-Event: $1" \
               -H "X-GitHub-Delivery: $2" -H "X-Hub-Signature-256: $sig" --data-binary "$3" \
-              -w '\n%{http_code}\n' http://127.0.0.1:8082/webhooks/github
+              -w '\n%{http_code}\n' hooks.public.test /webhooks/github
           }
           PUSH="{\"ref\":\"refs/heads/main\",\"after\":\"$DEPLOY_SHA\",\"deleted\":false,\"repository\":{\"html_url\":\"$REPO_URL\"}}"
           BEFORE=$(api GET "/api/platform/apps/$APP/deployments" | jq length)
@@ -344,11 +356,15 @@ jobs:
           # GitHub redelivering the first push changes nothing.
           hook push ci-push-1 "$PUSH" | grep 'already handled' || on_failure
           # A delivery without the right signature is refused, and the API
-          # isn't served on the public port at all.
-          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+          # isn't served on the webhook's hostname at all. The webhook's port
+          # isn't published on the host any more.
+          test "$(pub -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
             -H 'X-GitHub-Event: push' -H 'X-GitHub-Delivery: forged' -H 'X-Hub-Signature-256: sha256=00' \
-            --data "$PUSH" http://127.0.0.1:8082/webhooks/github)" = 401 || on_failure
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/api/platform/apps)" = 404 || on_failure
+            --data "$PUSH" hooks.public.test /webhooks/github)" = 401 || on_failure
+          test "$(pub -o /dev/null -w '%{http_code}' hooks.public.test /api/platform/apps)" = 404 || on_failure
+          if curl -s --max-time 5 http://127.0.0.1:8082/webhooks/github; then
+            echo "the webhook port is published"; exit 1
+          fi
           for i in $(seq 1 120); do
             DS=$(api GET "/api/platform/apps/$APP/deployments")
             if [ "$(echo "$DS" | jq length)" -ge $((BEFORE + 2)) ] && [ "$(echo "$DS" | jq -r '.[0].status')" = healthy ]; then
@@ -582,6 +598,31 @@ jobs:
           docker exec -i ops-db-hello pg_restore --clean --if-exists -U app -d app < "$BACKUP_DIR/hello/$FILE" || on_failure
           test "$(count_visit)" = $((N + 1)) || on_failure
 
+          # Public hostnames. hello starts tailnet-only: the public server
+          # doesn't know it.
+          test "$(pub -o /dev/null -w '%{http_code}' hello.public.test /)" = 404 || on_failure
+          dash PATCH "/api/platform/apps/$APP" '{"publicName":"hello"}' | jq -e '.publicHostname == "hello.public.test"' || on_failure
+          # Made public: served on its public hostname straight away.
+          pub hello.public.test / | grep 'Howdy from the platform' || on_failure
+          # Only public hostnames are on the public server: a tailnet one
+          # sent through the tunnel is a 404, whatever Host it carries...
+          test "$(pub -o /dev/null -w '%{http_code}' hello.apps.test /)" = 404 || on_failure
+          # ...and the tailnet server refuses the tunnel's network outright,
+          # in case a tunnel route points at caddy:80 by mistake.
+          test "$(docker run --rm --network dashboard_tunnel curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' \
+            --max-time 10 -H 'Host: hello.apps.test' http://caddy:80/)" = 403 || on_failure
+          # Nothing else is reachable from the tunnel's network: not the
+          # dashboard, the platform's API, Caddy's admin API, or an app.
+          HELLO_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "platform-apps").IPAddress}}' \
+            "$(docker ps -q --filter label=ops.platform.app=hello --filter label=ops.platform.role=app | head -1)")
+          [ -n "$HELLO_IP" ] || on_failure
+          for target in http://dashboard:8080/healthz http://platform:8081/healthz http://10.203.0.2:2019/config/ \
+              "http://$HELLO_IP:8080/"; do
+            if docker run --rm --network dashboard_tunnel curlimages/curl:8.11.1 -s --max-time 5 "$target"; then
+              echo "$target reachable from the tunnel network"; exit 1
+            fi
+          done
+
           # Metrics. CPU and memory: the dashboard's history has a series
           # for hello the app (its containers summed), apart from its
           # containers.
@@ -592,21 +633,30 @@ jobs:
           done
           # Requests: the platform has turned on Caddy's per-host metrics,
           # reads them once a minute, and counts hello's requests apart from
-          # everyone else's. Known requests are sent; the hour's count rises
-          # by at least that many within two readings.
+          # everyone else's. Known requests are sent, half on its tailnet
+          # hostname and half on its public one (an app's count is both);
+          # the hour's count rises by at least that many within two
+          # readings.
           docker run --rm --network dashboard_caddy-admin curlimages/curl:8.11.1 -fsS \
             http://10.203.0.2:2019/config/apps/http/metrics | jq -e '.per_host == true' || on_failure
           requests() { dash GET "/api/platform/apps/$APP/metrics?window=1h" | jq '[.requests[] | select(. != null)] | add // 0'; }
           BEFORE=$(requests)
-          for i in $(seq 1 40); do
+          for i in $(seq 1 20); do
             curl -fsS -o /dev/null -H 'Host: hello.apps.test' http://127.0.0.1/ || on_failure
           done
+          docker run --rm --network dashboard_tunnel --entrypoint sh curlimages/curl:8.11.1 -c \
+            'for i in $(seq 1 20); do curl -fsS -o /dev/null -H "Host: hello.public.test" http://caddy:8080/ || exit 1; done' || on_failure
           for i in $(seq 1 75); do
             [ "$(requests)" -ge $((BEFORE + 40)) ] && break
             [ "$i" = 75 ] && { echo "requests: $BEFORE before, $(requests) after"; on_failure; }
             sleep 2
           done
           dash GET /api/platform/apps | jq -e '.[] | select(.name == "hello") | .requestsLastHour >= 40' || on_failure
+          # Tailnet-only again: its public hostname is gone at once, and the
+          # tailnet one still serves.
+          dash PATCH "/api/platform/apps/$APP" '{"publicName":""}' | jq -e '.publicHostname == null' || on_failure
+          test "$(pub -o /dev/null -w '%{http_code}' hello.public.test /)" = 404 || on_failure
+          visit hello.apps.test / | grep 'Howdy from the platform' || on_failure
 
           # A source directory that doesn't exist fails with a clear reason
           # (found mid-stream, so this also checks the reason survives

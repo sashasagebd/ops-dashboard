@@ -110,7 +110,12 @@ export type PlatformApp = {
   nextCommitSha: string | null // a pushed commit waiting for the deploy in progress
   createdAt: string
   currentDeployment: Deployment | null // the live one; null if nothing is live
-  requestsLastHour: number | null // from Caddy; null without readings yet
+  // Public on the internet (through Cloudflare) at <publicName>.<domain>;
+  // both null if tailnet-only. publicHostname is also null while the server
+  // has no public domain set up.
+  publicName: string | null
+  publicHostname: string | null
+  requestsLastHour: number | null // from Caddy, tailnet and public together; null without readings yet
 }
 
 // AppDetail matches appDetailResponse.
@@ -120,6 +125,7 @@ export type AppDetail = PlatformApp & {
   events: PlatformEvent[] // the reconciler's, newest first, at most 20
   database: AppDatabase | null // null if the app has none
   backups: Backup[] // its database's, newest first, at most 7
+  publicDomain: string | null // what a public name goes in front of; null if public hostnames aren't set up
 }
 
 // Backup matches backupResponse: one pg_dump of an app's database, a file in
@@ -267,6 +273,12 @@ export function createDatabase(appId: number): Promise<AppDatabase> {
 // startBackup backs up the app's database now; it runs in the background.
 export function startBackup(appId: number): Promise<Backup> {
   return sendJSON<Backup>('POST', `/api/platform/apps/${appId}/backups`)
+}
+
+// setPublicName makes the app public at <name>.<publicDomain> at once, or
+// tailnet-only again with ''.
+export function setPublicName(appId: number, publicName: string): Promise<PlatformApp> {
+  return sendJSON<PlatformApp>('PATCH', `/api/platform/apps/${appId}`, { publicName })
 }
 
 export function setAutoDeploy(appId: number, autoDeploy: boolean): Promise<PlatformApp> {

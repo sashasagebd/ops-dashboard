@@ -64,6 +64,8 @@ func translate(err error) error {
 			return fmt.Errorf("%w: an app with that name already exists", ErrConflict)
 		case "apps_hostname_key":
 			return fmt.Errorf("%w: an app with that hostname already exists", ErrConflict)
+		case "apps_public_name_key":
+			return fmt.Errorf("%w: another app already has that public name", ErrConflict)
 		case "deployments_one_in_progress_per_app":
 			return ErrDeployInProgress
 		case "backups_one_in_progress_per_app":

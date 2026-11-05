@@ -96,7 +96,10 @@ cd frontend && npm run lint && npm test && npm run build
 | `GITHUB_TOKEN` | unset | platform: optional token for downloading app code (higher rate limit, private repos); read-only Contents access is enough |
 | `GITHUB_WEBHOOK_SECRET` | unset | platform: turns on push-to-deploy; the GitHub webhook's secret, at least 32 characters (`openssl rand -hex 32`). Unset, the webhook listener doesn't run. |
 | `WEBHOOK_LISTEN_ADDR` | `:8082` | platform: the webhook listener's address (only `POST /webhooks/github` is served there) |
-| `WEBHOOK_PORT` | `8082` | compose: host port for the webhook listener, always bound to `127.0.0.1` (Tailscale Funnel forwards to it) |
+| `PUBLIC_DOMAIN` | unset | platform: turns on public hostnames; apps made public are served at `<public name>.<PUBLIC_DOMAIN>`, the webhook at `hooks.<PUBLIC_DOMAIN>`. Must differ from `APPS_DOMAIN`. |
+| `CLOUDFLARE_TUNNEL_TOKEN` | unset | compose: the Cloudflare tunnel's token, for `cloudflared` |
+| `COMPOSE_PROFILES` | unset | compose: `tunnel` starts `cloudflared` |
+| `TUNNEL_SUBNET`, `WEBHOOK_UPSTREAM` | `10.203.0.8/29` (set in `compose.yaml`), `platform:8082` | platform: the tunnel network, which Caddy's tailnet server refuses; the webhook listener as Caddy reaches it |
 | `BACKUP_DIR` | required | compose: where app database backups are written (an existing directory, e.g. `/home/sasha/backups`) |
 | `BACKUP_UID`, `BACKUP_GID` | `1000`, `1000` | compose: who backups are written as, so the files are yours (`id -u`, `id -g`) |
 | `BACKUP_VOLUME`, `BACKUP_USER`, `BACKUP_MOUNT` | `platform-backups`, from `BACKUP_UID:BACKUP_GID`, `/backups` | platform: set in `compose.yaml`. Without `BACKUP_VOLUME`, backups are off. |
@@ -137,14 +140,65 @@ tailscale serve status
 
 The dashboard is then at `https://<server-name>.<tailnet>.ts.net/`.
 
+### Public hostnames
+
+Apps are tailnet-only unless you make them public. A public app is also
+served on the internet at `<public name>.<PUBLIC_DOMAIN>` (e.g.
+`api.sashasagebd.com`), through Cloudflare Tunnel: `cloudflared` makes an
+outbound connection to Cloudflare, which brings visitors' requests in, so
+nothing is published and no router port is forwarded. Cloudflare serves
+HTTPS. The GitHub webhook comes in the same way, at `hooks.<PUBLIC_DOMAIN>`.
+
+```
+internet -> Cloudflare (HTTPS) -> cloudflared -> Caddy :8080 (public server) -> public apps' containers
+                                                                             -> platform :8082 (hooks.<domain>: the webhook only)
+tailnet  -> Caddy :80 (tailnet server) -> every app's container
+```
+
+`cloudflared` shares a network with Caddy alone, and Caddy's public server
+has only public apps' routes (anything else is a 404), so the dashboard,
+the platform's API and tailnet-only apps can't be reached through the
+tunnel, however its routes are set. Caddy's tailnet server refuses requests
+from the tunnel's network outright.
+
+Setting it up, once (the domain must be on Cloudflare):
+
+1. In Cloudflare's dashboard: Zero Trust → Networks → Tunnels → **Create a
+   tunnel** → Cloudflared. Name it (e.g. `homelab`). On the next page, pick
+   Docker and copy the token: the long string after `--token` in the command
+   shown. Don't run that command; compose runs `cloudflared`.
+2. Add the tunnel's routes (Public hostnames, or Published application
+   routes), each to service **HTTP** `caddy:8080`:
+   - Subdomain `*`, your domain: every public name, with no Cloudflare
+     change per app. If the dashboard creates no DNS record for it, add one
+     under DNS → Records: type CNAME, name `*`, target
+     `<tunnel ID>.cfargotunnel.com`, proxied.
+   - If Cloudflare won't take `*`: one route per name instead, `hooks` plus
+     one for each app you make public.
+3. SSL/TLS → Edge Certificates: turn on **Always Use HTTPS**.
+4. On the server, in `.env`:
+   ```sh
+   PUBLIC_DOMAIN=sashasagebd.com
+   CLOUDFLARE_TUNNEL_TOKEN=<the token>
+   COMPOSE_PROFILES=tunnel
+   ```
+   then `docker compose up -d`. `docker compose logs cloudflared` should
+   show "Registered tunnel connection" (four of them), and the tunnel shows
+   Healthy in Cloudflare's dashboard.
+
+Then make an app public on its page: **Public access**, a name, **Make
+public**. It's served at its public hostname within seconds; **Make
+tailnet-only** takes it off again just as fast. Renaming it changes the
+address at once, and the old one stops working.
+
 ### Push-to-deploy
 
 A push to an app's branch deploys it (apps can turn this off on their page).
 GitHub sends the push to a webhook listener the platform runs on its own
-port, published on `127.0.0.1:8082` only, and Tailscale Funnel gives that
-one port a public HTTPS address. The dashboard on 443 stays tailnet-only.
-Every delivery is signed with a shared secret, and the platform refuses any
-that isn't.
+port, which isn't published: it's reached through the tunnel at
+`https://hooks.<PUBLIC_DOMAIN>/webhooks/github`, and that hostname serves
+nothing else. Every delivery is signed with a shared secret, and the
+platform refuses any that isn't. Needs public hostnames set up (above).
 
 1. Set the secret in `.env` and restart the platform:
    ```sh
@@ -154,15 +208,8 @@ that isn't.
    docker compose up -d
    docker compose logs platform | grep 'listening addr=:8082'
    ```
-2. Allow Funnel for the server in the Tailscale admin console (Access
-   controls: the `funnel` node attribute), then publish the webhook port.
-   This keeps running across reboots:
-   ```sh
-   sudo tailscale funnel --bg --https=8443 http://127.0.0.1:8082
-   tailscale funnel status
-   ```
-3. In each app's GitHub repo: Settings → Webhooks → Add webhook.
-   - Payload URL: `https://<server-name>.<tailnet>.ts.net:8443/webhooks/github`
+2. In each app's GitHub repo: Settings → Webhooks → Add webhook.
+   - Payload URL: `https://hooks.<PUBLIC_DOMAIN>/webhooks/github`
    - Content type: `application/json`
    - Secret: the value from step 1
    - Events: just the push event

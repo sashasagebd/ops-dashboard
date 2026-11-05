@@ -710,6 +710,40 @@ func TestSetAutoDeploy(t *testing.T) {
 	}
 }
 
+func TestSetPublicName(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	hello := createTestApp(t, s, "hello")
+	other := createTestApp(t, s, "other")
+
+	got, err := s.SetPublicName(ctx, hello.ID, "api")
+	if err != nil || got.PublicName != "api" {
+		t.Fatalf("set: %+v, %v; want api", got, err)
+	}
+	if again, _ := s.App(ctx, hello.ID); again.PublicName != "api" {
+		t.Errorf("read back: %q, want api", again.PublicName)
+	}
+	if _, err := s.SetPublicName(ctx, other.ID, "api"); !errors.Is(err, ErrConflict) {
+		t.Errorf("taken name: error = %v, want ErrConflict", err)
+	}
+	// The database refuses what the API should never send.
+	for _, bad := range []string{"hooks", "API", "a.b", "-x", "x-", strings.Repeat("a", 64)} {
+		if _, err := s.SetPublicName(ctx, other.ID, bad); !errors.Is(err, ErrInvalid) {
+			t.Errorf("public name %q: error = %v, want ErrInvalid", bad, err)
+		}
+	}
+	if cleared, err := s.SetPublicName(ctx, hello.ID, ""); err != nil || cleared.PublicName != "" {
+		t.Errorf("cleared: %+v, %v; want no public name", cleared, err)
+	}
+	// Once cleared, the name is free again.
+	if _, err := s.SetPublicName(ctx, other.ID, "api"); err != nil {
+		t.Errorf("reusing a cleared name: %v", err)
+	}
+	if _, err := s.SetPublicName(ctx, 999999, "x"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing app: error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestRecordDelivery(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()

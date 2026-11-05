@@ -12,18 +12,22 @@ import (
 
 // caddyOutput is a reading as Caddy's /metrics gives it, trimmed to what
 // matters: hello's requests (200s and a 502, two methods), a probe host, the
-// catch-all, another server's, and metrics that aren't read.
+// catch-all, another server's, and metrics that aren't read; and on the
+// public server, 2 requests to hello's public hostname.
 func caddyOutput(hello200, hello502 int) string {
 	var b strings.Builder
 	b.WriteString("# HELP caddy_http_request_duration_seconds Histogram of round-trip request durations.\n")
 	b.WriteString("# TYPE caddy_http_request_duration_seconds histogram\n")
-	hist := func(host, code, method string, n int, bounds map[string]int) {
+	histOn := func(server, host, code, method string, n int, bounds map[string]int) {
 		for _, le := range []string{"0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf"} {
-			fmt.Fprintf(&b, "caddy_http_request_duration_seconds_bucket{code=%q,handler=\"reverse_proxy\",host=%q,method=%q,server=\"apps\",le=%q} %d\n",
-				code, host, method, le, bounds[le])
+			fmt.Fprintf(&b, "caddy_http_request_duration_seconds_bucket{code=%q,handler=\"reverse_proxy\",host=%q,method=%q,server=%q,le=%q} %d\n",
+				code, host, method, server, le, bounds[le])
 		}
-		fmt.Fprintf(&b, "caddy_http_request_duration_seconds_sum{code=%q,handler=\"reverse_proxy\",host=%q,method=%q,server=\"apps\"} 1.5\n", code, host, method)
-		fmt.Fprintf(&b, "caddy_http_request_duration_seconds_count{code=%q,handler=\"reverse_proxy\",host=%q,method=%q,server=\"apps\"} %d\n", code, host, method, n)
+		fmt.Fprintf(&b, "caddy_http_request_duration_seconds_sum{code=%q,handler=\"reverse_proxy\",host=%q,method=%q,server=%q} 1.5\n", code, host, method, server)
+		fmt.Fprintf(&b, "caddy_http_request_duration_seconds_count{code=%q,handler=\"reverse_proxy\",host=%q,method=%q,server=%q} %d\n", code, host, method, server, n)
+	}
+	hist := func(host, code, method string, n int, bounds map[string]int) {
+		histOn("apps", host, code, method, n, bounds)
 	}
 	// hello's 200s all took between 10 and 25ms.
 	fast := func(n int) map[string]int {
@@ -37,6 +41,7 @@ func caddyOutput(hello200, hello502 int) string {
 	hist("hello.apps.test:80", "502", "POST", hello502, fast(hello502)) // a port in Host: still hello
 	hist("probe-7.platform.internal", "200", "GET", 9, fast(9))
 	hist("_other", "404", "GET", 4, fast(4))
+	histOn("public", "hello.example.com", "200", "GET", 2, fast(2))
 	b.WriteString(`caddy_http_request_duration_seconds_count{code="200",handler="file_server",host="hello.apps.test",method="GET",server="srv0"} 1000` + "\n")
 	b.WriteString(`caddy_http_requests_total{handler="reverse_proxy",host="hello.apps.test",server="apps"} 77` + "\n")
 	b.WriteString(`go_goroutines 42` + "\n")
@@ -56,8 +61,11 @@ func TestParseRequests(t *testing.T) {
 	if _, ok := got["_other"]; ok {
 		t.Error("the catch-all counted as a host")
 	}
-	if len(got) != 2 {
-		t.Errorf("hosts = %v, want hello and the probe", len(got))
+	if public := got["hello.example.com"]; public == nil || public.requests != 2 {
+		t.Errorf("public host = %+v, want 2 requests", public)
+	}
+	if len(got) != 3 {
+		t.Errorf("hosts = %v, want hello, its public hostname and the probe", len(got))
 	}
 }
 
@@ -173,6 +181,35 @@ func TestCollector(t *testing.T) {
 	}
 	if total, ok := c.Total("hello.apps.test", time.Hour); !ok || total != 36 {
 		t.Errorf("Total = %v, %v; want 36", total, ok)
+	}
+}
+
+func TestCollectorGroupsHostsByApp(t *testing.T) {
+	caddy := &fakeCaddy{readings: []string{caddyOutput(100, 0), caddyOutput(130, 0), caddyOutput(130, 0)}}
+	c := New(caddy, time.Minute, time.Hour)
+	c.Group = func(context.Context) (map[string]string, error) {
+		return map[string]string{"hello.apps.test": "hello", "hello.example.com": "hello"}, nil
+	}
+	now := time.Date(2026, 11, 4, 12, 0, 30, 0, time.UTC)
+	c.now = func() time.Time { return now }
+	c.Collect(t.Context()) // baseline, the public hostname's 2 included
+	now = now.Add(time.Minute)
+	c.Collect(t.Context()) // +30 on the tailnet hostname, none public
+	if total, ok := c.Total("hello", time.Hour); !ok || total != 30 {
+		t.Errorf("hello = %v, %v; want 30", total, ok)
+	}
+	// Hosts that aren't an app's aren't kept, nor are hosts by their own name.
+	for _, key := range []string{"probe-7.platform.internal", "hello.apps.test"} {
+		if total, _ := c.Total(key, time.Hour); total != 0 {
+			t.Errorf("%s = %v, want nothing kept", key, total)
+		}
+	}
+
+	// A failed lookup is a failed reading: a gap, not numbers under the
+	// wrong key.
+	c.Group = func(context.Context) (map[string]string, error) { return nil, errors.New("db down") }
+	if err := c.Collect(t.Context()); err == nil {
+		t.Error("Collect succeeded although the lookup failed")
 	}
 }
 

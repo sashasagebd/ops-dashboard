@@ -14,6 +14,7 @@ import {
   fetchHistory,
   rollback,
   setAutoDeploy,
+  setPublicName,
   setEnvVar,
   startBackup,
   type AppDetail,
@@ -75,6 +76,8 @@ const EVENT_LABEL: Record<EventKind, string> = {
 const IN_PROGRESS: ReadonlySet<DeploymentStatus> = new Set(['queued', 'building', 'starting'])
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/
+// One part of a hostname, as the platform checks a public name.
+const PUBLIC_NAME_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
 
 // AppsPage lists the platform's apps and registers new ones.
 export function AppsPage() {
@@ -121,6 +124,12 @@ function AppsTable({ apps }: { apps: PlatformApp[] }) {
               </td>
               <td>
                 <AppLink hostname={a.hostname} />
+                {a.publicHostname !== null && (
+                  <>
+                    <br />
+                    <PublicLink hostname={a.publicHostname} />
+                  </>
+                )}
               </td>
               <td>
                 {a.currentDeployment === null ? (
@@ -217,6 +226,8 @@ export function AppPage({ id }: { id: number }) {
             <h3>Deploy</h3>
             <DeployForm app={app} onDeployed={onDeployed} />
             <AutoDeploy app={app} onDone={refresh} />
+            <h3>Public access</h3>
+            <PublicAccess app={app} onDone={refresh} />
             <h3>Logs</h3>
             <Logs app={app} choice={log} onChoose={setLog} />
             <h3>Deployments</h3>
@@ -250,6 +261,14 @@ function AppSummary({ app }: { app: AppDetail }) {
       <dt>Address</dt>
       <dd>
         <AppLink hostname={app.hostname} />
+      </dd>
+      <dt>Public</dt>
+      <dd>
+        {app.publicHostname === null ? (
+          <span className="muted">no, tailnet only</span>
+        ) : (
+          <PublicLink hostname={app.publicHostname} />
+        )}
       </dd>
       <dt>Live</dt>
       <dd>
@@ -351,6 +370,74 @@ function AutoDeploy({ app, onDone }: { app: AppDetail; onDone: () => void }) {
         </p>
       )}
       <ActionError state={action} />
+    </div>
+  )
+}
+
+// PublicAccess makes the app public on the internet, at a name of its own
+// under the server's public domain, or tailnet-only again.
+function PublicAccess({ app, onDone }: { app: AppDetail; onDone: () => void }) {
+  const [name, setName] = useState('')
+  const [action, run] = useAction()
+  const domain = app.publicDomain
+  const save = (publicName: string) => {
+    void run(async () => {
+      await setPublicName(app.id, publicName)
+      setName('')
+      onDone()
+    })
+  }
+  const onSubmit = (e: FormEvent) => {
+    e.preventDefault()
+    if (!window.confirm(`Make ${app.name} public? Anyone on the internet can reach it at https://${name}.${domain}/.`)) {
+      return
+    }
+    save(name)
+  }
+  const onPrivate = () => {
+    if (!window.confirm(`Make ${app.name} tailnet-only? https://${app.publicHostname}/ stops working at once.`)) return
+    save('')
+  }
+
+  if (domain === null) {
+    return (
+      <p className="muted">
+        Public hostnames aren't set up on this server (<span className="mono">PUBLIC_DOMAIN</span>), so apps are
+        tailnet-only.
+      </p>
+    )
+  }
+  return (
+    <div>
+      {app.publicHostname === null ? (
+        <p className="muted">Tailnet only. Give it a public name to serve it on the internet, through Cloudflare.</p>
+      ) : (
+        <p>
+          Public at <PublicLink hostname={app.publicHostname} />.{' '}
+          <button type="button" onClick={onPrivate} disabled={action.status === 'busy'}>
+            Make tailnet-only
+          </button>
+        </p>
+      )}
+      <form className="form-inline" onSubmit={onSubmit}>
+        <label>
+          <span className="visually-hidden">Public name</span>
+          <input
+            className="mono"
+            value={name}
+            onChange={(e) => setName(e.target.value.trim().toLowerCase())}
+            placeholder={app.publicName ?? 'e.g. api'}
+            pattern={PUBLIC_NAME_PATTERN.source}
+            title="Lowercase letters, digits and inner hyphens"
+            spellCheck={false}
+          />
+        </label>
+        <span className="mono">.{domain}</span>
+        <button type="submit" disabled={!PUBLIC_NAME_PATTERN.test(name) || action.status === 'busy'}>
+          {app.publicHostname === null ? 'Make public' : 'Change'}
+        </button>
+        <ActionError state={action} />
+      </form>
     </div>
   )
 }
@@ -851,11 +938,20 @@ function Field({ label, hint, children }: { label: string; hint: string; childre
   )
 }
 
-// Apps are served over plain HTTP: on the tailnet for now, and behind
-// Cloudflare (which adds HTTPS) once they're public.
+// Apps are served over plain HTTP on the tailnet; their public addresses
+// (PublicLink) are HTTPS.
 function AppLink({ hostname }: { hostname: string }) {
   return (
     <a href={`http://${hostname}/`} target="_blank" rel="noreferrer">
+      {hostname}
+    </a>
+  )
+}
+
+// PublicLink is an app's public address: HTTPS, which Cloudflare adds.
+function PublicLink({ hostname }: { hostname: string }) {
+  return (
+    <a href={`https://${hostname}/`} target="_blank" rel="noreferrer">
       {hostname}
     </a>
   )

@@ -25,24 +25,31 @@ type Source interface {
 }
 
 // Collector reads Caddy's request metrics every Step and keeps Retention of
-// per-step numbers per host. Safe for concurrent use.
+// per-step numbers per key: per host, or per app with Group. Safe for
+// concurrent use.
 type Collector struct {
 	src  Source
 	step time.Duration
 	size int // steps kept
 	now  func() time.Time
 
+	// Group, if set, says which key each host's requests count towards
+	// (an app's name, for its tailnet and public hostnames alike), read at
+	// every reading; hosts it leaves out (the webhook's, health probes')
+	// aren't kept. Unset, each host is its own key.
+	Group func(ctx context.Context) (map[string]string, error)
+
 	mu      sync.Mutex
 	prev    map[string]*counters // the last reading; nil before the first
 	ok      []bool               // per step slot: a reading was taken in it
 	slotIdx []int64              // which step each slot holds now
-	hosts   map[string]*hostSeries
+	series  map[string]*keySeries
 
 	lastErr string // Run's last logged error; only Run touches it
 }
 
-// hostSeries is one host's ring of per-step numbers, indexed like ok.
-type hostSeries struct {
+// keySeries is one key's ring of per-step numbers, indexed like ok.
+type keySeries struct {
 	requests, errors []float64
 	p95              []float64 // seconds; NaN when there were no requests
 	idx              []int64
@@ -53,7 +60,7 @@ func New(src Source, step, retention time.Duration) *Collector {
 	n := int(retention / step)
 	return &Collector{
 		src: src, step: step, size: n, now: time.Now,
-		ok: make([]bool, n), slotIdx: make([]int64, n), hosts: map[string]*hostSeries{},
+		ok: make([]bool, n), slotIdx: make([]int64, n), series: map[string]*keySeries{},
 	}
 }
 
@@ -91,6 +98,12 @@ func (c *Collector) Collect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var group map[string]string
+	if c.Group != nil {
+		if group, err = c.Group(ctx); err != nil {
+			return err
+		}
+	}
 	idx := c.now().UnixNano() / int64(c.step)
 
 	c.mu.Lock()
@@ -104,16 +117,38 @@ func (c *Collector) Collect(ctx context.Context) error {
 		c.slotIdx[slot], c.ok[slot] = idx, false
 	}
 	c.ok[slot] = true
+	// Differences are taken per host (each has its own running totals),
+	// then added up per key, buckets included, so a key's p95 is over all
+	// its hosts' requests.
+	sums := map[string]*counters{}
 	for host, now := range cur {
+		key := host
+		if group != nil {
+			if key = group[host]; key == "" {
+				continue
+			}
+		}
 		d := delta(c.prev[host], now)
-		s := c.hosts[host]
+		sum := sums[key]
+		if sum == nil {
+			sum = &counters{buckets: map[float64]float64{}}
+			sums[key] = sum
+		}
+		sum.requests += d.requests
+		sum.errors += d.errors
+		for le, n := range d.buckets {
+			sum.buckets[le] += n
+		}
+	}
+	for key, d := range sums {
+		s := c.series[key]
 		if s == nil {
-			s = &hostSeries{requests: make([]float64, c.size), errors: make([]float64, c.size),
+			s = &keySeries{requests: make([]float64, c.size), errors: make([]float64, c.size),
 				p95: make([]float64, c.size), idx: make([]int64, c.size)}
 			for i := range s.idx {
 				s.idx[i] = -1
 			}
-			c.hosts[host] = s
+			c.series[key] = s
 		}
 		if s.idx[slot] != idx {
 			s.idx[slot], s.requests[slot], s.errors[slot] = idx, 0, 0
@@ -180,7 +215,7 @@ func quantile(q float64, buckets map[float64]float64) float64 {
 	return lowerBound
 }
 
-// Series is a window of one host's numbers, one value per Step from Start,
+// Series is a window of one key's numbers, one value per Step from Start,
 // oldest first; nil where no reading was taken (the platform was down, or
 // Caddy couldn't be read).
 type Series struct {
@@ -191,9 +226,9 @@ type Series struct {
 	P95      []*float64 // seconds; nil also when there were no requests
 }
 
-// Window returns host's last window of numbers, ending with the current
-// step. A host with no requests in a step that was read has 0 for it.
-func (c *Collector) Window(host string, window time.Duration) Series {
+// Window returns key's last window of numbers, ending with the current
+// step. A key with no requests in a step that was read has 0 for it.
+func (c *Collector) Window(key string, window time.Duration) Series {
 	n := min(max(int((window+c.step-1)/c.step), 1), c.size)
 	end := c.now().UnixNano() / int64(c.step)
 	first := end - int64(n) + 1
@@ -202,7 +237,7 @@ func (c *Collector) Window(host string, window time.Duration) Series {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	hs := c.hosts[host]
+	hs := c.series[key]
 	for i := range n {
 		idx := first + int64(i)
 		slot := c.slot(idx)
@@ -221,10 +256,10 @@ func (c *Collector) Window(host string, window time.Duration) Series {
 	return s
 }
 
-// Total is how many requests host had over the last window, and false if
-// no reading was taken in it at all.
-func (c *Collector) Total(host string, window time.Duration) (float64, bool) {
-	s := c.Window(host, window)
+// Total is how many requests key had over the last window, and false if no
+// reading was taken in it at all.
+func (c *Collector) Total(key string, window time.Duration) (float64, bool) {
+	s := c.Window(key, window)
 	total, any := 0.0, false
 	for _, r := range s.Requests {
 		if r != nil {

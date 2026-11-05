@@ -172,6 +172,7 @@ func (s *Store) CurrentDeployment(ctx context.Context, appID int64) (Deployment,
 type LiveApp struct {
 	AppName      string `db:"name"`
 	Hostname     string `db:"hostname"`
+	PublicName   string `db:"public_name"` // "" if tailnet-only
 	Port         int    `db:"port"`
 	DeploymentID int64  `db:"deployment_id"`
 }
@@ -179,7 +180,7 @@ type LiveApp struct {
 // LiveApps returns every app that has a healthy deployment, by name.
 func (s *Store) LiveApps(ctx context.Context) ([]LiveApp, error) {
 	rows, _ := s.pool.Query(ctx, `
-		SELECT a.name, a.hostname, a.port, d.id AS deployment_id
+		SELECT a.name, a.hostname, COALESCE(a.public_name, '') AS public_name, a.port, d.id AS deployment_id
 		FROM apps a JOIN deployments d ON d.app_id = a.id AND d.status = 'healthy'
 		ORDER BY a.name`)
 	live, err := pgx.CollectRows(rows, pgx.RowToStructByName[LiveApp])

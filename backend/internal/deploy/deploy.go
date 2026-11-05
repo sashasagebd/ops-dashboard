@@ -91,6 +91,28 @@ type Config struct {
 	HealthInterval time.Duration // time between health probes
 	DrainTimeout   time.Duration // how long the old version gets to finish its requests after the switch
 	DrainInterval  time.Duration // time between checks that it has
+
+	// PublicDomain, if set, is where public apps are served on the internet
+	// (through Cloudflare's tunnel): <public name>.<PublicDomain>. Empty:
+	// no app is public.
+	PublicDomain string
+	// WebhookUpstream, if set with PublicDomain, is the platform's webhook
+	// listener as Caddy reaches it (e.g. "platform:8082"), routed publicly
+	// at WebhookHost.
+	WebhookUpstream string
+}
+
+// WebhookHost is the GitHub webhook's public hostname under domain. The
+// database reserves its first label, so no app can take it.
+func WebhookHost(domain string) string { return "hooks." + domain }
+
+// PublicHost is an app's public hostname, or "" if it isn't public (or
+// nothing is: no domain).
+func PublicHost(publicName, domain string) string {
+	if publicName == "" || domain == "" {
+		return ""
+	}
+	return publicName + "." + domain
 }
 
 // Deployer queues deployments and runs them as jobs.
@@ -342,7 +364,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 			return err
 		}
 		d.pruneImages(ctx, log, out, app)
-		out.Printf("Live at http://%s/", app.Hostname)
+		d.printLive(out, app)
 		return nil
 	default:
 		// Finished some other way (superseded by a later deploy, or failed
@@ -414,7 +436,7 @@ func (d *Deployer) deploy(ctx context.Context, log *slog.Logger, out *deployLog,
 	}
 	d.pruneImages(ctx, log, out, app)
 	log.Info("deploy finished: healthy")
-	out.Printf("Live at http://%s/", app.Hostname)
+	d.printLive(out, app)
 	return nil
 }
 
@@ -476,6 +498,14 @@ func (d *Deployer) reuseImage(ctx context.Context, out *deployLog, dep store.Dep
 	}
 	out.Printf("Using image %s (no build)", dep.ImageTag)
 	return dep.ImageTag, nil
+}
+
+// printLive ends a deploy's log with where the app is served now.
+func (d *Deployer) printLive(out *deployLog, app store.App) {
+	out.Printf("Live at http://%s/", app.Hostname)
+	if host := PublicHost(app.PublicName, d.cfg.PublicDomain); host != "" {
+		out.Printf("Public at https://%s/", host)
+	}
 }
 
 // pruneImages removes the app's images that are no longer kept: the platform
@@ -670,18 +700,25 @@ func (d *Deployer) SyncMetrics(ctx context.Context) (changed bool, err error) {
 }
 
 // routeTable is what Caddy should route: every app's hostname to its live
-// deployment's container, plus any probe routes for deployments being
-// checked.
+// deployment's container (and its public hostname too, for a public app),
+// the webhook's public hostname to the platform, plus any probe routes for
+// deployments being checked (tailnet only).
 func (d *Deployer) routeTable(ctx context.Context) ([]router.Route, error) {
 	live, err := d.store.LiveApps(ctx)
 	if err != nil {
 		return nil, err
 	}
-	routes := make([]router.Route, 0, len(live))
+	routes := make([]router.Route, 0, len(live)+1)
 	for _, a := range live {
+		upstream := ContainerName(a.AppName, a.DeploymentID) + ":" + strconv.Itoa(a.Port)
+		routes = append(routes, router.Route{Host: a.Hostname, Upstream: upstream})
+		if host := PublicHost(a.PublicName, d.cfg.PublicDomain); host != "" {
+			routes = append(routes, router.Route{Host: host, Upstream: upstream, Public: true})
+		}
+	}
+	if d.cfg.PublicDomain != "" && d.cfg.WebhookUpstream != "" {
 		routes = append(routes, router.Route{
-			Host:     a.Hostname,
-			Upstream: ContainerName(a.AppName, a.DeploymentID) + ":" + strconv.Itoa(a.Port),
+			Host: WebhookHost(d.cfg.PublicDomain), Upstream: d.cfg.WebhookUpstream, Public: true,
 		})
 	}
 	d.mu.Lock()

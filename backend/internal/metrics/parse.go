@@ -18,11 +18,12 @@ type counters struct {
 	buckets  map[float64]float64 // duration histogram: upper bound (seconds, +Inf included) -> requests that took at most that long
 }
 
-// server is the Caddy server whose traffic is the apps' (router.serverPath).
-const server = "apps"
+// servers are the Caddy servers whose traffic is the apps': the tailnet one
+// and the public one (internal/router).
+var servers = map[string]bool{"apps": true, "public": true}
 
 // parseRequests reads Caddy's metrics (Prometheus's text format) and returns
-// each host's request counters, for the platform's server only. It reads the
+// each host's request counters, for the platform's servers only. It reads the
 // request duration histogram, which has everything needed: its _count by
 // code gives requests and 5xx, its buckets give latency percentiles.
 //
@@ -43,7 +44,7 @@ func parseRequests(data []byte) (map[string]*counters, error) {
 			return nil, err
 		}
 		host := labels["host"]
-		if labels["server"] != server || host == "" || host == "_other" {
+		if !servers[labels["server"]] || host == "" || host == "_other" {
 			continue
 		}
 		host = stripPort(host)

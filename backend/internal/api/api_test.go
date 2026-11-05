@@ -66,6 +66,21 @@ func (f *fakeStore) CreateApp(_ context.Context, n store.NewApp) (store.App, err
 	return a, nil
 }
 
+func (f *fakeStore) SetPublicName(_ context.Context, id int64, name string) (store.App, error) {
+	for _, a := range f.apps {
+		if a.PublicName == name && name != "" && a.ID != id {
+			return store.App{}, fmt.Errorf("%w: another app already has that public name", store.ErrConflict)
+		}
+	}
+	for i, a := range f.apps {
+		if a.ID == id {
+			f.apps[i].PublicName = name
+			return f.apps[i], nil
+		}
+	}
+	return store.App{}, store.ErrNotFound
+}
+
 func (f *fakeStore) SetAutoDeploy(_ context.Context, id int64, on bool) (store.App, error) {
 	for i, a := range f.apps {
 		if a.ID == id {
@@ -166,6 +181,13 @@ type fakeDeployer struct {
 	started    []string
 	latest     string // the branch head StartLatest finds; "" for none
 	rolledBack []int64
+
+	routesApplied int
+}
+
+func (f *fakeDeployer) ApplyRoutes(context.Context) error {
+	f.routesApplied++
+	return nil
 }
 
 func (f *fakeDeployer) Rollback(_ context.Context, appID, target int64) (store.Deployment, error) {
@@ -195,7 +217,7 @@ func newTestAPI() (http.Handler, *fakeStore, *fakeDeployer) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", RepoURL: "https://github.com/o/hello", Hostname: "hello.apps.test", Port: 8080}}
 	dep := &fakeDeployer{}
-	return New(st, dep, &fakeEngine{}, nil, nil, "apps.test"), st, dep
+	return New(st, dep, &fakeEngine{}, nil, nil, "apps.test", ""), st, dep
 }
 
 // do sends a request; a non-empty body is sent as JSON.
@@ -374,7 +396,7 @@ func TestInternalErrorsAreGeneric(t *testing.T) {
 
 func TestListAppsEmptyIsArray(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
-	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, nil, nil, "apps.test"), "GET", "/api/platform/apps", "")
+	rec := do(t, New(st, &fakeDeployer{}, &fakeEngine{}, nil, nil, "apps.test", ""), "GET", "/api/platform/apps", "")
 	if strings.TrimSpace(rec.Body.String()) != "[]" {
 		t.Errorf("body = %s, want []", rec.Body)
 	}
@@ -405,6 +427,71 @@ func TestAutoDeploySwitch(t *testing.T) {
 	}
 	if rec := do(t, h, "PATCH", "/api/platform/apps/9", `{"autoDeploy":true}`); rec.Code != http.StatusNotFound {
 		t.Errorf("missing app: status %d, want 404", rec.Code)
+	}
+}
+
+func TestPublicName(t *testing.T) {
+	st := &fakeStore{env: map[string]string{}}
+	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test"}, {ID: 2, Name: "other", Hostname: "other.apps.test"}}
+	dep := &fakeDeployer{}
+	h := New(st, dep, &fakeEngine{}, nil, nil, "apps.test", "example.com")
+
+	got := decode[appDetailResponse](t, do(t, h, "GET", "/api/platform/apps/1", ""))
+	if got.PublicName != nil || got.PublicHostname != nil {
+		t.Errorf("new app: public %v %v, want tailnet-only", got.PublicName, got.PublicHostname)
+	}
+	if got.PublicDomain == nil || *got.PublicDomain != "example.com" {
+		t.Errorf("publicDomain = %v, want example.com", got.PublicDomain)
+	}
+	rec := do(t, h, "PATCH", "/api/platform/apps/1", `{"publicName":"hi"}`)
+	app := decode[appResponse](t, rec)
+	if rec.Code != http.StatusOK || app.PublicHostname == nil || *app.PublicHostname != "hi.example.com" ||
+		*app.PublicName != "hi" || st.apps[0].PublicName != "hi" {
+		t.Fatalf("made public: %d %s", rec.Code, rec.Body)
+	}
+	if dep.routesApplied != 1 {
+		t.Errorf("routes applied %d times, want once, straight away", dep.routesApplied)
+	}
+	// Only the public name changed.
+	if st.apps[0].AutoDeploy {
+		t.Error("autoDeploy changed too")
+	}
+
+	for body, want := range map[string]int{
+		`{"publicName":"Hi"}`:        http.StatusBadRequest,
+		`{"publicName":"a.b"}`:       http.StatusBadRequest,
+		`{"publicName":"-x"}`:        http.StatusBadRequest,
+		`{"publicName":7}`:           http.StatusBadRequest,
+		`{"publicName":"hooks"}`:     http.StatusConflict, // the webhook's
+		`{"publicName":"hi"}`:        http.StatusOK,       // its own again: fine
+		`{"publicName":"elsewhere"}`: http.StatusOK,
+	} {
+		if rec := do(t, h, "PATCH", "/api/platform/apps/1", body); rec.Code != want {
+			t.Errorf("PATCH %s: status %d, want %d: %s", body, rec.Code, want, rec.Body)
+		}
+	}
+	do(t, h, "PATCH", "/api/platform/apps/1", `{"publicName":"hi"}`)
+	if rec := do(t, h, "PATCH", "/api/platform/apps/2", `{"publicName":"hi"}`); rec.Code != http.StatusConflict {
+		t.Errorf("another app's name: status %d, want 409", rec.Code)
+	}
+
+	// Cleared: tailnet-only again.
+	rec = do(t, h, "PATCH", "/api/platform/apps/1", `{"publicName":""}`)
+	if app := decode[appResponse](t, rec); rec.Code != http.StatusOK || app.PublicName != nil || app.PublicHostname != nil {
+		t.Errorf("cleared: %d %s", rec.Code, rec.Body)
+	}
+
+	// No public domain: an app can't be made public, but clearing works.
+	off := New(st, dep, &fakeEngine{}, nil, nil, "apps.test", "")
+	if rec := do(t, off, "PATCH", "/api/platform/apps/1", `{"publicName":"hi"}`); rec.Code != http.StatusConflict ||
+		!strings.Contains(rec.Body.String(), "PUBLIC_DOMAIN") {
+		t.Errorf("no domain: %d %s, want 409 pointing at PUBLIC_DOMAIN", rec.Code, rec.Body)
+	}
+	if rec := do(t, off, "PATCH", "/api/platform/apps/1", `{"publicName":""}`); rec.Code != http.StatusOK {
+		t.Errorf("clearing with no domain: %d", rec.Code)
+	}
+	if got := decode[appDetailResponse](t, do(t, off, "GET", "/api/platform/apps/1", "")); got.PublicDomain != nil {
+		t.Errorf("no domain: publicDomain = %v, want null", *got.PublicDomain)
 	}
 }
 
@@ -512,7 +599,7 @@ func TestDatabase(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test", Port: 8080}}
 	eng := &fakeEngine{}
-	h := New(st, &fakeDeployer{}, eng, nil, nil, "apps.test")
+	h := New(st, &fakeDeployer{}, eng, nil, nil, "apps.test", "")
 
 	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"database":null`) {
 		t.Errorf("no database yet: body %s, want database null", rec.Body)
@@ -581,7 +668,7 @@ func TestBackups(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello"}}
 	bk := &fakeBackups{}
-	h := New(st, &fakeDeployer{}, &fakeEngine{}, bk, nil, "apps.test")
+	h := New(st, &fakeDeployer{}, &fakeEngine{}, bk, nil, "apps.test", "")
 
 	if rec := do(t, h, "GET", "/api/platform/apps/1", ""); !strings.Contains(rec.Body.String(), `"backups":[]`) {
 		t.Errorf("no backups yet: %s, want backups []", rec.Body)
@@ -616,7 +703,7 @@ func TestBackups(t *testing.T) {
 	}
 
 	// Backups not set up on this platform: a clear 409.
-	off := New(st, &fakeDeployer{}, &fakeEngine{}, nil, nil, "apps.test")
+	off := New(st, &fakeDeployer{}, &fakeEngine{}, nil, nil, "apps.test", "")
 	if rec := do(t, off, "POST", "/api/platform/apps/1/backups", ""); rec.Code != http.StatusConflict ||
 		!strings.Contains(rec.Body.String(), "BACKUP_DIR") {
 		t.Errorf("backups off: %d %s, want 409 pointing at BACKUP_DIR", rec.Code, rec.Body)
@@ -625,10 +712,10 @@ func TestBackups(t *testing.T) {
 
 type fakeRequests struct{}
 
-func (fakeRequests) Window(host string, window time.Duration) metrics.Series {
+func (fakeRequests) Window(app string, window time.Duration) metrics.Series {
 	one, five, p := 1.0, 5.0, 0.0234567
 	s := metrics.Series{Start: time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC), Step: time.Minute}
-	if host == "hello.apps.test" {
+	if app == "hello" {
 		s.Requests = []*float64{nil, &five}
 		s.Errors = []*float64{nil, &one}
 		s.P95 = []*float64{nil, &p}
@@ -636,8 +723,8 @@ func (fakeRequests) Window(host string, window time.Duration) metrics.Series {
 	return s
 }
 
-func (fakeRequests) Total(host string, _ time.Duration) (float64, bool) {
-	if host == "hello.apps.test" {
+func (fakeRequests) Total(app string, _ time.Duration) (float64, bool) {
+	if app == "hello" {
 		return 5.4, true
 	}
 	return 0, false
@@ -646,7 +733,7 @@ func (fakeRequests) Total(host string, _ time.Duration) (float64, bool) {
 func TestRequestMetrics(t *testing.T) {
 	st := &fakeStore{env: map[string]string{}}
 	st.apps = []store.App{{ID: 1, Name: "hello", Hostname: "hello.apps.test"}, {ID: 2, Name: "new", Hostname: "new.apps.test"}}
-	h := New(st, &fakeDeployer{}, &fakeEngine{}, nil, fakeRequests{}, "apps.test")
+	h := New(st, &fakeDeployer{}, &fakeEngine{}, nil, fakeRequests{}, "apps.test", "")
 
 	rec := do(t, h, "GET", "/api/platform/apps/1/metrics", "")
 	if rec.Code != http.StatusOK {
