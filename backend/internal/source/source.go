@@ -118,12 +118,23 @@ var ErrBranchNotFound = errors.New("branch not found in the repository")
 // LatestCommit returns the SHA of the newest commit on a branch of repoURL,
 // for deploying "whatever is on main now".
 func (g *GitHub) LatestCommit(ctx context.Context, repoURL, branch string) (string, error) {
+	sha, _, _, err := g.LatestCommitIfChanged(ctx, repoURL, branch, "")
+	return sha, err
+}
+
+// LatestCommitIfChanged is LatestCommit for asking again and again (polling):
+// etag is what the last answer carried (or ""), and if the branch hasn't
+// moved since, GitHub answers 304 and changed is false (sha is then "").
+// GitHub doesn't count a 304 to an authenticated request against the rate
+// limit, so checking an unchanged branch every minute costs nothing there.
+// newETag goes with the next call.
+func (g *GitHub) LatestCommitIfChanged(ctx context.Context, repoURL, branch, etag string) (sha, newETag string, changed bool, err error) {
 	owner, repo, err := ParseRepoURL(repoURL)
 	if err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	if branch == "" {
-		return "", ErrBranchNotFound
+		return "", "", false, ErrBranchNotFound
 	}
 	// Branch names can contain slashes (feature/x): each part is escaped,
 	// the slashes kept.
@@ -133,26 +144,32 @@ func (g *GitHub) LatestCommit(ctx context.Context, repoURL, branch string) (stri
 	}
 	u := fmt.Sprintf("%s/repos/%s/%s/commits/%s", g.APIBase, url.PathEscape(owner), url.PathEscape(repo), strings.Join(parts, "/"))
 	// This media type answers with just the SHA, not the whole commit.
-	resp, err := g.get(ctx, u, "application/vnd.github.sha")
+	extra := http.Header{}
+	if etag != "" {
+		extra.Set("If-None-Match", etag)
+	}
+	resp, err := g.get(ctx, u, "application/vnd.github.sha", extra)
 	if err != nil {
-		return "", fmt.Errorf("looking up %s: %w", branch, err)
+		return "", "", false, fmt.Errorf("looking up %s: %w", branch, err)
 	}
 	defer resp.Body.Close()
 	switch {
+	case resp.StatusCode == http.StatusNotModified && etag != "":
+		return "", etag, false, nil
 	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusUnprocessableEntity:
-		return "", ErrBranchNotFound
+		return "", "", false, ErrBranchNotFound
 	case resp.StatusCode != http.StatusOK:
-		return "", fmt.Errorf("looking up %s: GitHub answered %s", branch, resp.Status)
+		return "", "", false, fmt.Errorf("looking up %s: GitHub answered %s", branch, resp.Status)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	if err != nil {
-		return "", fmt.Errorf("looking up %s: %w", branch, err)
+		return "", "", false, fmt.Errorf("looking up %s: %w", branch, err)
 	}
-	sha := strings.TrimSpace(string(body))
+	sha = strings.TrimSpace(string(body))
 	if !shaPattern.MatchString(sha) {
-		return "", fmt.Errorf("looking up %s: GitHub answered %.50q, not a commit SHA", branch, sha)
+		return "", "", false, fmt.Errorf("looking up %s: GitHub answered %.50q, not a commit SHA", branch, sha)
 	}
-	return sha, nil
+	return sha, resp.Header.Get("ETag"), true, nil
 }
 
 // get sends a GET to GitHub's API, with the token if there is one.
@@ -161,10 +178,15 @@ func (g *GitHub) LatestCommit(ctx context.Context, repoURL, branch string) (stri
 // a redirect to a different domain, but compares hostnames only (not ports)
 // and treats subdomains as the same, so the rule is made explicit here: any
 // change of host:port drops it.
-func (g *GitHub) get(ctx context.Context, u, accept string) (*http.Response, error) {
+func (g *GitHub) get(ctx context.Context, u, accept string, extra ...http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
+	}
+	for _, h := range extra {
+		for k, vs := range h {
+			req.Header[k] = vs
+		}
 	}
 	req.Header.Set("Accept", accept)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")

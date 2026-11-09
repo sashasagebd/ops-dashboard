@@ -348,6 +348,34 @@ func keys(m map[string]string) []string {
 	return ks
 }
 
+func TestLatestCommitIfChanged(t *testing.T) {
+	const head = "89abcdef0123456789abcdef0123456789abcdef"
+	var gotIfNoneMatch string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotIfNoneMatch = r.Header.Get("If-None-Match")
+		if gotIfNoneMatch == `"v1"` {
+			w.WriteHeader(http.StatusNotModified) // the branch hasn't moved
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = io.WriteString(w, head)
+	}))
+	defer srv.Close()
+	g := NewGitHub()
+	g.APIBase = srv.URL
+
+	// The first time: the head, and the ETag to send next time.
+	sha, etag, changed, err := g.LatestCommitIfChanged(t.Context(), "https://github.com/o/r", "main", "")
+	if err != nil || sha != head || etag != `"v1"` || !changed || gotIfNoneMatch != "" {
+		t.Fatalf("first = %q, %q, %v, %v (If-None-Match %q)", sha, etag, changed, err, gotIfNoneMatch)
+	}
+	// Again with it: unchanged, no SHA, the same ETag kept.
+	sha, etag, changed, err = g.LatestCommitIfChanged(t.Context(), "https://github.com/o/r", "main", etag)
+	if err != nil || sha != "" || etag != `"v1"` || changed || gotIfNoneMatch != `"v1"` {
+		t.Errorf("again = %q, %q, %v, %v (If-None-Match %q)", sha, etag, changed, err, gotIfNoneMatch)
+	}
+}
+
 func TestLatestCommit(t *testing.T) {
 	const head = "89abcdef0123456789abcdef0123456789abcdef"
 	var gotPath, gotAccept, gotAuth string

@@ -45,7 +45,7 @@ type Store interface {
 
 // Deployer deploys pushed commits; in production it's a *deploy.Deployer.
 type Deployer interface {
-	Push(ctx context.Context, appID int64, commitSHA string) (store.Deployment, bool, error)
+	Push(ctx context.Context, appID int64, commitSHA string) (store.Deployment, store.RequestOutcome, error)
 }
 
 // New returns the webhook listener's handler: Path and nothing else. secret
@@ -190,13 +190,25 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "auto-deploy is off"})
 			continue
 		}
+<<<<<<< Updated upstream
 		dep, started, err := h.deployer.Push(ctx, app.ID, push.After)
+=======
+		if app.Stopped {
+			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "the app is stopped"})
+			continue
+		}
+		dep, outcome, err := h.deployer.Push(ctx, app.ID, push.After)
+>>>>>>> Stashed changes
 		switch {
 		case err != nil:
 			slog.Error("webhook: deploying a push", "app", app.Name, "commit", push.After, "err", err)
 			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "internal error; see the platform's logs"})
 			status = http.StatusInternalServerError
-		case started:
+		case outcome == store.RequestKnown:
+			// The branch poller got there first, or the same commit was
+			// pushed again.
+			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "already deployed, or on its way"})
+		case outcome == store.RequestStarted:
 			slog.Info("webhook: deploying a push", "app", app.Name, "commit", push.After, "deployment", dep.ID)
 			res.Apps = append(res.Apps, appResult{App: app.Name, Result: "deploying", DeploymentID: &dep.ID})
 		default:

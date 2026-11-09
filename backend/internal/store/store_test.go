@@ -624,14 +624,21 @@ func TestRequestDeploymentWaitsForTheOneInProgress(t *testing.T) {
 	}
 
 	// Nothing in progress: it deploys straight away.
-	first, started, err := s.RequestDeployment(ctx, app.ID, sha1)
-	if err != nil || !started || first.CommitSHA != sha1 {
-		t.Fatalf("RequestDeployment = %+v, %v, %v; want started", first, started, err)
+	first, outcome, err := s.RequestDeployment(ctx, app.ID, sha1)
+	if err != nil || outcome != RequestStarted || first.CommitSHA != sha1 {
+		t.Fatalf("RequestDeployment = %+v, %v, %v; want started", first, outcome, err)
 	}
 	// Busy: the next pushes wait, and the newest wins.
 	for _, sha := range []string{sha2, sha3} {
-		if _, started, err := s.RequestDeployment(ctx, app.ID, sha); err != nil || started {
-			t.Fatalf("RequestDeployment(%s) while busy: started %v, %v; want it to wait", sha[:4], started, err)
+		if _, outcome, err := s.RequestDeployment(ctx, app.ID, sha); err != nil || outcome != RequestWaiting {
+			t.Fatalf("RequestDeployment(%s) while busy: %v, %v; want it to wait", sha[:4], outcome, err)
+		}
+	}
+	// Seen again (the poller after the webhook, or a redelivery): the one
+	// deploying and the one waiting are both known already.
+	for _, sha := range []string{sha1, sha3} {
+		if _, outcome, err := s.RequestDeployment(ctx, app.ID, sha); err != nil || outcome != RequestKnown {
+			t.Errorf("RequestDeployment(%s) again: %v, %v; want it known", sha[:4], outcome, err)
 		}
 	}
 	got, _ := s.App(ctx, app.ID)
@@ -655,6 +662,15 @@ func TestRequestDeploymentWaitsForTheOneInProgress(t *testing.T) {
 	if _, ok, _ := s.StartNextDeployment(ctx, app.ID); ok {
 		t.Error("started the same next commit twice")
 	}
+	// The latest failed, and seeing its commit again doesn't retry it; an
+	// older commit pushed again (a revert) does deploy.
+	mustDo(t, s.MarkFailed(ctx, next.ID, "test"))
+	if _, outcome, _ := s.RequestDeployment(ctx, app.ID, sha3); outcome != RequestKnown {
+		t.Errorf("the latest, failed commit seen again: %v, want it known (not retried)", outcome)
+	}
+	if _, outcome, _ := s.RequestDeployment(ctx, app.ID, sha1); outcome != RequestStarted {
+		t.Errorf("an older commit pushed again: %v, want it deployed", outcome)
+	}
 	if _, _, err := s.RequestDeployment(ctx, 999999, sha1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("RequestDeployment(missing app) error = %v, want ErrNotFound", err)
 	}
@@ -670,11 +686,11 @@ func TestConcurrentPushesStartOneDeploy(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Go(func() {
-			_, started, err := s.RequestDeployment(ctx, app.ID, sha1)
+			_, outcome, err := s.RequestDeployment(ctx, app.ID, sha1)
 			if err != nil {
 				t.Error(err)
 			}
-			if started {
+			if outcome == RequestStarted {
 				mu.Lock()
 				starts++
 				mu.Unlock()
@@ -683,11 +699,11 @@ func TestConcurrentPushesStartOneDeploy(t *testing.T) {
 	}
 	wg.Wait()
 	if starts != 1 {
-		t.Errorf("%d pushes started a deploy, want exactly 1 (the rest wait)", starts)
+		t.Errorf("%d pushes started a deploy, want exactly 1 (the rest find it deploying)", starts)
 	}
 	got, _ := s.App(ctx, app.ID)
-	if got.NextCommitSHA != sha1 {
-		t.Errorf("next = %q, want the waiting push", got.NextCommitSHA)
+	if got.NextCommitSHA != "" {
+		t.Errorf("next = %q, want none: it's the commit already deploying", got.NextCommitSHA)
 	}
 }
 

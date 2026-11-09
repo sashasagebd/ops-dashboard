@@ -49,17 +49,21 @@ type fakeDeployer struct {
 	pushed []string // "appID sha"
 	busy   map[int64]bool
 	err    error
+	known  map[int64]bool // apps that have the pushed commit already (the poller got there first)
 }
 
-func (f *fakeDeployer) Push(_ context.Context, appID int64, commit string) (store.Deployment, bool, error) {
+func (f *fakeDeployer) Push(_ context.Context, appID int64, commit string) (store.Deployment, store.RequestOutcome, error) {
 	if f.err != nil {
-		return store.Deployment{}, false, f.err
+		return store.Deployment{}, 0, f.err
 	}
 	f.pushed = append(f.pushed, commit[:7]+" to "+string(rune('0'+appID)))
-	if f.busy[appID] {
-		return store.Deployment{}, false, nil
+	switch {
+	case f.known[appID]:
+		return store.Deployment{}, store.RequestKnown, nil
+	case f.busy[appID]:
+		return store.Deployment{}, store.RequestWaiting, nil
 	}
-	return store.Deployment{ID: 40 + appID, AppID: appID}, true, nil
+	return store.Deployment{ID: 40 + appID, AppID: appID}, store.RequestStarted, nil
 }
 
 func newTestWebhook() (http.Handler, *fakeStore, *fakeDeployer) {
@@ -70,7 +74,7 @@ func newTestWebhook() (http.Handler, *fakeStore, *fakeDeployer) {
 		{ID: 4, Name: "paused", RepoURL: "https://github.com/owner/repo", Branch: "main", AutoDeploy: false},
 		{ID: 5, Name: "other", RepoURL: "https://github.com/owner/other", Branch: "main", AutoDeploy: true},
 	}}
-	dep := &fakeDeployer{busy: map[int64]bool{}}
+	dep := &fakeDeployer{busy: map[int64]bool{}, known: map[int64]bool{}}
 	return New(secret, st, dep), st, dep
 }
 
@@ -103,6 +107,15 @@ func deliver(t *testing.T, h http.Handler, event, delivery, body string, signatu
 	var res response
 	_ = json.Unmarshal(rec.Body.Bytes(), &res)
 	return rec, res
+}
+
+func TestPushOfACommitAlreadyKnown(t *testing.T) {
+	h, _, dep := newTestWebhook()
+	dep.known[1] = true // the branch poller deployed it a moment ago
+	_, res := deliver(t, h, "push", "d-known", pushBody("refs/heads/main"))
+	if len(res.Apps) == 0 || res.Apps[0].App != "web" || res.Apps[0].Result != "already deployed, or on its way" {
+		t.Errorf("apps = %+v, want web reported as already deployed", res.Apps)
+	}
 }
 
 func TestPushDeploysMatchingApps(t *testing.T) {

@@ -76,14 +76,41 @@ func createDeployment(ctx context.Context, db interface {
 // take turns: a push can't see a deploy in progress, then miss it finishing
 // and leave its commit waiting with nothing to start it.
 
-// RequestDeployment queues a deploy of commitSHA for an app if it has none in
-// progress (started is true), and otherwise makes commitSHA the app's next
-// commit, replacing any older one, for StartNextDeployment to deploy once the
-// one in progress has finished.
-func (s *Store) RequestDeployment(ctx context.Context, appID int64, commitSHA string) (d Deployment, started bool, err error) {
+// RequestOutcome is what RequestDeployment did with a commit.
+type RequestOutcome int
+
+const (
+	RequestStarted RequestOutcome = iota + 1 // queued a deploy of it
+	RequestWaiting                           // a deploy is in progress: it's the app's next commit
+	RequestKnown                             // the latest deployment's commit, or the one waiting: nothing to do
+)
+
+// RequestDeployment is for a commit seen on an app's branch (a push, or the
+// branch poller): it queues a deploy of commitSHA if the app has none in
+// progress, and otherwise makes commitSHA the app's next commit, replacing
+// any older one, for StartNextDeployment to deploy once the one in progress
+// has finished. The commit of the app's latest deployment (deploying, live,
+// or failed) or the one waiting is left alone (RequestKnown): the webhook
+// and the poller both see every push, and a failed deploy isn't retried
+// every time its commit is seen again. An older commit pushed again (a
+// revert by force-push) does deploy. Deploying the same commit again on
+// purpose is CreateDeployment's ("Deploy latest", or a commit).
+func (s *Store) RequestDeployment(ctx context.Context, appID int64, commitSHA string) (d Deployment, outcome RequestOutcome, err error) {
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockApp(ctx, tx, appID); err != nil {
 			return err
+		}
+		var known bool
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE((SELECT commit_sha FROM deployments WHERE app_id = $1
+			                 ORDER BY id DESC LIMIT 1) = $2, false)
+			    OR EXISTS (SELECT 1 FROM apps WHERE id = $1 AND next_commit_sha = $2)`,
+			appID, commitSHA).Scan(&known); err != nil {
+			return err
+		}
+		if known {
+			outcome = RequestKnown
+			return nil
 		}
 		// In a savepoint (a nested transaction), because a refused insert
 		// would otherwise abort the whole transaction.
@@ -94,16 +121,17 @@ func (s *Store) RequestDeployment(ctx context.Context, appID int64, commitSHA st
 		})
 		switch {
 		case err == nil:
-			started = true
+			outcome = RequestStarted
 			return nil
 		case errors.Is(err, ErrDeployInProgress):
+			outcome = RequestWaiting
 			_, err := tx.Exec(ctx, "UPDATE apps SET next_commit_sha = $2 WHERE id = $1", appID, commitSHA)
 			return err
 		default:
 			return err
 		}
 	})
-	return d, started, translate(err)
+	return d, outcome, translate(err)
 }
 
 // StartNextDeployment queues a deploy of the app's next commit, if it has one

@@ -642,6 +642,52 @@ What changed:
 - No backend change; no new dependencies. Tests were moved to the new
   layout, plus tests for the URL's tab, keyboard tabs and the theme switch.
 
+<<<<<<< Updated upstream
+=======
+## L: Stopping and deleting apps 🔍
+
+Asked for 2026-11-05: apps had no way to be taken offline or removed. The
+owner chose to leave a deleted app's database volume for removal by hand
+rather than give the platform Docker's `VOLUMES` permission.
+
+- **Stop / Start** on an app's Settings tab. Stop removes its container and
+  routes (memory freed, addresses off), keeps its live version, database,
+  settings and history; no deploys or rollbacks meanwhile (pushes say "the
+  app is stopped"); refused mid-deploy. Start runs the live version again
+  from its image. The reconciler leaves a stopped app stopped.
+- **Delete** (type the name to confirm): the app's rows (cascade), routes,
+  containers (database's too), images and database network. Its database
+  volume and backups stay; the Apps page then shows the commands to remove
+  them, and warns to remove the volume before reusing the name. Refused
+  mid-deploy or mid-backup.
+- Migration 0013 (`apps.stopped`). API: `POST /apps/{id}/stop`, `/start`,
+  `DELETE /apps/{id}`; apps have `stopped`. Engine: `RemoveNetwork` (the
+  `NETWORKS` group the proxy already allows). Tests: store (database), the
+  deployer's order of work, the reconciler, the API, the webhook, the UI.
+  Details in [decisions/platform.md](decisions/platform.md) ("Stopping and
+  deleting apps").
+
+## B: Branch polling 🔍
+
+Asked for 2026-11-08: pushes to pokewordle's repo didn't deploy (no
+webhook on that repo; each repo needs one by hand). The owner chose
+automation; polling over a GitHub App (much less to set up), every 60s.
+
+- With `GITHUB_TOKEN`, every `BRANCH_POLL_INTERVAL` (1m) the platform asks
+  GitHub for each auto-deployed, running app's branch head, with an ETag
+  (unchanged: 304, free against the rate limit); a new commit goes through
+  `Push`, like the webhook's. The webhook stays, as the instant path.
+- A commit that's the app's latest deployment's (deploying, live or
+  failed) or the waiting one is ignored, so a push both see deploys once
+  and a failed deploy isn't retried every minute. CI's second identical
+  push now reports "already deployed, or on its way" instead of waiting.
+- CI runs with polling off (it would deploy main to the test apps
+  mid-run), then at the end restarts the platform polling every 10s and
+  checks a new app deploys main's head, once.
+- Details in [decisions/platform.md](decisions/platform.md) ("Branch
+  polling"). On the server: `GITHUB_TOKEN` must be set in `.env`.
+
+>>>>>>> Stashed changes
 ## Open questions
 
 - **pokewordle's Worker and its backend** (for after P5): worth checking

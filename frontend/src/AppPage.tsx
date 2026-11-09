@@ -703,6 +703,10 @@ function AutoDeploy({ app, onDone }: { app: AppDetail; onDone: () => void }) {
           Deploy automatically on every push to <span className="mono">{app.branch}</span>
         </span>
       </label>
+      <p className="muted card-note">
+        Within seconds if the repo has the platform's GitHub webhook; otherwise the platform checks the branch every
+        minute.
+      </p>
       {!app.autoDeploy && rolledBackTo(app) !== null && (
         <p className="muted card-note">
           Turned off by the rollback to #{rolledBackTo(app)}, so that a push doesn't replace it. Turn it back on once

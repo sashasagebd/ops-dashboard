@@ -66,6 +66,9 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       # Optional: turns on push-to-deploy (see .env.example).
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      # How often apps' branches are checked for new commits (needs
+      # GITHUB_TOKEN; 0 turns it off). See .env.example.
+      BRANCH_POLL_INTERVAL: ${BRANCH_POLL_INTERVAL:-1m}
       # Optional: apps made public are served at <public name>.<PUBLIC_DOMAIN>
       # through the tunnel (see .env.example).
       PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-}
