@@ -94,6 +94,7 @@ cd frontend && npm run lint && npm test && npm run build
 | `APPS_LISTEN_IP` | required | compose: the IP Caddy serves apps on (port 80); the server's Tailscale IP. Never `0.0.0.0`: Docker bypasses UFW. |
 | `PLATFORM_URL` | `http://platform:8081` | dashboard: where it forwards `/api/platform/` (set in `compose.yaml`) |
 | `GITHUB_TOKEN` | unset | platform: optional token for downloading app code (higher rate limit, private repos); read-only Contents access is enough |
+| `BRANCH_POLL_INTERVAL` | `1m` | platform: how often apps' branches are checked for new commits, so repos without the webhook still deploy on push (Go duration, at least `10s`; `0` turns it off; needs `GITHUB_TOKEN`) |
 | `GITHUB_WEBHOOK_SECRET` | unset | platform: turns on push-to-deploy; the GitHub webhook's secret, at least 32 characters (`openssl rand -hex 32`). Unset, the webhook listener doesn't run. |
 | `WEBHOOK_LISTEN_ADDR` | `:8082` | platform: the webhook listener's address (only `POST /webhooks/github` is served there) |
 | `PUBLIC_DOMAIN` | unset | platform: turns on public hostnames; apps made public are served at `<public name>.<PUBLIC_DOMAIN>`, the webhook at `hooks.<PUBLIC_DOMAIN>`. Must differ from `APPS_DOMAIN`. |
@@ -194,7 +195,12 @@ address at once, and the old one stops working.
 
 ### Push-to-deploy
 
-A push to an app's branch deploys it (apps can turn this off on their page).
+With `GITHUB_TOKEN` set, this needs no setup: the platform checks each
+auto-deployed app's branch every minute (`BRANCH_POLL_INTERVAL`) and deploys
+a new commit. A GitHub webhook on the repo, below, makes it instant instead
+of within a minute; both can be on, and a push still deploys once.
+
+The webhook: a push to an app's branch deploys it (apps can turn this off on their page).
 GitHub sends the push to a webhook listener the platform runs on its own
 port, which isn't published: it's reached through the tunnel at
 `https://hooks.<PUBLIC_DOMAIN>/webhooks/github`, and that hostname serves

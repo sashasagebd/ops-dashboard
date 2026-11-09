@@ -144,6 +144,26 @@ func run(addr string) error {
 
 	github := source.NewGitHub()
 	github.Token = os.Getenv("GITHUB_TOKEN") // optional
+	// Without a token, GitHub allows 60 requests an hour from the server's
+	// IP: too few to check every app's branch every minute. Pushes still
+	// deploy through the webhook.
+	// BRANCH_POLL_INTERVAL: how often (a Go duration, at least 10s; 0 turns
+	// it off), default a minute.
+	pollEvery := time.Minute
+	if v := os.Getenv("BRANCH_POLL_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || (d != 0 && d < 10*time.Second) {
+			return fmt.Errorf("BRANCH_POLL_INTERVAL %q: want a duration of at least 10s (e.g. 1m), or 0 for off", v)
+		}
+		pollEvery = d
+	}
+	switch {
+	case github.Token == "" && pollEvery > 0:
+		slog.Info("polling branches for new commits is off: GITHUB_TOKEN isn't set (repos need the webhook to deploy on push)")
+		pollEvery = 0
+	case pollEvery == 0:
+		slog.Info("polling branches for new commits is off: BRANCH_POLL_INTERVAL is 0")
+	}
 	// Caddy's admin API and proxy port, on the internal network only the
 	// platform shares with it (see compose.yaml).
 	caddy := router.New(
@@ -257,6 +277,9 @@ func run(addr string) error {
 			wg.Go(func() { backuper.RunScheduler(ctx) })
 		}
 		wg.Go(func() { requests.Run(ctx) })
+		if pollEvery > 0 {
+			wg.Go(func() { deployer.RunPoller(ctx, pollEvery) })
+		}
 		runner.Run(ctx) // returns at once if ctx is already done
 		wg.Wait()
 	}()

@@ -70,6 +70,18 @@ type fakes struct {
 	dbSpec      engine.DatabaseSpec // what RunDatabase was asked for
 	userEnv     map[string]string   // EnvVars' answer, if set
 	onRun       func()              // hook, called as Run starts a container
+<<<<<<< Updated upstream
+=======
+
+	lifecycleErr error // StopApp, StartApp and DeleteApp refuse with it
+	deleted      bool  // DeleteApp ran: nothing of the app is live any more
+
+	head         string          // the branch's newest commit, for LatestCommitIfChanged
+	headETag     string          // its ETag
+	sentETags    []string        // the ETags the poller sent, in order
+	knownCommits map[string]bool // commits RequestDeployment finds known
+	requestErr   error           // RequestDeployment fails with it
+>>>>>>> Stashed changes
 }
 
 func newFakes() *fakes {
@@ -277,13 +289,39 @@ func (f *fakes) CountDeploymentLogs(context.Context, int64, string) (int, error)
 	return f.priorBuild, nil
 }
 
-func (f *fakes) RequestDeployment(ctx context.Context, appID int64, commit string) (store.Deployment, bool, error) {
+func (f *fakes) RequestDeployment(ctx context.Context, appID int64, commit string) (store.Deployment, store.RequestOutcome, error) {
+	if f.requestErr != nil {
+		return store.Deployment{}, 0, f.requestErr
+	}
+	if f.knownCommits[commit] {
+		return store.Deployment{}, store.RequestKnown, nil
+	}
 	if f.busy {
 		f.nextCommit = commit
-		return store.Deployment{}, false, nil
+		return store.Deployment{}, store.RequestWaiting, nil
 	}
 	d, err := f.CreateDeployment(ctx, appID, commit)
-	return d, err == nil, err
+	if err != nil {
+		return d, 0, err
+	}
+	if f.knownCommits == nil {
+		f.knownCommits = map[string]bool{}
+	}
+	f.knownCommits[commit] = true
+	return d, store.RequestStarted, nil
+}
+
+func (f *fakes) Apps(context.Context) ([]store.App, error) { return []store.App{f.app}, nil }
+
+func (f *fakes) LatestCommitIfChanged(_ context.Context, repo, branch, etag string) (string, string, bool, error) {
+	f.event("poll %s %s", repo, branch)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sentETags = append(f.sentETags, etag)
+	if etag != "" && etag == f.headETag {
+		return "", etag, false, nil
+	}
+	return f.head, f.headETag, true, nil
 }
 
 func (f *fakes) StartNextDeployment(ctx context.Context, appID int64) (store.Deployment, bool, error) {
@@ -1050,14 +1088,15 @@ func TestPushDeploysNowOrNext(t *testing.T) {
 	notified := 0
 	d.Notify = func() { notified++ }
 
-	if dep, started, err := d.Push(t.Context(), 1, sha); err != nil || !started || dep.ID != 7 || notified != 1 {
-		t.Errorf("Push when idle: %+v, started %v, %v, notified %d; want deployment 7 started", dep, started, err, notified)
+	if dep, outcome, err := d.Push(t.Context(), 1, sha); err != nil || outcome != store.RequestStarted || dep.ID != 7 || notified != 1 {
+		t.Errorf("Push when idle: %+v, %v, %v, notified %d; want deployment 7 started", dep, outcome, err, notified)
 	}
 	f.busy = true
-	if _, started, err := d.Push(t.Context(), 1, sha); err != nil || started || notified != 1 {
-		t.Errorf("Push while busy: started %v, %v, notified %d; want it to wait, no wake", started, err, notified)
+	const other = "fedcba9876543210fedcba9876543210fedcba98"
+	if _, outcome, err := d.Push(t.Context(), 1, other); err != nil || outcome != store.RequestWaiting || notified != 1 {
+		t.Errorf("Push while busy: %v, %v, notified %d; want it to wait, no wake", outcome, err, notified)
 	}
-	if f.nextCommit != sha {
+	if f.nextCommit != other {
 		t.Errorf("next commit = %q, want the push", f.nextCommit)
 	}
 }

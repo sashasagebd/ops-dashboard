@@ -164,6 +164,10 @@ jobs:
           PUBLIC_DOMAIN: public.test
           # Where app database backups go (the server uses ~/backups).
           BACKUP_DIR: /tmp/ci-backups
+          # No branch polling for most of the run: with the token above it
+          # would deploy main's newest commit to the test apps in the middle
+          # of the checks. Checked on its own at the end.
+          BRANCH_POLL_INTERVAL: '0'
           # The commit to deploy in the end-to-end test: this one. (For a
           # pull request, the branch head rather than GitHub's merge commit.)
           DEPLOY_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -348,11 +352,10 @@ jobs:
           BEFORE=$(api GET "/api/platform/apps/$APP/deployments" | jq length)
           hook ping ci-ping '{"zen":"Design for failure."}' | grep '"pong"' || on_failure
           hook push ci-push-1 "$PUSH" | grep '"deploying"' || on_failure
-          # A second push, while the first is (almost certainly) still
-          # deploying: it waits, then deploys by itself once the first is
-          # done. If the first was already done, it deploys at once. Either
-          # way, two new deployments, the second ending live.
-          hook push ci-push-2 "$PUSH" | grep -E '"deploying"|"deploys next' || on_failure
+          # The same commit pushed again (or seen by the branch poller after
+          # the webhook): it's the latest deployment's commit, so nothing
+          # new is deployed.
+          hook push ci-push-2 "$PUSH" | grep '"already deployed, or on its way"' || on_failure
           # GitHub redelivering the first push changes nothing.
           hook push ci-push-1 "$PUSH" | grep 'already handled' || on_failure
           # A delivery without the right signature is refused, and the API
@@ -367,7 +370,7 @@ jobs:
           fi
           for i in $(seq 1 120); do
             DS=$(api GET "/api/platform/apps/$APP/deployments")
-            if [ "$(echo "$DS" | jq length)" -ge $((BEFORE + 2)) ] && [ "$(echo "$DS" | jq -r '.[0].status')" = healthy ]; then
+            if [ "$(echo "$DS" | jq length)" = $((BEFORE + 1)) ] && [ "$(echo "$DS" | jq -r '.[0].status')" = healthy ]; then
               break
             fi
             [ "$i" = 120 ] && { echo "$DS" | jq .; on_failure; }
@@ -705,6 +708,31 @@ jobs:
           docker compose start caddy
           docker compose up -d --wait --wait-timeout 60 caddy platform || on_failure
           visit selftest.apps.test /healthz | grep '"ok"' || on_failure
+
+          # Branch polling: a repo without the webhook still deploys on
+          # push. The other apps are stopped first (stopped apps aren't
+          # polled), then the platform restarts checking every 10s, and a
+          # new app is deployed from main's newest commit, once.
+          for name in selftest hello; do
+            id=$(dash GET /api/platform/apps | jq -r ".[] | select(.name == \"$name\") | .id")
+            dash POST "/api/platform/apps/$id/stop" | jq -e '.stopped == true' || on_failure
+          done
+          BRANCH_POLL_INTERVAL=10s docker compose up -d --wait --wait-timeout 60 platform || on_failure
+          APP=$(dash POST /api/platform/apps \
+            "{\"name\":\"polled\",\"repoUrl\":\"$REPO_URL\",\"sourceDir\":\"examples/hello\",\"port\":8080,\"healthCheckPath\":\"/healthz\"}" | jq -r .id)
+          [ "$APP" != null ] || on_failure
+          MAIN_HEAD=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github.sha' \
+            "https://api.github.com/repos/${{ github.repository }}/commits/main")
+          for i in $(seq 1 30); do
+            [ "$(api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].commitSha // empty')" = "$MAIN_HEAD" ] && break
+            [ "$i" = 30 ] && { api GET "/api/platform/apps/$APP/deployments" | jq .; on_failure; }
+            sleep 2
+          done
+          DEP=$(api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].id')
+          curl -sSN --max-time 10 "http://127.0.0.1:8080/api/platform/apps/$APP/deployments/$DEP/logs" | grep -F 'checked every minute' || [ $? = 28 ] || on_failure
+          # Two more polls: the same commit isn't deployed again.
+          sleep 22
+          test "$(api GET "/api/platform/apps/$APP/deployments" | jq length)" = 1 || on_failure
 
           # App containers aren't Compose's, so remove them first, or the
           # apps network can't be deleted; with the platform stopped, or its

@@ -37,6 +37,7 @@ import (
 
 type Store interface {
 	App(ctx context.Context, id int64) (store.App, error)
+	Apps(ctx context.Context) ([]store.App, error)
 	CreateDeployment(ctx context.Context, appID int64, commitSHA string) (store.Deployment, error)
 	Deployment(ctx context.Context, id int64) (store.Deployment, error)
 	MarkBuilding(ctx context.Context, id int64) error
@@ -48,7 +49,7 @@ type Store interface {
 	AppendDeploymentLogs(ctx context.Context, deploymentID int64, lines []store.NewLogLine) error
 	CountDeploymentLogs(ctx context.Context, deploymentID int64, stream string) (int, error)
 	PruneDeploymentLogs(ctx context.Context, appID int64, keep int) (int64, error)
-	RequestDeployment(ctx context.Context, appID int64, commitSHA string) (store.Deployment, bool, error)
+	RequestDeployment(ctx context.Context, appID int64, commitSHA string) (store.Deployment, store.RequestOutcome, error)
 	StartNextDeployment(ctx context.Context, appID int64) (store.Deployment, bool, error)
 	Deployments(ctx context.Context, appID int64, limit int) ([]store.Deployment, error)
 	CreateRollback(ctx context.Context, appID, targetID int64) (store.Deployment, error)
@@ -60,6 +61,7 @@ type Store interface {
 type Source interface {
 	BuildContext(ctx context.Context, repoURL, commitSHA, dir string) (io.ReadCloser, error)
 	LatestCommit(ctx context.Context, repoURL, branch string) (string, error)
+	LatestCommitIfChanged(ctx context.Context, repoURL, branch, etag string) (sha, newETag string, changed bool, err error)
 }
 
 type Engine interface {
@@ -137,6 +139,12 @@ type Deployer struct {
 	// as it runs (drain included) and tried by the reconciler, which leaves
 	// an app alone while its deploy runs (TryLockApp).
 	locks appLocks
+
+	// The branch poller's ETags, per repo and branch (poll.go). In memory:
+	// after a restart the first pass asks without them, and commits it has
+	// seen already are known to the store.
+	pollMu sync.Mutex
+	etags  map[branchKey]string
 }
 
 // New returns a Deployer.
@@ -187,16 +195,17 @@ func (d *Deployer) Rollback(ctx context.Context, appID, targetID int64) (store.D
 	return dep, nil
 }
 
-// Push deploys a pushed commit: straight away if the app has no deploy in
-// progress (started), otherwise once that one finishes, as the app's next
-// commit (replacing an older push waiting there). See
-// store.RequestDeployment.
-func (d *Deployer) Push(ctx context.Context, appID int64, commitSHA string) (dep store.Deployment, started bool, err error) {
-	dep, started, err = d.store.RequestDeployment(ctx, appID, commitSHA)
-	if started {
+// Push deploys a commit seen on an app's branch (the webhook's push, or the
+// poller's): straight away if the app has no deploy in progress, otherwise
+// once that one finishes, as the app's next commit (replacing an older one
+// waiting there); a commit it has already deployed, is deploying or has
+// waiting changes nothing. See store.RequestDeployment.
+func (d *Deployer) Push(ctx context.Context, appID int64, commitSHA string) (dep store.Deployment, outcome store.RequestOutcome, err error) {
+	dep, outcome, err = d.store.RequestDeployment(ctx, appID, commitSHA)
+	if outcome == store.RequestStarted {
 		d.notify()
 	}
-	return dep, started, err
+	return dep, outcome, err
 }
 
 // startNext starts the deploy of a pushed commit that was waiting for
