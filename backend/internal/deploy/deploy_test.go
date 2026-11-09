@@ -70,8 +70,6 @@ type fakes struct {
 	dbSpec      engine.DatabaseSpec // what RunDatabase was asked for
 	userEnv     map[string]string   // EnvVars' answer, if set
 	onRun       func()              // hook, called as Run starts a container
-<<<<<<< Updated upstream
-=======
 
 	lifecycleErr error // StopApp, StartApp and DeleteApp refuse with it
 	deleted      bool  // DeleteApp ran: nothing of the app is live any more
@@ -81,7 +79,6 @@ type fakes struct {
 	sentETags    []string        // the ETags the poller sent, in order
 	knownCommits map[string]bool // commits RequestDeployment finds known
 	requestErr   error           // RequestDeployment fails with it
->>>>>>> Stashed changes
 }
 
 func newFakes() *fakes {
@@ -238,12 +235,61 @@ func (f *fakes) LiveApps(context.Context) ([]store.LiveApp, error) {
 	defer f.mu.Unlock()
 	var live []store.LiveApp
 	for id, s := range f.statuses {
-		if s == store.StatusHealthy {
+		if s == store.StatusHealthy && !f.app.Stopped && !f.deleted {
 			live = append(live, store.LiveApp{AppName: f.app.Name, Hostname: "hello.apps.test", PublicName: f.app.PublicName,
 				Port: f.app.Port, DeploymentID: id})
 		}
 	}
 	return live, nil
+}
+
+func (f *fakes) CurrentDeployment(_ context.Context, appID int64) (store.Deployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, s := range f.statuses {
+		if s == store.StatusHealthy {
+			return store.Deployment{ID: id, AppID: appID, CommitSHA: sha, Status: s, ImageTag: ImageTag(f.app.Name, sha)}, nil
+		}
+	}
+	return store.Deployment{}, store.ErrNotFound
+}
+
+func (f *fakes) StopApp(context.Context, int64) (store.App, error) {
+	if f.lifecycleErr != nil {
+		return store.App{}, f.lifecycleErr
+	}
+	f.event("store: stopped")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.app.Stopped = true
+	return f.app, nil
+}
+
+func (f *fakes) StartApp(context.Context, int64) (store.App, error) {
+	if f.lifecycleErr != nil {
+		return store.App{}, f.lifecycleErr
+	}
+	f.event("store: started")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.app.Stopped = false
+	return f.app, nil
+}
+
+func (f *fakes) DeleteApp(context.Context, int64) (store.DeletedApp, error) {
+	if f.lifecycleErr != nil {
+		return store.DeletedApp{}, f.lifecycleErr
+	}
+	f.event("store: deleted")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleted = true
+	return store.DeletedApp{App: f.app, HadDatabase: f.database != nil}, nil
+}
+
+func (f *fakes) RemoveNetwork(_ context.Context, name string) error {
+	f.event("remove network %s", name)
+	return nil
 }
 
 // Source

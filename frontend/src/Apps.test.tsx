@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AppDetail, Backup, Deployment, PlatformApp, PlatformEvent } from './api'
 import App from './App'
+import { clearFlash } from './flash'
 import { FakeEventSource } from './test/fakeEventSource'
 
 const SHA = '0123456789abcdef0123456789abcdef01234567'
@@ -36,6 +37,7 @@ function app(overrides: Partial<PlatformApp> = {}): PlatformApp {
     cpuLimitMillicores: 500,
     sourceDir: 'examples/hello',
     autoDeploy: true,
+    stopped: false,
     nextCommitSha: null,
     createdAt: '2026-11-01T00:00:00Z',
     currentDeployment: null,
@@ -116,6 +118,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+  clearFlash()
 })
 
 describe('Apps page', () => {
@@ -683,6 +686,66 @@ describe('App page', () => {
     fireEvent.click(within(screen.getByText('OLD').closest('li')!).getByRole('button', { name: 'Remove' }))
     await vi.waitFor(() => expect(screen.queryByText('OLD')).not.toBeInTheDocument())
     expect(window.confirm).toHaveBeenCalled()
+  })
+
+  it('stops the app, after asking, and starts it again', async () => {
+    let stopped = false
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [200, detail({ stopped, currentDeployment: deployment(), deployments: [deployment()] })],
+      'POST /api/platform/apps/1/stop': () => {
+        stopped = true
+        return [200, app({ stopped })]
+      },
+      'POST /api/platform/apps/1/start': () => {
+        stopped = false
+        return [200, app({ stopped })]
+      },
+    })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    window.location.hash = '#/apps/1/settings'
+    render(<App />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }))
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('Its database keeps running'))
+    // Stopped: said in the header, and nothing can be deployed.
+    expect(await screen.findByRole('button', { name: 'Start' })).toBeInTheDocument()
+    expect(screen.getByText('Stopped')).toHaveClass('badge-neutral')
+    expect(screen.getByRole('button', { name: 'Deploy latest' })).toBeDisabled()
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/stop')).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }))
+    expect(await screen.findByRole('button', { name: 'Stop' })).toBeInTheDocument()
+    expect(screen.getByText('Live')).toHaveClass('badge-up')
+    expect(sent(fetchMock, 'POST', '/api/platform/apps/1/start')).toHaveLength(1)
+  })
+
+  it('deletes the app once its name is typed, and says how to remove its data', async () => {
+    const fetchMock = mockFetch({
+      'GET /api/platform/apps/1': () => [
+        200,
+        detail({ database: { name: 'ops-db-hello', createdAt: '2026-11-01T00:00:00Z', state: 'running' } }),
+      ],
+      'DELETE /api/platform/apps/1': () => [200, { name: 'hello', databaseVolume: 'ops-db-hello' }],
+      'GET /api/platform/apps': () => [200, []],
+    })
+    window.location.hash = '#/apps/1/settings'
+    render(<App />)
+
+    const remove = await screen.findByRole('button', { name: 'Delete hello' })
+    expect(screen.getByText(/the ops-db-hello volume\) and its backups stay on the server/)).toBeInTheDocument()
+    const confirmName = screen.getByLabelText(/to confirm/)
+    fireEvent.change(confirmName, { target: { value: 'hell' } })
+    expect(remove).toBeDisabled()
+    fireEvent.change(confirmName, { target: { value: 'hello' } })
+    fireEvent.click(remove)
+
+    // On to the Apps page, which says what was left and how to remove it.
+    expect(await screen.findByText("Deleted hello. Its database's data is still on the server.")).toBeInTheDocument()
+    expect(window.location.hash).toBe('#/apps')
+    expect(screen.getByText(/docker volume rm ops-db-hello/)).toBeInTheDocument()
+    expect(sent(fetchMock, 'DELETE', '/api/platform/apps/1')).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByText(/docker volume rm/)).not.toBeInTheDocument()
   })
 
   it('shows an error if the app does not exist', async () => {

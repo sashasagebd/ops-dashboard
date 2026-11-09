@@ -56,6 +56,10 @@ type Store interface {
 	StartRollback(ctx context.Context, id int64) error
 	KeptImages(ctx context.Context, appID int64) ([]string, error)
 	Database(ctx context.Context, appID int64) (store.Database, error)
+	CurrentDeployment(ctx context.Context, appID int64) (store.Deployment, error)
+	StopApp(ctx context.Context, id int64) (store.App, error)
+	StartApp(ctx context.Context, id int64) (store.App, error)
+	DeleteApp(ctx context.Context, id int64) (store.DeletedApp, error)
 }
 
 type Source interface {
@@ -75,6 +79,7 @@ type Engine interface {
 	EnsureNetwork(ctx context.Context, name string, labels map[string]string) error
 	Pull(ctx context.Context, ref string) error
 	RunDatabase(ctx context.Context, spec engine.DatabaseSpec) (string, error)
+	RemoveNetwork(ctx context.Context, name string) error
 }
 
 type Router interface {
@@ -174,6 +179,11 @@ func (d *Deployer) StartLatest(ctx context.Context, appID int64) (store.Deployme
 	app, err := d.store.App(ctx, appID)
 	if err != nil {
 		return store.Deployment{}, err
+	}
+	if app.Stopped {
+		// Refused anyway when the deployment is created; no need to ask
+		// GitHub first.
+		return store.Deployment{}, store.ErrAppStopped
 	}
 	sha, err := d.source.LatestCommit(ctx, app.RepoURL, app.Branch)
 	if err != nil {
