@@ -1406,8 +1406,6 @@ repo (more files and a login, for routes that can't do harm anyway); a
   Cloudflare, which nothing else joins). CI can't run it (no token), so it
   sends requests to Caddy's public server from a container on the tunnel
   network, and checks what that network can't reach.
-<<<<<<< Updated upstream
-=======
 
 ## Stopping and deleting apps (2026-11-05)
 
@@ -1497,4 +1495,3 @@ minute because its commit is still the branch's head. Only the latest
 deployment is compared, not every commit ever deployed, so pushing an
 older commit again (a revert by force-push) still deploys it.
 
->>>>>>> Stashed changes

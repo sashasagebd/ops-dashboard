@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -56,16 +57,29 @@ func (s *Store) CreateDeployment(ctx context.Context, appID int64, commitSHA str
 
 func createDeployment(ctx context.Context, db interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }, appID int64, commitSHA string) (Deployment, error) {
+	// Only for an app that isn't stopped, with its row locked (as StopApp
+	// locks it), so stopping and deploying take turns: a deploy can't start
+	// just as the app is stopped.
 	rows, _ := db.Query(ctx, `
-		WITH d AS (
-			INSERT INTO deployments (app_id, commit_sha) VALUES ($1, $2) RETURNING *
+		WITH a AS (
+			SELECT id FROM apps WHERE id = $1 AND NOT stopped FOR UPDATE
+		), d AS (
+			INSERT INTO deployments (app_id, commit_sha) SELECT id, $2 FROM a RETURNING *
 		), j AS (
 			INSERT INTO jobs (kind, deployment_id) SELECT 'deploy', id FROM d
 		)
 		SELECT `+deploymentColumns+` FROM d`,
 		appID, commitSHA)
 	d, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[Deployment])
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Nothing inserted: the app is stopped, or doesn't exist.
+		if err := appStopped(ctx, db, appID); err != nil {
+			return Deployment{}, err
+		}
+		return Deployment{}, fmt.Errorf("app %w", ErrNotFound)
+	}
 	return d, translate(err)
 }
 
@@ -152,6 +166,9 @@ func (s *Store) StartNextDeployment(ctx context.Context, appID int64) (d Deploym
 		if errors.Is(err, ErrDeployInProgress) {
 			return nil // still busy: it stays next, for when that one finishes
 		}
+		if errors.Is(err, ErrAppStopped) {
+			return nil // stopped meanwhile (StopApp drops it anyway)
+		}
 		if err != nil {
 			return err
 		}
@@ -205,11 +222,13 @@ type LiveApp struct {
 	DeploymentID int64  `db:"deployment_id"`
 }
 
-// LiveApps returns every app that has a healthy deployment, by name.
+// LiveApps returns every app that has a healthy deployment and isn't
+// stopped, by name: what Caddy routes to.
 func (s *Store) LiveApps(ctx context.Context) ([]LiveApp, error) {
 	rows, _ := s.pool.Query(ctx, `
 		SELECT a.name, a.hostname, COALESCE(a.public_name, '') AS public_name, a.port, d.id AS deployment_id
 		FROM apps a JOIN deployments d ON d.app_id = a.id AND d.status = 'healthy'
+		WHERE NOT a.stopped
 		ORDER BY a.name`)
 	live, err := pgx.CollectRows(rows, pgx.RowToStructByName[LiveApp])
 	return live, translate(err)

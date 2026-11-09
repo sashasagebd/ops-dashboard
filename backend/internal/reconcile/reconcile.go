@@ -210,10 +210,14 @@ func (r *Reconciler) app(ctx context.Context, app store.App, db *store.Database,
 	// Read after taking the lock: a deploy that finished just before has
 	// changed which deployment is live.
 	live, err := r.store.CurrentDeployment(ctx, app.ID)
-	hasLive := err == nil
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
+	// A stopped app is kept with no container running: its live
+	// deployment's container, if one is left, is removed like an orphan,
+	// and nothing is restarted or recreated. Its database is still looked
+	// after below.
+	hasLive := err == nil && !app.Stopped
 	containers, err := r.engine.ManagedContainers(ctx, app.Name)
 	if err != nil {
 		return err

@@ -1,6 +1,7 @@
 import { useRef, useState, type FormEvent } from 'react'
 import { createApp, fetchApps, fetchEvents } from './api'
 import { AppCard, EventsList } from './appParts'
+import { clearFlash, readFlash, type Flash } from './flash'
 import { appHref } from './route'
 import { ActionError, Card, Field, Loaded, PageHeader } from './ui'
 import { useAction } from './useAction'
@@ -30,6 +31,7 @@ export function AppsPage() {
         }
       />
       <div className="stack">
+        <FlashNotice />
         <Loaded state={state} what="apps">
           {(apps) =>
             apps.length === 0 ? (
@@ -59,6 +61,30 @@ export function AppsPage() {
         </div>
       </div>
     </>
+  )
+}
+
+// FlashNotice shows what a deletion left behind, until it's dismissed.
+function FlashNotice() {
+  const [flash, setFlashState] = useState<Flash | null>(readFlash)
+  if (flash === null) return null
+  const dismiss = () => {
+    clearFlash()
+    setFlashState(null)
+  }
+  return (
+    <div className="notice" role="status">
+      <div className="notice-head">
+        <strong>{flash.title}</strong>
+        <button type="button" className="small" onClick={dismiss}>
+          Dismiss
+        </button>
+      </div>
+      {flash.lines.map((l) => (
+        <p key={l}>{l}</p>
+      ))}
+      {flash.commands.length > 0 && <pre className="command">{flash.commands.join('\n')}</pre>}
+    </div>
   )
 }
 

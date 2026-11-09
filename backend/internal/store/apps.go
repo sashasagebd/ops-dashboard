@@ -24,13 +24,14 @@ type App struct {
 	AutoDeploy         bool      `db:"auto_deploy"`     // pushes to Branch deploy it
 	NextCommitSHA      string    `db:"next_commit_sha"` // a pushed commit waiting for the deploy in progress; "" if none
 	PublicName         string    `db:"public_name"`     // served publicly at <PublicName>.<PUBLIC_DOMAIN>; "" if tailnet-only
+	Stopped            bool      `db:"stopped"`         // stopped on purpose: no container, no routes, no deploys
 	CreatedAt          time.Time `db:"created_at"`
 }
 
 const appColumns = `id, name, repo_url, branch, hostname, port, health_check_path,
 	memory_limit_bytes, cpu_limit_millicores, source_dir, auto_deploy,
 	COALESCE(next_commit_sha, '') AS next_commit_sha,
-	COALESCE(public_name, '') AS public_name, created_at`
+	COALESCE(public_name, '') AS public_name, stopped, created_at`
 
 // NewApp is what CreateApp needs. Name, RepoURL, Hostname and Port are
 // required; for the rest, the zero value means "use the database's default",

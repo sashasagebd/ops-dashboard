@@ -59,5 +59,6 @@ export function shortSHA(sha: string): string {
 // appState is an app's headline status, for its badge and sidebar dot: live
 // if something is, else whether it has never been deployed.
 export function appState(app: PlatformApp): { label: string; badge: string } {
+  if (app.stopped) return { label: 'Stopped', badge: 'neutral' }
   return app.currentDeployment === null ? { label: 'Not deployed', badge: 'neutral' } : { label: 'Live', badge: 'up' }
 }

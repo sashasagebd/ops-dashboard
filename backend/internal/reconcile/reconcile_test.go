@@ -375,6 +375,28 @@ func TestOrphansAreRemoved(t *testing.T) {
 	}
 }
 
+func TestAStoppedAppStaysStopped(t *testing.T) {
+	f := newFakes()
+	f.apps[0].Stopped = true
+	f.containers = nil // as Stop left it
+	r := f.reconciler(newClock())
+	if err := r.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.actions) != 0 || len(f.events) != 0 {
+		t.Errorf("actions %q, events %+v; want a stopped app left stopped", f.actions, f.events)
+	}
+
+	// A container Stop couldn't remove is removed now, not restarted.
+	f.containers = []engine.ManagedContainer{container("hello", 6, "exited")}
+	if err := r.Pass(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.actions, []string{"remove hello-6"}) {
+		t.Errorf("actions = %q, want the stopped app's container removed", f.actions)
+	}
+}
+
 func TestAppWithADeployRunningIsLeftAlone(t *testing.T) {
 	f := newFakes()
 	f.locked[1] = true

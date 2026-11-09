@@ -36,7 +36,8 @@ memory and request metrics, and be made public on `sashasagebd.com` through
 Cloudflare Tunnel with one setting; `hello` is live at
 `https://hello.sashasagebd.com`. The webhook comes in at
 `hooks.sashasagebd.com`; Tailscale Funnel is off.
-**Next:** the frontend redesign (UI below), written and awaiting review and CI. The pokewordle
+**Next:** stopping and deleting apps (L below), written and awaiting
+review and CI. The frontend redesign (UI below) is merged (PR #15). The pokewordle
 backend is a separate project; once it exists, deploying it is registering
 it, adding a database and the public name `api`. Phase 6 (preview
 environments, a stretch goal) is paused at the owner's call (2026-11-05).
@@ -611,7 +612,7 @@ Decisions (approved 2026-11-04), written up in
   `api.pokewordle.sashasagebd.com`): Cloudflare's free certificate covers
   the bare domain and one level of subdomains only.
 
-## UI: Frontend redesign 🔍
+## UI: Frontend redesign ✅
 
 Plan approved 2026-11-05 (owner: "ops console" direction, tabs on the app
 page, plain CSS; mocked up first, then done as one step at the owner's
@@ -642,8 +643,6 @@ What changed:
 - No backend change; no new dependencies. Tests were moved to the new
   layout, plus tests for the URL's tab, keyboard tabs and the theme switch.
 
-<<<<<<< Updated upstream
-=======
 ## L: Stopping and deleting apps 🔍
 
 Asked for 2026-11-05: apps had no way to be taken offline or removed. The
@@ -687,7 +686,6 @@ automation; polling over a GitHub App (much less to set up), every 60s.
 - Details in [decisions/platform.md](decisions/platform.md) ("Branch
   polling"). On the server: `GITHUB_TOKEN` must be set in `.env`.
 
->>>>>>> Stashed changes
 ## Open questions
 
 - **pokewordle's Worker and its backend** (for after P5): worth checking

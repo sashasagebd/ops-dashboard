@@ -670,6 +670,32 @@ jobs:
           [ "$(deploy "$DEPLOY_SHA")" = failed ] || on_failure
           api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].error' | grep 'source directory not found' || on_failure
 
+          # Stop and start: hello goes offline (its container removed, its
+          # route gone) while its database keeps running, then comes back
+          # from its image, with no build.
+          HELLO=$(dash GET /api/platform/apps | jq -r '.[] | select(.name == "hello") | .id')
+          dash POST "/api/platform/apps/$HELLO/stop" | jq -e '.stopped == true' || on_failure
+          test "$(docker ps -q --filter label=ops.platform.app=hello --filter label=ops.platform.role=app | wc -l)" = 0 || on_failure
+          if curl -s --max-time 5 -H 'Host: hello.apps.test' http://127.0.0.1/ | grep 'Howdy'; then
+            echo "hello still answers while stopped"; on_failure
+          fi
+          docker ps -q --filter name=ops-db-hello --filter status=running | grep . || on_failure
+          # A stopped app can't be deployed, and a pass of the reconciler
+          # leaves it stopped.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+            "http://127.0.0.1:8080/api/platform/apps/$HELLO/deployments/latest")" = 409 || on_failure
+          sleep 12
+          test "$(docker ps -q --filter label=ops.platform.app=hello --filter label=ops.platform.role=app | wc -l)" = 0 || on_failure
+          dash POST "/api/platform/apps/$HELLO/start" | jq -e '.stopped == false' || on_failure
+          for i in $(seq 1 20); do
+            visit hello.apps.test / | grep 'Howdy from the platform' && break
+            [ "$i" = 20 ] && on_failure
+            sleep 1
+          done
+          # Delete: nodir (never live) goes, with nothing left of it.
+          dash DELETE "/api/platform/apps/$APP" | jq -e '.name == "nodir" and .databaseVolume == null' || on_failure
+          dash GET /api/platform/apps | jq -e 'map(select(.name == "nodir")) | length == 0' || on_failure
+
           # Isolation: an app can reach neither Caddy's admin API nor the
           # platform.
           if docker run --rm --network platform-apps curlimages/curl:8.11.1 -s --max-time 5 http://caddy:2019/config/; then

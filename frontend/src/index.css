@@ -1115,6 +1115,53 @@ button:disabled {
   gap: 10px;
 }
 
+/* Something that can't be undone. */
+.card-danger {
+  border-color: color-mix(in srgb, var(--down) 35%, var(--border));
+}
+
+button.danger {
+  border-color: var(--down);
+  background: var(--down);
+  color: #fff;
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--down);
+  filter: brightness(1.08);
+}
+
+/* A notice with commands to copy (what deleting an app left behind). */
+.notice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: inset 3px 0 var(--accent), var(--shadow);
+}
+
+.notice-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.command {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--log-text);
+  background: var(--log-bg);
+  border-radius: var(--radius-sm);
+  user-select: all;
+}
+
 /* ---------- Text ---------- */
 
 .muted {
