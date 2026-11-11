@@ -525,8 +525,8 @@ jobs:
           dash GET /api/platform/events | jq -e 'map(select(.kind == "routes_reapplied" and .appId == null)) | length > 0' || on_failure
 
           # Databases: hello gets one, through the dashboard. The reconciler
-          # create  s it within a pass (the reconciler pulls the pgvector image first); the next deploy gives hello
-          # DATABASE_URL, and /visits counts in it.
+          # pulls the pgvector image and creates it; the next deploy gives
+          # hello DATABASE_URL, and /visits counts in it.
           SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           dash POST "/api/platform/apps/$APP/database" | jq -e '.name == "ops-db-hello"' || on_failure
           logged "created an app's database.*app=hello" || on_failure
@@ -747,7 +747,7 @@ jobs:
             "{\"name\":\"polled\",\"repoUrl\":\"$REPO_URL\",\"sourceDir\":\"examples/hello\",\"port\":8080,\"healthCheckPath\":\"/healthz\"}" | jq -r .id)
           [ "$APP" != null ] || on_failure
           MAIN_HEAD=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github.sha' \
-            "https://api.github.com/repos/${{ github.repository }}/commits/main")
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/main")
           for i in $(seq 1 30); do
             [ "$(api GET "/api/platform/apps/$APP/deployments" | jq -r '.[0].commitSha // empty')" = "$MAIN_HEAD" ] && break
             [ "$i" = 30 ] && { api GET "/api/platform/apps/$APP/deployments" | jq .; on_failure; }
