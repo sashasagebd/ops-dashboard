@@ -146,7 +146,7 @@ func TestBackupRuns(t *testing.T) {
 	if err := f.backuper().Run(t.Context(), job); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"pull postgres:18.6", "run ops-backup-hello-3", "wait task", "remove task"}
+	want := []string{"pull pgvector/pgvector:0.8.7-pg18-trixie", "run ops-backup-hello-3", "wait task", "remove task"}
 	if !slices.Equal(f.actions, want) {
 		t.Errorf("actions = %q, want %q", f.actions, want)
 	}
@@ -157,7 +157,7 @@ func TestBackupRuns(t *testing.T) {
 	// The container: the app's database network, as the owner, into the
 	// backups volume, with its inputs as env vars.
 	s := f.spec
-	if s.Image != "postgres:18.6" || s.Network != "ops-db-hello" || s.User != "1000:1000" ||
+	if s.Image != "pgvector/pgvector:0.8.7-pg18-trixie" || s.Network != "ops-db-hello" || s.User != "1000:1000" ||
 		s.Volume != "platform-backups" || s.VolumeTarget != "/backups" ||
 		s.Env["PGHOST"] != "ops-db-hello" || s.Env["PGPASSWORD"] != "pw" || s.Env["KEEP"] != "7" ||
 		s.Labels[engine.LabelRole] != engine.RoleBackup || s.Labels[engine.LabelApp] != "hello" {

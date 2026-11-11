@@ -1396,11 +1396,11 @@ func TestRunDatabase(t *testing.T) {
 	if err := f.deployer().RunDatabase(t.Context(), f.app, db); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(f.events, []string{"network ops-db-hello", "pull postgres:18.6", "run database ops-db-hello"}) {
+	if !slices.Equal(f.events, []string{"network ops-db-hello", "pull pgvector/pgvector:0.8.7-pg18-trixie", "run database ops-db-hello"}) {
 		t.Errorf("events = %q, want network, image, then the container", f.events)
 	}
 	spec := f.dbSpec
-	if spec.Image != "postgres:18.6" || spec.Network != "ops-db-hello" || spec.Volume != "ops-db-hello" ||
+	if spec.Image != "pgvector/pgvector:0.8.7-pg18-trixie" || spec.Network != "ops-db-hello" || spec.Volume != "ops-db-hello" ||
 		spec.Env["POSTGRES_PASSWORD"] != "pw0123" || spec.Env["POSTGRES_USER"] != "app" || spec.Env["POSTGRES_DB"] != "app" ||
 		spec.Labels[engine.LabelApp] != "hello" || spec.MemoryBytes != 256<<20 {
 		t.Errorf("database spec = %+v", spec)
