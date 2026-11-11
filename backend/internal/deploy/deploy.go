@@ -1051,7 +1051,7 @@ func (s *streamReader) Err() error {
 
 // DatabaseImage is what every app database runs: pinned, like the platform's
 // own Postgres.
-const DatabaseImage = "postgres:18.6"
+const DatabaseImage = "pgvector/pgvector:0.8.7-pg18-trixie"
 
 // databaseMemoryBytes caps an app database's memory. Postgres's defaults
 // (128 MiB of shared buffers) fit well inside it.

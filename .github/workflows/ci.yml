@@ -525,8 +525,7 @@ jobs:
           dash GET /api/platform/events | jq -e 'map(select(.kind == "routes_reapplied" and .appId == null)) | length > 0' || on_failure
 
           # Databases: hello gets one, through the dashboard. The reconciler
-          # creates it within a pass (postgres:18.6 is already here: the
-          # platform's own database uses it); the next deploy gives hello
+          # create  s it within a pass (the reconciler pulls the pgvector image first); the next deploy gives hello
           # DATABASE_URL, and /visits counts in it.
           SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           dash POST "/api/platform/apps/$APP/database" | jq -e '.name == "ops-db-hello"' || on_failure
